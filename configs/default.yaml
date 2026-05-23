@@ -1,1 +1,30 @@
-# nano-kvrouter default configuration
+cluster:
+  prefill_nodes: 4
+  decode_nodes: 4
+
+node:
+  gpu_blocks: 2000
+  cpu_blocks: 10000
+  disk_blocks: 100000
+
+model:
+  block_size: 16
+  kv_bytes_per_token: 512
+  prefill_cost_per_token_ms: 0.033
+  decode_base_ms: 5.0
+
+bandwidth:
+  gpu_to_gpu: 300_000_000_000
+  gpu_to_cpu:  32_000_000_000
+  cpu_to_disk:  5_000_000_000
+
+slo:
+  ttft_target_ms: 2000.0
+  tbt_target_ms:   100.0
+
+workload:
+  request_rate: 50.0
+  duration_s: 60.0
+  prefix_sharing_ratio: 0.6
+  avg_prompt_len: 1024
+  avg_output_len: 256
