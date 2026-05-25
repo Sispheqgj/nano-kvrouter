@@ -120,6 +120,10 @@ class MetricsCollector:
             rec["prefill_node"] = getattr(decision, "prefill_node", None)
 
     def _on_rejected(self, event: Event, engine: SimulationEngine) -> None:
+        request_id = event.payload.get("request_id")
+        if request_id is None:
+            logger.warning("REQUEST_REJECTED payload missing 'request_id', skipping")
+            return
         self._rejected_count += 1
 
     def _on_prefill_complete(self, event: Event, engine: SimulationEngine) -> None:
@@ -149,11 +153,14 @@ class MetricsCollector:
             return
 
         if step_index == 0:
-            # First output token: record TTFT (idempotent guard against duplicate events).
-            if rec.get("ttft") is None:
-                ttft = event.time - rec["arrival_time"]
-                rec["ttft"] = ttft
-                self._ttft_per_request.append(ttft)
+            if rec.get("ttft") is not None:
+                # Duplicate step 0 — entire branch skipped (TTFT not double-counted,
+                # TBT anchor not reset, prevents post-duplicate TBT distortion).
+                logger.debug("duplicate step_index=0 for request_id=%s, skipping", request_id)
+                return
+            ttft = event.time - rec["arrival_time"]
+            rec["ttft"] = ttft
+            self._ttft_per_request.append(ttft)
             # Seed TBT reference; subsequent steps compute (current - last).
             self._last_decode_step_time[request_id] = event.time
             self._tbt_samples.setdefault(request_id, [])

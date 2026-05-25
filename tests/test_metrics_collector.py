@@ -337,3 +337,38 @@ def test_ttft_idempotent_on_repeated_step_zero(engine, collector):
     # Only one TTFT sample recorded; p50 and avg are both 100 (not distorted by 110)
     assert s["ttft_p50_ms"] == pytest.approx(100.0)
     assert s["ttft_avg_ms"] == pytest.approx(100.0)
+
+
+# ------------------------------------------------------------------
+# Test 15: REQUEST_REJECTED without request_id is skipped
+# ------------------------------------------------------------------
+
+def test_rejected_without_request_id_skipped(engine, collector):
+    collector.attach(engine)
+    engine.schedule(_arrive(_make_request("r0"), t=0.0))
+    # REJECTED payload missing request_id — rejected count must stay 0
+    engine.schedule(Event(
+        time=1.0, type=EventType.REQUEST_REJECTED,
+        payload={"reason": "test"},  # no request_id
+    ))
+    engine.run()
+    assert collector.summary()["rejected"] == 0
+
+
+# ------------------------------------------------------------------
+# Test 16: Duplicate step_index=0 must not reset the TBT anchor
+# ------------------------------------------------------------------
+
+def test_duplicate_step_zero_does_not_reset_tbt_anchor(engine, collector):
+    """Second step_index=0 must not move the TBT anchor.
+    Subsequent TBT[1] must reflect time since the *first* step 0."""
+    collector.attach(engine)
+    req = _make_request("r0")
+    engine.schedule(_arrive(req, t=0.0))
+    engine.schedule(_decode_step("r0", t=100.0, step=0))   # TTFT=100, anchor=100
+    engine.schedule(_decode_step("r0", t=105.0, step=0))   # duplicate — anchor stays 100
+    engine.schedule(_decode_step("r0", t=110.0, step=1))   # TBT = 110 - 100 = 10 (NOT 5)
+    engine.run()
+    s = collector.summary()
+    assert s["ttft_p50_ms"] == pytest.approx(100.0)   # TTFT not double-counted
+    assert s["tbt_avg_ms"] == pytest.approx(10.0)     # anchor is 100, not 105
