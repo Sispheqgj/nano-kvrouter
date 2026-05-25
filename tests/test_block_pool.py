@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import pytest
+from nano_kvrouter.config import NodeConfig
 from nano_kvrouter.kv_cache.block_pool import BlockPool
 
 
 @pytest.fixture
 def pool() -> BlockPool:
-    return BlockPool(capacities={"gpu": 10, "cpu": 20, "disk": 50})
+    return BlockPool(NodeConfig(gpu_blocks=10, cpu_blocks=20, disk_blocks=50))
 
 
 # ------------------------------------------------------------------
@@ -148,7 +149,7 @@ def test_stats_after_promote_reflect_both_tiers(pool):
 
 
 def test_default_capacities():
-    p = BlockPool()
+    p = BlockPool(NodeConfig())
     s = p.stats()
     assert s["gpu"]["capacity"]  == 2_000
     assert s["cpu"]["capacity"]  == 10_000

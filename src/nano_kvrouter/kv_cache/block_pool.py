@@ -4,16 +4,9 @@ import logging
 import uuid
 from dataclasses import dataclass, field
 
-logger = logging.getLogger(__name__)
+from nano_kvrouter.config import NodeConfig
 
-# Conservative defaults sized for an 80GB-class GPU; experiments
-# override these via `NodeConfig`. They live here as a safety net so
-# `BlockPool()` is usable in tests without wiring up a full config.
-TIER_DEFAULTS: dict[str, int] = {
-    "gpu": 2_000,
-    "cpu": 10_000,
-    "disk": 100_000,
-}
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -50,27 +43,30 @@ class BlockPool:
     a block toward the GPU vs push it out to disk.
 
     Design notes:
-        * `TIER_DEFAULTS` provides sensible sizes so unit tests can use
-          `BlockPool()` without a config. Production callers should
-          pass per-tier capacities derived from `NodeConfig`.
+        * Tier capacities come from `NodeConfig` so the YAML config is
+          the single source of truth — same principle that drives
+          `MockEngineNode`'s capacity / latency parameters.
+        * Only the three named tiers ``"gpu"``, ``"cpu"``, ``"disk"``
+          exist; extending the hierarchy would require touching this
+          class *and* `NodeConfig` together, which is intentional.
         * Errors are raised, not swallowed: an unknown tier or an
           over-allocation is a programmer bug, not a runtime decision
           point. Callers (schedulers, cache managers) are expected to
           check `stats()` before allocating.
     """
 
-    def __init__(self, capacities: dict[str, int] | None = None) -> None:
-        """Initialize an empty pool with given (or default) per-tier capacities.
+    def __init__(self, node_config: NodeConfig) -> None:
+        """Initialize an empty pool with per-tier capacities from config.
 
         Args:
-            capacities: Optional override for tier sizes. Keys not
-                present fall back to `TIER_DEFAULTS`; unknown keys are
-                accepted and create additional tiers (handy for tests
-                that want to simulate, say, a remote-storage tier).
+            node_config: Source of `gpu_blocks` / `cpu_blocks` /
+                `disk_blocks`. Each becomes the capacity of the
+                correspondingly-named tier; the three tiers are fixed.
         """
-        caps = {**TIER_DEFAULTS, **(capacities or {})}
         self._tiers: dict[str, _TierState] = {
-            tier: _TierState(capacity=cap) for tier, cap in caps.items()
+            "gpu": _TierState(capacity=node_config.gpu_blocks),
+            "cpu": _TierState(capacity=node_config.cpu_blocks),
+            "disk": _TierState(capacity=node_config.disk_blocks),
         }
         self._block_tier: dict[str, str] = {}  # block_id → tier
 
@@ -119,7 +115,7 @@ class BlockPool:
 
         Args:
             num_blocks: Number of blocks to allocate.
-            tier: Tier name (e.g. ``"gpu"``); must already exist.
+            tier: One of ``"gpu"``, ``"cpu"``, ``"disk"``.
 
         Returns:
             Newly minted block ids (UUID4 strings). The pool records
@@ -127,7 +123,7 @@ class BlockPool:
             calls can find them.
 
         Raises:
-            ValueError: `tier` is not registered.
+            ValueError: `tier` is not one of the three known tiers.
             MemoryError: Not enough free slots on `tier`.
         """
         state = self._require_tier(tier)

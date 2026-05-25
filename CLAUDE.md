@@ -41,6 +41,15 @@ The structure below describes the **target architecture** from `DESIGN.md`. Not 
 
 When adding a planned module, also add a `tests/test_<module>.py` in the same change.
 
+## Learning and review docs
+
+The `doc/` directory contains ongoing study notes and per-file code review records produced during project learning sessions.
+
+- Start with `doc/review-notes.md` for the high-level index and PR backlog.
+- Use `doc/code-review/README.md` to find per-file review notes.
+- Add or update the matching `doc/code-review/**/<file>.md` when a source file is reviewed against a paper, real repository, or design discussion.
+- These docs are context for future small PRs; they are not runtime documentation and should not override tests or source code behavior.
+
 ## Project structure
 
 ```
