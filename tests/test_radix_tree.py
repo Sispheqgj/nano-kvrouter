@@ -168,3 +168,29 @@ def test_default_clock_is_wall_clock():
     t_after = time.time()
 
     assert t_before <= tree._nodes[bid].last_access_time <= t_after + 1.0
+
+
+# ---------------------------------------------------------------------------
+# 6. total_block_capacity
+# ---------------------------------------------------------------------------
+
+def test_total_block_capacity_empty_tree():
+    tree = RadixTree()
+    assert tree.total_block_capacity(16) == 0
+
+
+def test_total_block_capacity_after_split():
+    """Capacity after split equals the sum across all surviving nodes."""
+    tree = RadixTree()
+    tree.insert(list(range(64)))         # 1 node, key_len=64, blocks=4
+    assert tree.total_block_capacity(16) == 4
+
+    # Insert a shorter prefix that forces a split: mid key=[0..47] + remnant key=[48..63]
+    tree.insert(list(range(48)))         # split: mid key=[0..47] (3 blocks) + child key=[48..63] (1 block)
+    assert tree.total_block_capacity(16) == 4
+
+
+def test_total_block_capacity_invalid_block_size_raises():
+    tree = RadixTree()
+    with pytest.raises(ValueError):
+        tree.total_block_capacity(0)

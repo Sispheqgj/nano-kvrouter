@@ -224,3 +224,23 @@ class RadixTree:
             del self._nodes[victim.block_id]
 
         return evicted
+
+    def total_block_capacity(self, block_size: int) -> int:
+        """Total KV block usage if each node's key were chunked by `block_size`.
+
+        Sums `len(node.key) // block_size` across every non-root node in the
+        tree. Used by CacheManager to reconcile pool allocation against
+        the tree's actual logical block footprint after edge splits.
+
+        Args:
+            block_size: Number of tokens per logical KV block.
+
+        Returns:
+            Non-negative total block count. Returns 0 for an empty tree.
+
+        Raises:
+            ValueError: If block_size <= 0.
+        """
+        if block_size <= 0:
+            raise ValueError(f"block_size must be positive, got {block_size}")
+        return sum(len(n.key) // block_size for n in self._nodes.values())
