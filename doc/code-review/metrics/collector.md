@@ -138,3 +138,22 @@ TBT 的 per-step weighting 也更贴近 serving benchmark 的常见做法：长�
 
 如果后续实验关注 request-level fairness，可以并行增加 per-request weighted TBT，而不是把当前 v2 定义改回去。
 
+## Update：REQUEST_REJECTED 和重复 `step_index=0` 防御修复
+
+rollback commit 中合入了两个小的防御性修复：
+
+- `_on_rejected` 在 payload 缺少 `request_id` 时会 `logger.warning` 后跳过，和其他 handlers 的防御风格保持一致。
+- 对同一个 request 收到重复的 `step_index=0` 事件时，整个 step-0 分支会 early return，避免重置 `_last_decode_step_time`。
+
+第二点的语义是：
+
+```text
+TBT[1] 锚定到第一次 step_index=0 的时间戳，
+而不是后续重复 step_index=0 的时间戳。
+```
+
+对应测试：
+
+```text
+test_duplicate_step_zero_does_not_reset_tbt_anchor
+```

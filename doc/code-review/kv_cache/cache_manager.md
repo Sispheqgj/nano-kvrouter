@@ -1,91 +1,64 @@
-# CacheManager：v1 split-reconcile 修复后的已知局限
+# CacheManager：v1 设计说明与 rollback 复盘
 
-## 基本信息
+## 状态
 
-- 源码文件：`src/nano_kvrouter/kv_cache/cache_manager.py`
-- 相关文件：`src/nano_kvrouter/kv_cache/radix_tree.py`
-- 审阅日期：2026-05-25
-- 当前状态：
-  - 已实现 V1（commit 待 add）
-  - block-aligned split over-allocation 已通过 `admit()` 末尾 reconcile 修复（commit 待 add）
-  - non-block-aligned split + small-node floor under-count 仍是残留问题
-- 相关任务：TaskList #9
+- 已实现 V1（commit 待 add）
+- 之前尝试过加入 “split-aware reconcile”，但因为会造成 `lookup()` 和 `pool.used` 不一致，已经选择 rollback。本文件记录原因。
+- 相关任务：TaskList #8（已关闭：rollback chosen as the fix）
 
-## 文件职责
+## V1 当前设计
 
-`CacheManager` 是 scheduler 和 simulator 访问 KV cache 的统一入口。
+当前 `CacheManager` 的核心设计是：
 
-当前 V1 的职责是：
+- 每个 node 有一棵独立 `RadixTree`。
+- 每个 node 有一个独立 `BlockPool`。
+- `RadixTree` 和 `BlockPool` 是并行但相互独立的数据结构。
+- `_pool_ids[node_id]: list[str]` 负责桥接两者：
+  - `admit()` 分配新 KV blocks 后 append pool IDs。
+  - eviction 时从 `_pool_ids` 中移除对应数量的 pool IDs 并释放。
+- `pool.used` 表示**物理 KV block 分配量**。
+- `lookup()` 返回**逻辑 prefix hit**，即 `matched_tokens // block_size`。
 
-- 每个 node 维护一棵独立 `RadixTree`。
-- 每个 node 维护一个对应的 `BlockPool`。
-- `lookup()` / `lookup_all()` 给 scheduler 返回本地 prefix 命中信息。
-- `free_blocks()` 给 scheduler 返回 node 的剩余 cache 容量信号。
-- `admit()` 在 prefill 完成后把 prompt 的 KV cache 物化到指定 node。
-
-V1 仍然是 GPU-only 简化模型：
-
-- `transfer_cost_ms == 0.0`
-- 不做 CPU/Disk tier movement
-- 不做跨节点 KV transfer
-
-## 当前已经完成了什么
-
-### 1. V1 CacheManager 已实现
-
-当前实现采用每节点独立缓存视图：
-
-```python
-self._trees: dict[str, RadixTree]
-self._pools: dict[str, BlockPool]
-```
-
-这对应之前确定的 P0 方案：
+这两个视图在非 block 边界 split 时可能相差几个 blocks：
 
 ```text
-1B：每个 node 一棵独立 RadixTree
-2A：lookup 只考虑同节点本地 cache，不做跨节点 KV 拉取
+pool.used > lookup matched_blocks
 ```
 
-### 2. block-aligned split over-allocation 已修复
-
-V1 曾经存在一种过分配问题：`admit()` 先根据 `match_prefix()` 估算需要新增多少 blocks，再调用 `tree.insert()`。如果 `insert()` 触发 edge split，tree 的实际 block footprint 可能小于预先分配的 block 数。
-
-现在通过 `admit()` 末尾 reconcile pass 修复：
+但这个偏差是保守的：
 
 ```text
-pool.used > tree.total_block_capacity()
+pool.used >= matched_blocks_in_tree
 ```
 
-时，从 `_pool_ids` 尾部释放多余 block，使 `BlockPool` 的占用和 `RadixTree` 的容量统计重新对齐。
+也就是说，scheduler 最多会看到“剩余容量比理论最大可用量更少”，而不会看到“剩余容量比真实物理容量更多”。这是安全方向的偏差。
 
-这个修复解决了 block-aligned split 场景下的 over-allocation。
+## 被 rollback 的尝试：在 `admit()` 末尾 reconcile
 
-## 残留问题：small-node floor under-count
+之前有一个错误修复尝试：给 `RadixTree` 增加 `total_block_capacity(block_size)`，在 `admit()` 末尾比较：
 
-### 症状
+```text
+pool_used - actual_capacity
+```
 
-当 `admit()` 触发 `RadixTree` 在**非 block 边界**位置切分 edge 时，split 会产生一个 `key_len < block_size` 的 small node。
+然后从 `_pool_ids` 尾部释放多余 pool IDs。
 
-Sonnet 的 reconcile pass 使用：
+其中 `total_block_capacity(block_size)` 的含义是：
 
 ```python
-len(n.key) // block_size
+sum(len(node.key) // block_size for node in tree_nodes)
 ```
 
-也就是 floor 语义。这样 `key_len < block_size` 的 small node 会被计为 `0 blocks`。
+这个 reconcile 是错误的，因为它混淆了两个不同量：
 
-但从物理 KV cache 的角度看，这个 small node 仍然占用 KV cache 空间。
+- `pool.used`：物理 KV block 占用量。这是正确的物理 accounting。
+- `total_block_capacity`：用 floor 语义计算出来的“每个 radix node key 能装进多少完整 blocks”。它会忽略 non-block-aligned split 产生的 partial-block nodes。
 
-结果是：
+换句话说，`RadixTree` split 只是改变索引结构，不应该改变物理 KV blocks 的占用数量。
 
-- `pool.used` 会低估真实 KV 占用。
-- `free_blocks()` 会返回偏高的剩余容量。
-- scheduler 可能把请求误调度到一个实际上更满的 node。
+## Codex review 反例
 
-误差上界：每次 small-node split 最多低估 1 个 block。
-
-## 复现例子
+下面这个反例打破了 reconcile 的 invariant。
 
 假设：
 
@@ -96,167 +69,158 @@ block_size = 16
 第一步：
 
 ```python
-admit([0..63])
+admit([0..15])
 ```
 
-这会产生 4 blocks，leaf key 为 `[0..63]`。
+结果：
+
+```text
+1 block
+pool.used = 1
+```
 
 第二步：
 
 ```python
-admit([0..7] + [99..130])
+admit([0] + [99..130])
 ```
 
-这个 prompt 的共同前缀只有 8 tokens，不在 block 边界上。
+这是 32 个对齐 tokens，但它和已有 prompt 只共享第一个 token。
 
 过程：
 
 ```text
-match_prefix 返回 0
-new_blocks_needed = 3
-allocate 后 _pool_ids = 7
-tree.insert 在 cp=8 处 split
+match_prefix returns 0    # partial edge match
+allocate 2                # pool.used = 3
+tree.insert splits at cp=1
 ```
 
-split 后 tree 结构中出现：
+split 后：
 
-| 节点 | key 长度 | floor 计数 |
-|------|----------|------------|
-| mid `[0..7]` | 8 | 0 blocks |
-| leaf1 `[8..63]` | 56 | 3 blocks |
-| leaf2 `[99..130]` | 32 | 2 blocks |
+| Radix node | key_len | floor capacity |
+|------------|---------|----------------|
+| `mid([0])` | 1 | 0 |
+| `leaf1([1..15])` | 15 | 0 |
+| `leaf2([99..130])` | 31 | 1 |
 
 于是：
 
 ```text
-total_block_capacity = 0 + 3 + 2 = 5
+total_capacity = 0 + 0 + 1 = 1
 ```
 
-reconcile 看到：
+错误 reconcile 会认为：
 
 ```text
-pool.used = 7
-tree.total_block_capacity = 5
+pool.used = 3
+total_capacity = 1
+需要释放 2 个 blocks
 ```
 
-于是从尾部释放 2 个 pool blocks，把 `pool.used` 调到 5。
-
-但真实语义上：
+于是强行释放 2 个 pool IDs，让：
 
 ```text
-A 占 4 blocks
-B 占 3 blocks
-真实总占用应为 7 blocks
+pool.used = 1
 ```
 
-所以 `free_blocks()` 会比真实情况多报 2 个 blocks。
+但此时对新请求：
 
-## 影响评估
+```python
+lookup(req=[0, 99..130])
+```
 
-| 维度 | 影响 |
-|------|------|
-| 功能正确性 | 不会 crash，也不会直接造成数据丢失 |
-| 调度行为 | scheduler 可能认为某个 node 比实际更空，从而误路由请求 |
-| 容量控制 | 可能多 admit 一些请求，随后依赖 reactive eviction 自我修正 |
-| 指标质量 | `free_blocks()` 会有噪声，误差通常不超过每次 small-node split 1 个 block |
-| 严重程度 | P1，当前不是 P0 阻塞项 |
+仍然会返回：
+
+```text
+matched_blocks = 2
+```
+
+这就造成严重不一致：
+
+```text
+lookup(): GPU 上有 2 个 cache blocks 命中
+pool.used/free_blocks(): GPU 上只分配了 1 个 block
+```
+
+scheduler 如果用 `lookup()` 做路由、用 `free_blocks()` 做容量检查，就会得到互相矛盾的信号，产生不一致决策。
+
+## 为什么 rollback 是正确修复
+
+没有 reconcile 的 V1 中：
+
+```text
+lookup says: 2 blocks cached
+pool says: 3 blocks physically occupied
+```
+
+这两个说法可以同时为真：
+
+- `lookup()` 表示逻辑上可复用的完整 KV blocks。
+- `pool.used` 表示物理上已经分配出去的 KV blocks。
+
+因为 non-block-aligned split 会造成 partial-block waste，所以物理占用可以大于逻辑命中。这是保守偏差。
+
+而 reconcile 后：
+
+```text
+lookup says: 2 blocks cached
+pool says: 1 block physically occupied
+```
+
+这不可能同时为真。它会让 scheduler 的 cache-hit 信号和 capacity 信号互相打架。
+
+所以正确结论是：
+
+```text
+不要用 RadixTree.total_block_capacity() 去修正 BlockPool.pool.used。
+pool.used 是物理占用来源。
+RadixTree split 后的 floor capacity 不是物理占用。
+```
+
+## 什么时候再重新处理
+
+### 情况 1：generator 大量产生 non-block-aligned prefix sharing
+
+如果 `simulator/generator.py` 在大规模 workload 中持续生成非 block 对齐的共享前缀，并且物理 block waste 成为可测量问题，可以优先考虑：
+
+```text
+在 generator 中强制 shared prefix length 是 block_size 的整数倍。
+```
+
+这符合真实 vLLM PagedAttention 的固定大小 block 分页语义，改动也比重写 radix tree 小。
+
+### 情况 2：真实 workload trace 证明 partial-block waste 显著
+
+如果真实生产 trace 显示 partial-block waste 非常明显，再考虑在 `RadixTree` 层实现真正的 block-boundary-aware split。
+
+这会是更大的结构性改动，需要重新审视：
+
+- `RadixTree.insert()` 的 split 语义
+- partial edge match
+- `match_prefix()` 的 block 对齐行为
+- eviction 和 block accounting 的一致性
 
 ## 当前问题与差距
 
-| 问题 | 影响 | 证据 | 优先级 |
-|------|------|------|--------|
-| non-block-aligned split 会产生 small node | small node 物理占用 KV，但 floor 计数为 0 | `total_block_capacity` 使用 `len(key) // block_size` | 高 |
-| reconcile 会把真实占用误判为 over-allocation | `pool.used` 被调低，`free_blocks()` 偏高 | split 后 `pool.used=7`，capacity 统计为 5 | 高 |
-| `match_prefix()` 对 partial edge match 返回 0 | `admit()` 会高估新增 blocks，再由 reconcile 修正；非对齐时修正可能过头 | 复现例子中共同前缀 8 tokens，但 block-aligned 命中为 0 | 中 |
-| 当前 generator 未保证共享前缀 block-aligned | 测试或 workload 可能持续触发非对齐 split | 需要在 `simulator/generator.py` 侧约束 | 中 |
-
-## 缓解路径
-
-### 路径 1：推荐，在 generator 中强制共享前缀 block-aligned
-
-在 `simulator/generator.py` 中保证 prefix sharing length 是 `block_size` 的整数倍。
-
-优点：
-
-- 改动小。
-- 符合真实 vLLM 一类系统以固定大小 KV blocks 分页的语义。
-- 避免为了仿真 workload 的非对齐 case 重写 radix split。
-
-缺点：
-
-- 只是约束输入分布，不是从数据结构层面彻底修复。
-
-### 路径 2：重写 `RadixTree.insert()`，强制 block 边界 split
-
-让 radix tree 的 edge split 只能发生在 block boundary。
-
-优点：
-
-- 从根上解决 small-node floor under-count。
-- tree 的逻辑结构和 block accounting 更一致。
-
-缺点：
-
-- 改动大。
-- 可能影响已有 radix 测试。
-- 需要重新审视 partial prefix matching、node split、LRU eviction 的语义。
-
-### 路径 3：`total_block_capacity` 改成 ceiling 语义
-
-把：
-
-```python
-len(n.key) // block_size
-```
-
-改成类似：
-
-```python
-ceil(len(n.key) / block_size)
-```
-
-优点：
-
-- 改动小。
-- small node 不再被计为 0。
-
-缺点：
-
-- 会引入相反方向的偏差。
-- 对多个 small nodes 可能高估容量。
-- 需要重新校准 reconcile 语义。
+| 问题 | 当前处理 | 影响 | 优先级 |
+|------|----------|------|--------|
+| non-block-aligned split 会造成 partial-block waste | V1 接受，保留物理 `pool.used` | scheduler 可能看到略少的 free capacity | 中 |
+| `lookup()` 和 `pool.used` 是不同视图 | 保留差异，不强行 reconcile | 需要在文档和测试中明确语义 | 中 |
+| 没有 block-boundary-aware split | 暂不实现 | 如果真实 trace 浪费明显，后续再做 | 低 |
+| generator 未强制 block-aligned shared prefix | 暂不处理 | workload 可能产生更多 partial split | 低 |
 
 ## 后续 PR 候选
 
 | PR | 改动范围 | 验证方式 |
 |----|----------|----------|
-| PR-1：generator 强制 block-aligned prefix sharing | 修改 `simulator/generator.py`，让共享前缀长度对齐 `block_size` | 新增 generator 单测，确认共享前缀长度总是 16/32/48... |
-| PR-2：为 small-node under-count 加 regression test | 在 `tests/test_cache_manager.py` 复现 `[0..63]` + `[0..7]+[99..130]` | 先标记当前行为，再为后续修复提供保护 |
-| PR-3：评估 block-boundary split | spike `RadixTree.insert()` 的 block-aligned split 版本 | 跑完整 radix/cache manager 测试，确认是否破坏现有语义 |
-| PR-4：评估 ceiling capacity semantics | spike `total_block_capacity` ceiling 版本 | 对比 floor/ceil 在 aligned/non-aligned workload 下的 `pool.used` 偏差 |
+| PR-1：增加 rollback regression test | 覆盖 `[0..15]` 和 `[0]+[99..130]` 反例，确认不会 reconcile 到 `pool.used < lookup matched_blocks` | `pytest tests/test_cache_manager.py` |
+| PR-2：文档化 `lookup()` vs `pool.used` 语义 | 在源码 docstring 或 DESIGN 中说明逻辑命中和物理占用不同 | 文档 review |
+| PR-3：generator block-aligned shared prefix | 如果 workload 需要，约束共享前缀长度对齐 `block_size` | generator 单测 |
+| PR-4：block-boundary-aware RadixTree split | 远期结构性改动 | 跑完整 radix/cache manager 测试 |
 
-## 学习笔记
+## 相关代码
 
-这个问题的本质是：
-
-```text
-RadixTree 按 token prefix split，
-BlockPool 按 fixed-size KV block 计费。
-```
-
-当 split 点刚好落在 block boundary 上时，两者很容易对齐。
-
-当 split 点落在 block 内部时，就会出现 small node：
-
-```text
-key_len < block_size
-```
-
-这类 node 在 radix tree 语义里是合法的，但在 block accounting 语义里不好处理：
-
-- 用 floor 会低估。
-- 用 ceil 会高估。
-- 强制 block-aligned split 会改变 radix tree 结构。
-
-所以当前建议是 P1 先从 workload/generator 层面规避非 block-aligned sharing。等后续确实需要模拟任意 token 级共享前缀，再回到 `RadixTree` 层做更彻底的 block-aware split 设计。
+- `src/nano_kvrouter/kv_cache/cache_manager.py`：`admit()`、`lookup()`
+- `src/nano_kvrouter/kv_cache/radix_tree.py`：`insert()`、split logic
+- TaskList #8：closed，rollback chosen as the fix
 
