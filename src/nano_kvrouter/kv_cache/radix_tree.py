@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 
@@ -44,14 +45,24 @@ class RadixTree:
           nodes are never evicted directly — they go away only when all
           their children are gone (not modelled here; out of scope for
           the simulator's purposes).
-        * All time stamps use `time.time()` because the tree is unit-
-          tested in isolation. The production simulator wraps inserts in
-          events that carry simulated time; the LRU ordering still
-          works because the relative order is preserved.
+        * Time stamps are produced by an injected ``clock`` callable so that
+          the production simulator can pass ``engine.now`` and keep LRU
+          ordering in simulated time. The default (``time.time``) preserves
+          the original wall-clock behaviour used by standalone unit tests.
     """
 
-    def __init__(self) -> None:
-        """Initialize an empty tree with a sentinel root node."""
+    def __init__(self, clock: Callable[[], float] | None = None) -> None:
+        """Initialize an empty tree with a sentinel root node.
+
+        Args:
+            clock: Optional callable returning the current time as a float.
+                Defaults to ``time.time`` (wall-clock seconds) when ``None``.
+                Pass ``engine.now`` when running inside
+                :class:`~nano_kvrouter.simulator.engine.SimulationEngine` so
+                LRU timestamps are in simulated milliseconds instead of
+                wall-clock seconds.
+        """
+        self._clock: Callable[[], float] = clock if clock is not None else time.time
         self._root = RadixNode(key=[], block_id="root")
         # All non-root nodes indexed by block_id for O(1) eviction lookup.
         self._nodes: dict[str, RadixNode] = {}
@@ -81,7 +92,7 @@ class RadixTree:
 
         node = self._root
         pos = 0
-        now = time.time()
+        now = self._clock()
 
         while pos < len(token_ids):
             first = token_ids[pos]
@@ -156,7 +167,7 @@ class RadixTree:
         pos = 0
         best_pos = 0
         best_id = self._root.block_id
-        now = time.time()
+        now = self._clock()
 
         while pos < len(token_ids):
             first = token_ids[pos]

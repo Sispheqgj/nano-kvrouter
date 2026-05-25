@@ -140,3 +140,31 @@ def test_lru_evict_more_than_available():
 
     evicted = tree.evict_lru(10)   # only 1 node exists
     assert len(evicted) == 1
+
+
+# ---------------------------------------------------------------------------
+# 5. 可注入仿真时钟
+# ---------------------------------------------------------------------------
+
+def test_custom_clock_drives_access_time():
+    """注入 fake clock 后 last_access_time 应由 clock 决定而非 wall-clock。"""
+    times = iter([10.0, 20.0, 30.0])
+    tree = RadixTree(clock=lambda: next(times))
+
+    bid1 = tree.insert([1, 2, 3])
+    bid2 = tree.insert([4, 5, 6])
+    bid3 = tree.insert([7, 8, 9])
+
+    assert tree._nodes[bid1].last_access_time == 10.0
+    assert tree._nodes[bid2].last_access_time == 20.0
+    assert tree._nodes[bid3].last_access_time == 30.0
+
+
+def test_default_clock_is_wall_clock():
+    """不传 clock 时，last_access_time 应约等于 time.time()（容差 1 秒）。"""
+    t_before = time.time()
+    tree = RadixTree()
+    bid = tree.insert([100, 200, 300])
+    t_after = time.time()
+
+    assert t_before <= tree._nodes[bid].last_access_time <= t_after + 1.0
