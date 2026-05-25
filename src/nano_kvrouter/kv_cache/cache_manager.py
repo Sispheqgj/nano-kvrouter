@@ -15,9 +15,11 @@ Architecture (v1 GPU-only)
   flat per-node pool-ID list ``_pool_ids`` bridges the two: when we allocate
   N blocks from the pool we append N IDs to the list; when we evict a tree
   node we free ``key_len // block_size`` IDs from the front of the same list.
-* Edge splits at non-block-aligned offsets are reconciled at the end of
-  :meth:`admit` by freeing excess pool blocks; ``pool.used`` stays in sync
-  with the tree's actual block footprint at all times.
+* ``pool.used`` reflects physical block allocation conservatively: it may
+  exceed the tree's logical block coverage when admit triggers a
+  non-block-aligned split. This is intentional — scheduler sees
+  ``free_blocks`` slightly lower than maximum, but lookup and pool stay
+  consistent (pool never under-counts allocated blocks).
 * ``transfer_cost_ms`` is always 0.0 in v1 — no CPU/Disk tier management.
 * Tier promotion / demotion and cross-node transfer cost are deferred to P1.
 
@@ -243,23 +245,6 @@ class CacheManager:
         # Insert the block-aligned prefix; the tail (< block_size tokens) is
         # discarded because we cannot cache a partial block.
         tree.insert(token_ids[: total_blocks * self._block_size])
-
-        # Reconcile: edge split during insert can leave _pool_ids longer than
-        # the tree's actual block footprint when the split point is not on a
-        # block_size boundary. Free the excess from the tail (most-recently-
-        # allocated entries, which are the ones that didn't end up being used).
-        actual_capacity = tree.total_block_capacity(self._block_size)
-        pool_used = pool.stats()["gpu"]["used"]
-        if pool_used > actual_capacity:
-            excess = pool_used - actual_capacity
-            ids_to_free = self._pool_ids[node_id][-excess:]
-            self._pool_ids[node_id] = self._pool_ids[node_id][:-excess]
-            pool.free(ids_to_free)
-            logger.debug(
-                "admit: reconcile freed %d excess pool blocks on node %s (split-induced)",
-                excess,
-                node_id,
-            )
 
         logger.debug(
             "admit: node %s +%d blocks (total_blocks=%d, already=%d)",

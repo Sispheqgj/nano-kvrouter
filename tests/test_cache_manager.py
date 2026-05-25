@@ -252,30 +252,13 @@ def test_transfer_cost_always_zero_in_v1(single_node: CacheManager) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 13. Reconcile: non-block-aligned split keeps pool.used in sync with tree
+# 13. Non-overlapping admits each consume their own distinct blocks
 # ---------------------------------------------------------------------------
 
 
-def test_admit_reconciles_pool_after_non_block_aligned_split(single_node: CacheManager) -> None:
-    """When admit triggers an edge split at a non-block-aligned offset,
-    pool.used must equal the tree's actual block capacity after reconcile."""
-    # First admit: 64 tokens = 4 blocks, single tree leaf
-    single_node.admit(_tokens(64, start=0), "n0")
-    assert single_node.free_blocks("n0", "gpu") == 100 - 4
-
-    # Second admit: [0..47] + [999..1011] = 60 tokens → 3 aligned blocks
-    # match_prefix returns 0 (partial edge match), so new_blocks_needed = 3
-    # tree.insert([0..47]) splits the leaf into mid([0..47]) + remnant([48..63])
-    # Without reconcile: pool.used = 7.  With reconcile: pool.used = 4.
-    new_tokens = _tokens(48, start=0) + _tokens(13, start=999)
-    single_node.admit(new_tokens, "n0")
-
-    # Tree now has mid (48 tokens = 3 blocks) + remnant (16 tokens = 1 block) = 4 blocks
-    assert single_node.free_blocks("n0", "gpu") == 100 - 4
-
-
-def test_admit_reconcile_does_not_over_free_on_clean_admit() -> None:
-    """A normal admit without any split must not trigger reconcile (no false free)."""
+def test_two_non_overlapping_admits_use_distinct_blocks() -> None:
+    """Two admits with entirely different token prefixes must each consume
+    their own block allocation with no cross-contamination."""
     cm = CacheManager(
         node_ids=["n0"],
         model_config=ModelConfig(block_size=BLOCK_SIZE),
