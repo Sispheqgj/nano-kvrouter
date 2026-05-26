@@ -225,22 +225,34 @@ class RadixTree:
 
         return evicted
 
-    def total_block_capacity(self, block_size: int) -> int:
-        """Total KV block usage if each node's key were chunked by `block_size`.
+    def evict_lru_with_lengths(self, n_blocks: int) -> list[int]:
+        """Like evict_lru, but returns len(key) of each evicted node instead of block_id.
 
-        Sums `len(node.key) // block_size` across every non-root node in the
-        tree. Used by CacheManager to reconcile pool allocation against
-        the tree's actual logical block footprint after edge splits.
+        Used by CacheManager to compute physical block reclamation via
+        ceil(key_len / block_size) without a parallel block_id → pool mapping.
 
         Args:
-            block_size: Number of tokens per logical KV block.
+            n_blocks: Maximum number of leaves to evict.
 
         Returns:
-            Non-negative total block count. Returns 0 for an empty tree.
-
-        Raises:
-            ValueError: If block_size <= 0.
+            List of ``len(node.key)`` for each evicted node, in eviction order.
+            Empty if no eligible (unpinned, leaf) candidates remain.
         """
-        if block_size <= 0:
-            raise ValueError(f"block_size must be positive, got {block_size}")
-        return sum(len(n.key) // block_size for n in self._nodes.values())
+        evicted: list[int] = []
+
+        for _ in range(n_blocks):
+            candidates = [
+                n for n in self._nodes.values()
+                if not n.children and n.ref_count == 0
+            ]
+            if not candidates:
+                break
+
+            victim = min(candidates, key=lambda n: n.last_access_time)
+            assert victim.parent is not None
+            del victim.parent.children[victim.key[0]]
+            victim.parent = None
+            evicted.append(len(victim.key))
+            del self._nodes[victim.block_id]
+
+        return evicted

@@ -170,27 +170,19 @@ def test_default_clock_is_wall_clock():
     assert t_before <= tree._nodes[bid].last_access_time <= t_after + 1.0
 
 
+
 # ---------------------------------------------------------------------------
-# 6. total_block_capacity
+# 6. evict_lru_with_lengths — returns token counts not block_ids
 # ---------------------------------------------------------------------------
 
-def test_total_block_capacity_empty_tree():
+def test_evict_lru_with_lengths_returns_token_counts():
     tree = RadixTree()
-    assert tree.total_block_capacity(16) == 0
+    tree.insert([1, 2, 3])      # key_len=3
+    time.sleep(0.01)
+    tree.insert([4, 5, 6, 7])   # key_len=4
+    time.sleep(0.01)
+    tree.insert([8, 9])         # key_len=2
 
-
-def test_total_block_capacity_after_split():
-    """Capacity after split equals the sum across all surviving nodes."""
-    tree = RadixTree()
-    tree.insert(list(range(64)))         # 1 node, key_len=64, blocks=4
-    assert tree.total_block_capacity(16) == 4
-
-    # Insert a shorter prefix that forces a split: mid key=[0..47] + remnant key=[48..63]
-    tree.insert(list(range(48)))         # split: mid key=[0..47] (3 blocks) + child key=[48..63] (1 block)
-    assert tree.total_block_capacity(16) == 4
-
-
-def test_total_block_capacity_invalid_block_size_raises():
-    tree = RadixTree()
-    with pytest.raises(ValueError):
-        tree.total_block_capacity(0)
+    # Evict the 2 oldest leaves; their key lengths must be returned.
+    lengths = tree.evict_lru_with_lengths(2)
+    assert sorted(lengths) == [3, 4]
