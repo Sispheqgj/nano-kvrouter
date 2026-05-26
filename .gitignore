@@ -9,3 +9,10 @@ wheels/
 # Virtual environments
 .venv
 .claude/
+
+# Session logs
+*-protocol-design.txt
+*-design-kvrouter-*.txt
+
+# macOS junk
+.DS_Store
