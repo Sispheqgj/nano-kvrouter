@@ -270,3 +270,148 @@ def test_two_non_overlapping_admits_use_distinct_blocks() -> None:
     cm.admit(_tokens(64, start=1000), "n0")
     # Should use exactly 4 + 4 = 8 blocks
     assert cm.free_blocks("n0", "gpu") == 100 - 8
+
+
+# ---------------------------------------------------------------------------
+# 14. Codex regression — no orphan leak with non-aligned split + eviction
+# ---------------------------------------------------------------------------
+
+
+def test_no_orphan_leak_with_non_aligned_split_and_eviction() -> None:
+    """Codex regression: v1 leaked pool blocks when split created sub-block-sized
+    nodes (floor-capacity=0) and subsequent eviction couldn't account for them.
+    Capacity-counter ceiling design must keep _used in lockstep with tree state."""
+    cm = CacheManager(
+        node_ids=["n0"],
+        model_config=ModelConfig(block_size=BLOCK_SIZE),
+        node_config=NodeConfig(gpu_blocks=3, cpu_blocks=0, disk_blocks=0),
+        bandwidth_config=BandwidthConfig(),
+    )
+
+    # Stage 1: admit exactly 1 block (16 tokens)
+    cm.admit(_tokens(16, start=0), "n0")
+    assert cm.free_blocks("n0", "gpu") == 2
+
+    # Stage 2: non-aligned split — shared prefix is only 1 token
+    # [0] + _tokens(32, start=99) = 33 tokens → aligned to 32
+    # split: mid(key=[0], len=1) + child(key=[1..15], len=15) + leaf(key=[99..129], len=31)
+    # ceil((1+15+31)/16) = ceil(47/16) = 3 → all 3 GPU blocks used
+    new_tokens = [0] + _tokens(32, start=99)
+    cm.admit(new_tokens, "n0")
+    assert cm.free_blocks("n0", "gpu") == 0
+
+    # Stage 3: cold 3-block request must succeed, not raise MemoryError
+    cm.admit(_tokens(48, start=200), "n0")
+    assert cm.free_blocks("n0", "gpu") == 0
+
+    # The newly admitted sequence must be fully cached
+    req = _req(_tokens(48, start=200))
+    lk = cm.lookup(req, "n0")
+    assert lk.matched_tokens == 48
+    assert lk.matched_blocks_by_tier == {"gpu": 3}
+
+
+# ---------------------------------------------------------------------------
+# 15. Invariant — _used == ceil(tree total tokens / block_size) after each admit
+# ---------------------------------------------------------------------------
+
+
+def test_used_equals_tree_ceiling_after_each_admit() -> None:
+    cm = CacheManager(
+        node_ids=["n0"],
+        model_config=ModelConfig(block_size=BLOCK_SIZE),
+        node_config=NodeConfig(gpu_blocks=100),
+        bandwidth_config=BandwidthConfig(),
+    )
+    for length in [16, 32, 48, 17, 33]:
+        cm.admit(_tokens(length, start=length * 100), "n0")
+        tree = cm._trees["n0"]
+        total_tokens = sum(len(n.key) for n in tree._nodes.values())
+        expected = (total_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE
+        assert cm._used["n0"]["gpu"] == expected
+
+
+# ---------------------------------------------------------------------------
+# 16. lookup never reports more matched_blocks than _used
+# ---------------------------------------------------------------------------
+
+
+def test_lookup_never_exceeds_pool_used() -> None:
+    """For any query, matched_blocks <= _used. Lookup cannot report more
+    cached blocks than the counter says are physically allocated."""
+    cm = CacheManager(
+        node_ids=["n0"],
+        model_config=ModelConfig(block_size=BLOCK_SIZE),
+        node_config=NodeConfig(gpu_blocks=100),
+        bandwidth_config=BandwidthConfig(),
+    )
+    cm.admit(_tokens(64, start=0), "n0")
+    cm.admit([0] + _tokens(48, start=999), "n0")  # triggers a split
+
+    used = cm._used["n0"]["gpu"]
+
+    for query in [_tokens(64), [0] + _tokens(48, start=999), [0], _tokens(16)]:
+        lk = cm.lookup(_req(query), "n0")
+        matched_blocks = lk.matched_blocks_by_tier.get("gpu", 0)
+        assert matched_blocks <= used, (
+            f"INVARIANT BROKEN: matched_blocks={matched_blocks} > _used={used} "
+            f"for query={query[:5]}..."
+        )
+
+
+# ---------------------------------------------------------------------------
+# 17. Fast path: already-cached prompt does not allocate or evict
+# ---------------------------------------------------------------------------
+
+
+def test_admit_already_cached_is_noop_even_when_full_and_pinned() -> None:
+    """Re-admitting an already-cached prompt must succeed even when the
+    pool is full AND all leaves are pinned. Without the fast path, a
+    cache-aware scheduler routing to a hot node would incorrectly fail."""
+    cm = CacheManager(
+        node_ids=["n0"],
+        model_config=ModelConfig(block_size=BLOCK_SIZE),
+        node_config=NodeConfig(gpu_blocks=4, cpu_blocks=0, disk_blocks=0),
+        bandwidth_config=BandwidthConfig(),
+    )
+    cm.admit(_tokens(64, start=0), "n0")   # fill exactly
+    assert cm.free_blocks("n0", "gpu") == 0
+
+    # Pin every leaf so evict_lru would return nothing
+    for node in cm._trees["n0"]._nodes.values():
+        node.ref_count = 1
+
+    # Re-admit the same prompt — must be a no-op, no MemoryError
+    cm.admit(_tokens(64, start=0), "n0")
+    assert cm.free_blocks("n0", "gpu") == 0
+    # And it still looks up fully
+    lk = cm.lookup(_req(_tokens(64, start=0)), "n0")
+    assert lk.matched_tokens == 64
+
+
+# ---------------------------------------------------------------------------
+# 18. Oversize prompt fails fast without evicting existing cache
+# ---------------------------------------------------------------------------
+
+
+def test_admit_oversize_prompt_fails_without_evicting_existing_cache() -> None:
+    """A prompt larger than total capacity must raise MemoryError
+    immediately without touching any existing cache. Pre-check guard."""
+    cm = CacheManager(
+        node_ids=["n0"],
+        model_config=ModelConfig(block_size=BLOCK_SIZE),
+        node_config=NodeConfig(gpu_blocks=3, cpu_blocks=0, disk_blocks=0),
+        bandwidth_config=BandwidthConfig(),
+    )
+    # Fill with 3 blocks of useful cache
+    cm.admit(_tokens(48, start=0), "n0")
+    assert cm.free_blocks("n0", "gpu") == 0
+
+    # Oversized request: 4 blocks but capacity is 3 — must fail fast
+    with pytest.raises(MemoryError, match="exceeds total GPU capacity"):
+        cm.admit(_tokens(64, start=1000), "n0")
+
+    # Existing cache must NOT have been evicted
+    assert cm.free_blocks("n0", "gpu") == 0
+    lk = cm.lookup(_req(_tokens(48, start=0)), "n0")
+    assert lk.matched_tokens == 48   # original cache intact

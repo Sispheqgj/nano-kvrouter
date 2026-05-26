@@ -1,36 +1,24 @@
-"""Unified KV-cache interface over RadixTree + BlockPool.
+"""Unified KV-cache interface over RadixTree (capacity-counter design).
 
 CacheManager is the single entry point schedulers use to query prefix-hit
 details and the entry point the simulation engine uses to materialise new
 KV cache entries after prefill completes.
 
-Architecture (v1 GPU-only)
---------------------------
-* One :class:`~nano_kvrouter.kv_cache.radix_tree.RadixTree` per node — used
-  exclusively for prefix matching.
-* One :class:`~nano_kvrouter.kv_cache.block_pool.BlockPool` per node — used
-  exclusively for GPU block capacity accounting.
-* The two data structures are **parallel and independent**: RadixTree block
-  IDs (generated internally by the tree) never match BlockPool block IDs. A
-  flat per-node pool-ID list ``_pool_ids`` bridges the two: when we allocate
-  N blocks from the pool we append N IDs to the list; when we evict a tree
-  node we free ``key_len // block_size`` IDs from the front of the same list.
-* ``pool.used`` reflects physical block allocation conservatively: it may
-  exceed the tree's logical block coverage when admit triggers a
-  non-block-aligned split. This is intentional — scheduler sees
-  ``free_blocks`` slightly lower than maximum, but lookup and pool stay
-  consistent (pool never under-counts allocated blocks).
-* ``transfer_cost_ms`` is always 0.0 in v1 — no CPU/Disk tier management.
-* Tier promotion / demotion and cross-node transfer cost are deferred to P1.
-
-Design notes
-------------
-* ``matched_tokens`` returned by :meth:`lookup` is always aligned down to a
-  ``block_size`` boundary because the simulator stores one KV block per
-  ``block_size`` tokens; a partial last block cannot be reused.
-* :meth:`admit` calls ``pool.allocate`` **before** ``tree.insert`` so that a
-  ``MemoryError`` (pool full, nothing evictable) aborts without modifying the
-  tree.
+Architecture (v2 capacity-counter, GPU-only)
+--------------------------------------------
+* One :class:`~nano_kvrouter.kv_cache.radix_tree.RadixTree` per node.
+* Physical block accounting is derived directly from the tree state via
+  ceiling arithmetic: ``_used[node_id]["gpu"] == ceil(total_token_count /
+  block_size)``.  BlockPool is **not** called in v1 — it is retained as a
+  module for future P2 multi-tier accounting.
+* This eliminates the v1 ``_pool_ids`` mapping, which leaked blocks whenever
+  a RadixTree split produced sub-block-sized nodes (Codex review regression).
+* The fundamental invariant after every admit/evict:
+      ``_used[nid]["gpu"] == _tree_ceiling_blocks(nid)``
+  ``free_blocks`` is always derived from ``_capacity - _used``, so lookup
+  and capacity signals are always consistent.
+* ``transfer_cost_ms`` is always ``0.0`` in v1 — no CPU/Disk tier management.
+* Tier promotion / demotion and cross-node transfer cost are deferred to P2.
 """
 from __future__ import annotations
 
@@ -38,7 +26,6 @@ import logging
 from collections.abc import Callable, Sequence
 
 from nano_kvrouter.config import BandwidthConfig, ModelConfig, NodeConfig
-from nano_kvrouter.kv_cache.block_pool import BlockPool
 from nano_kvrouter.kv_cache.radix_tree import RadixTree
 from nano_kvrouter.request import Request
 from nano_kvrouter.scheduler.base import CacheLookup
@@ -49,7 +36,7 @@ __all__ = ["CacheManager"]
 
 
 class CacheManager:
-    """Unified read/write interface over per-node RadixTree + BlockPool pairs.
+    """Unified read/write interface over per-node RadixTrees.
 
     Satisfies the :class:`~nano_kvrouter.scheduler.base.CacheQuery` Protocol
     via structural subtyping so schedulers can query it without importing this
@@ -71,15 +58,15 @@ class CacheManager:
         *,
         clock: Callable[[], float] | None = None,
     ) -> None:
-        """Initialise per-node trees and pools.
+        """Initialise per-node trees and capacity counters.
 
         Args:
             node_ids: Stable sequence of node identifiers. Order is not
                 significant; IDs must be unique.
             model_config: Source of ``block_size`` used for alignment.
             node_config: Source of ``gpu_blocks`` / ``cpu_blocks`` /
-                ``disk_blocks`` forwarded to each node's :class:`BlockPool`.
-            bandwidth_config: Stored for future P1 transfer-cost calculations;
+                ``disk_blocks`` for capacity limits.
+            bandwidth_config: Stored for future P2 transfer-cost calculations;
                 not used in v1.
             clock: Optional simulated-time callable forwarded to each node's
                 :class:`RadixTree`. Defaults to ``time.time`` when ``None``.
@@ -88,15 +75,20 @@ class CacheManager:
         self._trees: dict[str, RadixTree] = {
             nid: RadixTree(clock=clock) for nid in node_ids
         }
-        self._pools: dict[str, BlockPool] = {
-            nid: BlockPool(node_config) for nid in node_ids
+        self._capacity: dict[str, dict[str, int]] = {
+            nid: {
+                "gpu": node_config.gpu_blocks,
+                "cpu": node_config.cpu_blocks,
+                "disk": node_config.disk_blocks,
+            }
+            for nid in node_ids
         }
+        self._used: dict[str, dict[str, int]] = {
+            nid: {"gpu": 0, "cpu": 0, "disk": 0} for nid in node_ids
+        }
+        # BlockPool is not used in v1; retained as a module for P2 multi-tier.
         self._model_cfg = model_config
         self._bw_cfg = bandwidth_config
-        # Flat ordered list of currently-allocated pool block IDs per node.
-        # Invariant: len(_pool_ids[nid]) == pools[nid].stats()["gpu"]["used"]
-        # (subject to the v1 simplification described in the module docstring).
-        self._pool_ids: dict[str, list[str]] = {nid: [] for nid in node_ids}
 
     # ------------------------------------------------------------------
     # CacheQuery Protocol — read-only
@@ -152,6 +144,9 @@ class CacheManager:
     def free_blocks(self, node_id: str, tier: str) -> int:
         """How many free blocks *node_id* has on *tier*.
 
+        Derived from ``_capacity - _used``. Always consistent with
+        :meth:`lookup` because both come from the same tree state.
+
         Args:
             node_id: Node to inspect.
             tier: Storage tier (``"gpu"`` / ``"cpu"`` / ``"disk"``).
@@ -163,10 +158,11 @@ class CacheManager:
             KeyError: If *node_id* is unknown or *tier* is not one of the
                 three valid tiers.
         """
-        if node_id not in self._pools:
+        if node_id not in self._capacity:
             raise KeyError(node_id)
-        # pool.stats() returns only known tiers; unknown tier → KeyError naturally.
-        return self._pools[node_id].stats()[tier]["free"]
+        if tier not in self._capacity[node_id]:
+            raise KeyError(tier)
+        return self._capacity[node_id][tier] - self._used[node_id][tier]
 
     # ------------------------------------------------------------------
     # Write path — called by SimulationEngine after PREFILL_COMPLETE
@@ -176,9 +172,14 @@ class CacheManager:
         """Materialise the KV cache for *token_ids* on *node_id*.
 
         Called by the simulation engine's ``PREFILL_COMPLETE`` handler once
-        a prefill is done. Inserts the prompt prefix into the RadixTree and
-        allocates the corresponding GPU blocks from the BlockPool, evicting
-        LRU entries first when capacity is exhausted.
+        a prefill is done. Inserts the block-aligned prefix into the
+        RadixTree and updates the GPU capacity counter, evicting LRU entries
+        first when capacity is exhausted.
+
+        Physical block accounting uses ceiling semantics:
+        ``used = ceil(total_tree_tokens / block_size)``.
+        This prevents the orphan leak that occurred in v1 when split created
+        sub-block-sized nodes whose floor-capacity was 0.
 
         Only full ``block_size``-aligned blocks are stored; a trailing
         partial block is discarded.
@@ -189,67 +190,91 @@ class CacheManager:
 
         Raises:
             KeyError: If *node_id* is unknown.
-            MemoryError: If the GPU tier is full and all remaining blocks are
-                pinned (``ref_count > 0``), making eviction impossible.
+            MemoryError: If (a) the GPU tier is full and all remaining blocks
+                are pinned (``ref_count > 0``), making eviction impossible; or
+                (b) the prompt requires more blocks than the node's total GPU
+                capacity.
+
+        Notes:
+            If the aligned prompt is already fully present in the tree (a
+            scheduler re-routes to a node that already cached this prefix),
+            admit is a no-op — no eviction, no allocation. This is essential
+            for cache-aware schedulers to behave correctly under pinned-leaf
+            full-pool conditions.
         """
         if node_id not in self._trees:
             raise KeyError(node_id)
 
         tree = self._trees[node_id]
-        pool = self._pools[node_id]
+        bs = self._block_size
 
-        total_blocks = len(token_ids) // self._block_size
+        total_blocks = len(token_ids) // bs
         if total_blocks == 0:
             logger.debug("admit: token_ids too short for even one block, no-op")
             return
+        aligned_tokens = token_ids[: total_blocks * bs]
 
-        already_matched, _ = tree.match_prefix(token_ids)
-        already_blocks = already_matched // self._block_size
-        new_blocks_needed = total_blocks - already_blocks
-
-        if new_blocks_needed <= 0:
-            logger.debug("admit: node %s already has full coverage, no-op", node_id)
+        # Fast path: if every block of the aligned prompt is already cached,
+        # admit is a no-op — no allocation needed even if pool is full or
+        # all leaves are pinned.
+        matched_raw, _ = tree.match_prefix(aligned_tokens)
+        already_blocks = matched_raw // bs
+        if already_blocks >= total_blocks:
+            logger.debug(
+                "admit: node %s already has %d/%d blocks cached, no-op",
+                node_id, already_blocks, total_blocks,
+            )
             return
 
-        # Evict LRU leaves until we have enough free GPU slots.
-        # We inspect each candidate BEFORE eviction to know how many pool
-        # blocks its key represents (eviction removes the node from _nodes).
-        while pool.stats()["gpu"]["free"] < new_blocks_needed:
-            candidates = [
-                n for n in tree._nodes.values()
-                if not n.children and n.ref_count == 0
-            ]
-            if not candidates:
-                # All remaining nodes are pinned or tree is empty; let
-                # pool.allocate raise MemoryError below.
-                break
-
-            lru_node = min(candidates, key=lambda n: n.last_access_time)
-            lru_blocks = len(lru_node.key) // self._block_size
-
-            tree.evict_lru(1)  # removes lru_node; same LRU selection as above
-            logger.debug(
-                "admit: evicted %d-block node from node %s", lru_blocks, node_id
+        # Pre-check: a prompt requiring more blocks than total capacity can
+        # never fit. Fail fast without evicting existing cache.
+        worst_case_new = total_blocks
+        capacity_gpu = self._capacity[node_id]["gpu"]
+        if worst_case_new > capacity_gpu:
+            raise MemoryError(
+                f"node {node_id!r}: prompt requires {worst_case_new} blocks, "
+                f"exceeds total GPU capacity {capacity_gpu}"
             )
 
-            if lru_blocks > 0:
-                pid_list = self._pool_ids[node_id]
-                to_free = pid_list[:lru_blocks]
-                self._pool_ids[node_id] = pid_list[lru_blocks:]
-                pool.free(to_free)
+        while capacity_gpu - self._used[node_id]["gpu"] < worst_case_new:
+            evicted_lens = tree.evict_lru_with_lengths(1)
+            if not evicted_lens:
+                raise MemoryError(
+                    f"node {node_id!r} GPU pool full and no evictable cache; "
+                    f"need {worst_case_new}, "
+                    f"free {capacity_gpu - self._used[node_id]['gpu']}"
+                )
+            for klen in evicted_lens:
+                freed = (klen + bs - 1) // bs
+                self._used[node_id]["gpu"] = max(
+                    0, self._used[node_id]["gpu"] - freed
+                )
+            # Re-sync to ground truth after each eviction round.
+            self._used[node_id]["gpu"] = self._tree_ceiling_blocks(node_id)
 
-        # Raises MemoryError if pool is still full after exhausting evictions.
-        new_pool_ids = pool.allocate(new_blocks_needed, "gpu")
-        self._pool_ids[node_id].extend(new_pool_ids)
-
-        # Insert the block-aligned prefix; the tail (< block_size tokens) is
-        # discarded because we cannot cache a partial block.
-        tree.insert(token_ids[: total_blocks * self._block_size])
+        pre = self._tree_ceiling_blocks(node_id)
+        tree.insert(aligned_tokens)
+        post = self._tree_ceiling_blocks(node_id)
+        self._used[node_id]["gpu"] = post
 
         logger.debug(
-            "admit: node %s +%d blocks (total_blocks=%d, already=%d)",
+            "admit: node %s blocks %d→%d (total_blocks=%d)",
             node_id,
-            new_blocks_needed,
+            pre,
+            post,
             total_blocks,
-            already_blocks,
         )
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _tree_ceiling_blocks(self, node_id: str) -> int:
+        """Total physical GPU blocks needed to store all tokens in node_id's tree.
+
+        Uses ceiling semantics matching vLLM PagedAttention block allocation:
+        a partial block at the tail still occupies one physical block slot.
+        """
+        bs = self._block_size
+        total_tokens = sum(len(n.key) for n in self._trees[node_id]._nodes.values())
+        return (total_tokens + bs - 1) // bs
