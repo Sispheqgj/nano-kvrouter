@@ -265,3 +265,32 @@ def test_ttft_reflects_cache_hit(
     assert dec.prefill_node == "n0"
     # uncached = 128 - 64 = 64 tokens × 0.1 ms = 6.4 ms; queue = 0
     assert dec.estimated_ttft_ms == pytest.approx(64 * 0.1)
+
+
+# ---------------------------------------------------------------------------
+# 13. Regression: full-hit node with zero free_blocks must NOT be penalised
+# ---------------------------------------------------------------------------
+
+
+def test_full_hit_node_at_capacity_not_eviction_penalised(
+    cm: CacheManager, nodes: list[MockEngineNode]
+) -> None:
+    """Codex regression (Important): eviction_cost must subtract already-cached
+    blocks before computing shortage.
+
+    n0: fully cached (4 blocks), free_blocks=0.
+    n1: cold, free_blocks=4 (plenty of room).
+
+    Without the fix, E2 computed shortage=4 for n0 (wrong — no new blocks
+    needed) and shortage=0 for n1.  With w_eviction=2, w_run=1, w_h=0:
+      old  score(n0) = 2×6.4 + 1×0   = 12.8  → n1 wrongly wins
+      fix  score(n0) = 2×0   + 1×0   = 0.0   → n0 correctly wins
+    """
+    cm.admit(list(range(64)), "n0")      # 4 blocks on n0; free_blocks → 0
+    assert cm.free_blocks("n0", "gpu") == 0
+
+    policy = E2Policy(w_historical=0, w_eviction=2, w_run=1, model_config=MODEL)
+    req = _make_request(list(range(64)))
+    dec = policy.schedule(req, nodes[:2], cm)
+    # n0 is fully cached — no eviction needed — must be chosen over cold n1
+    assert dec.prefill_node == "n0"

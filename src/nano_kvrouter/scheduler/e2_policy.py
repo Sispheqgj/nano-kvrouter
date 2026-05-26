@@ -136,12 +136,15 @@ class E2Policy:
         prompt_len = len(request.token_ids)
         bs = self._model_cfg.block_size
         ppt = self._model_cfg.prefill_cost_per_token_ms
-        needed_blocks = prompt_len // bs
+        total_blocks = prompt_len // bs
 
         def _score(n: MockEngineNode) -> float:
             matched = lookups[n.node_id].matched_tokens
+            # Only blocks NOT already cached require new allocation (and potential
+            # eviction). A fully-cached node needs 0 new blocks even if free==0.
+            new_blocks = max(0, total_blocks - matched // bs)
             hist = n.current_load() * prompt_len * ppt
-            shortage = max(0, needed_blocks - cache.free_blocks(n.node_id, "gpu"))
+            shortage = max(0, new_blocks - cache.free_blocks(n.node_id, "gpu"))
             evict = shortage * bs * ppt
             run = n.estimate_prefill_time(prompt_len, cached_tokens=matched) + n.queue_wait_time()
             return self._w_h * hist + self._w_e * evict + self._w_r * run

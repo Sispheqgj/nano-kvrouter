@@ -46,8 +46,8 @@ class MooncakeConductor:
     1. Choose ``chosen = max(nodes, key=score)`` — the globally best node.
     2. Compute ``est_ttft`` and ``est_tbt`` for *that* node.
     3. If either prediction exceeds the request's SLO, reject immediately.
-       No fallback to another node is attempted — if the best node fails,
-       the cluster is too loaded to serve this request within SLO.
+       No fallback to another node is attempted (design choice 6A) — the
+       request is rejected even if an alternative node could serve it.
 
     Rejection carries ``estimated_ttft_ms`` / ``estimated_tbt_ms`` set to
     the actual predicted values (not 0) so ``MetricsCollector`` can record
