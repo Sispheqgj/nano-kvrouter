@@ -14,6 +14,8 @@
 | 源码文件 | Review 文档 | 状态 | 对照材料 |
 |----------|-------------|------|----------|
 | `src/nano_kvrouter/engine/mock_node.py` | [`engine/mock_node.md`](engine/mock_node.md) | 已审阅 | Sarathi-Serve |
+| `src/nano_kvrouter/kv_cache/cache_manager.py` | [`kv_cache/cache_manager.md`](kv_cache/cache_manager.md) | 已审阅 | RadixTree / BlockPool |
+| `src/nano_kvrouter/metrics/collector.py` | [`metrics/collector.md`](metrics/collector.md) | 已审阅 | Mooncake / Sarathi-Serve |
 
 ## 待补文档
 
@@ -23,5 +25,3 @@
 | `src/nano_kvrouter/kv_cache/block_pool.py` | vLLM v1 / HiCache | block metadata、tier movement、capacity pressure |
 | `src/nano_kvrouter/scheduler/base.py` | SGLang / Mooncake / Preble | policy interface、SLO-aware decision |
 | `src/nano_kvrouter/simulator/engine.py` | serving simulator pattern | event loop、chunked prefill、migration |
-| `src/nano_kvrouter/metrics/collector.py` | LLM serving metrics | TTFT、TBT、reject rate、cache hit rate |
-

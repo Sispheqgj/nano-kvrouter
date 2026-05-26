@@ -27,6 +27,8 @@ nano-kvrouter 是一个 KV-cache-centric LLM serving control-plane simulator。
 - Code review 索引：[`doc/code-review/README.md`](code-review/README.md)
 - Per-file 模板：[`doc/code-review/TEMPLATE.md`](code-review/TEMPLATE.md)
 - `mock_node.py` review：[`doc/code-review/engine/mock_node.md`](code-review/engine/mock_node.md)
+- `cache_manager.py` review：[`doc/code-review/kv_cache/cache_manager.md`](code-review/kv_cache/cache_manager.md)
+- `collector.py` review：[`doc/code-review/metrics/collector.md`](code-review/metrics/collector.md)
 
 ## 待审阅模块 Backlog
 
@@ -35,11 +37,12 @@ nano-kvrouter 是一个 KV-cache-centric LLM serving control-plane simulator。
 | 模块 | Review 文档 | 对照系统 | 重点问题 |
 |------|-------------|----------|----------|
 | Mock node | [`doc/code-review/engine/mock_node.md`](code-review/engine/mock_node.md) | Sarathi-Serve | chunked prefill、token budget、generation stall |
+| Cache manager | [`doc/code-review/kv_cache/cache_manager.md`](code-review/kv_cache/cache_manager.md) | RadixTree / BlockPool | split-aware reconcile rollback，区分逻辑命中和物理占用 |
 | Radix prefix cache | 待建 | SGLang RadixAttention | prefix match、node split、LRU eviction 是否表达清楚 |
 | Block pool | 待建 | vLLM v1 / HiCache | block metadata、tier movement、capacity pressure |
 | Scheduler protocol | 待建 | SGLang / Mooncake / Preble | policy interface 是否能承载 cache-aware 和 SLO-aware 决策 |
 | Event engine | 待建 | serving simulator pattern | event loop 是否能支持 chunked prefill 和 migration |
-| Metrics collector | 待建 | LLM serving metrics | TTFT、TBT、reject rate、cache hit rate 的定义是否稳定 |
+| Metrics collector | [`doc/code-review/metrics/collector.md`](code-review/metrics/collector.md) | Mooncake / Sarathi-Serve | TTFT/TBT v2 定义，TBT per-step weighting |
 
 ## PR 拆分原则
 
