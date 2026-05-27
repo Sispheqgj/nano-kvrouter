@@ -34,7 +34,7 @@ class MooncakeConductor:
     * ``cache_benefit(n) = matched_tokens × prefill_cost_per_token_ms``
       — reusable computation; larger is better.
     * ``load_penalty(n)  = current_load() × prompt_len × prefill_cost_per_token_ms
-                           + queue_wait_time()``
+                           + queue_wait_time(prompt_len, expected_output_len)``
       — scheduling pressure from existing traffic; smaller is better.
     * ``transfer_penalty(n) = CacheLookup.transfer_cost_ms``
       — cost of migrating KV blocks across tiers / nodes to this node.
@@ -134,7 +134,7 @@ class MooncakeConductor:
         def score(n: MockEngineNode) -> float:
             matched = lookups[n.node_id].matched_tokens
             cache_benefit = matched * ppt
-            load_penalty = n.current_load() * prompt_len * ppt + n.queue_wait_time()
+            load_penalty = n.current_load() * prompt_len * ppt + n.queue_wait_time(prompt_len, request.expected_output_len)
             transfer_penalty = lookups[n.node_id].transfer_cost_ms
             return (
                 self._alpha * cache_benefit
@@ -148,7 +148,7 @@ class MooncakeConductor:
         chosen_matched = lookups[chosen.node_id].matched_tokens
         est_ttft = (
             chosen.estimate_prefill_time(prompt_len, cached_tokens=chosen_matched)
-            + chosen.queue_wait_time()
+            + chosen.queue_wait_time(prompt_len, request.expected_output_len)
         )
         est_tbt = chosen.estimate_decode_time(len(chosen.running_requests) + 1)
 

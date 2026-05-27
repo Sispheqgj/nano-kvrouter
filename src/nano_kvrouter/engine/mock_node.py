@@ -91,39 +91,91 @@ class MockEngineNode:
         """
         return len(self.running_requests) / self.node_config.capacity
 
-    def queue_wait_time(self) -> float:
-        """Rough wait-time estimate for everything currently queued.
+    def queue_wait_time(
+        self,
+        prompt_len: int | None = None,
+        expected_output_len: int | None = None,
+    ) -> float:
+        """Conservative upper-bound estimate of how long a new admittee waits.
+
+        Models capacity-aware admission:
+        * If ``running_requests`` < ``capacity``, a slot is open for immediate
+          admission — wait time is 0.
+        * Otherwise the new request must wait for ``queue_length + 1``
+          currently-blocking requests to complete (each modelled as a full
+          prefill + decode lifecycle, the conservative upper bound).
+
+        Args:
+            prompt_len: New request's prompt length in tokens. When supplied
+                with expected_output_len, computes full lifecycle estimate.
+            expected_output_len: New request's expected decode steps. Required
+                together with prompt_len for the accurate estimate.
 
         Returns:
-            `queue_depth * decode_base_ms`. This is intentionally
-            optimistic — it assumes each queued request blocks for one
-            decode step worth of time — and is used only as a relative
-            penalty when comparing nodes, not as an absolute SLO check.
+            Wait time in milliseconds.
+            - 0.0 when there is a free slot at admission time.
+            - With both args: ``n_blockers × (prompt_len × ppt + output_len ×
+              (decode_base + marginal))``
+            - Without args (legacy): ``n_blockers × decode_base_ms``. Coarse
+              fallback; new callers should always supply args.
+
+        Known limitation (v1):
+            Uses *the new request's* ``prompt_len`` / ``expected_output_len``
+            to estimate the lifecycle of every blocker — because the node
+            stores only request IDs, not the prompt/output lengths of
+            already-admitted requests. Accurate for the current fixed-length
+            :class:`RequestGenerator`. For trace replay / bursty workloads
+            with heterogeneous lengths, short blockers ahead of a long new
+            request will underestimate wait, and a long blocker ahead of a
+            short new request will overestimate. This is acceptable for v1
+            because the Conductor's SLO check is intentionally a conservative
+            *gate* (false accepts are worse than false rejects); to make it
+            length-aware in v2, ``MockEngineNode`` would need to track the
+            ``(prompt_len, expected_output_len)`` of each running/queued
+            request.
         """
-        return len(self.queue) * self.model_config.decode_base_ms
+        if len(self.running_requests) < self.node_config.capacity:
+            return 0.0
+
+        n_blockers = len(self.queue) + 1  # 1 running must finish + N queued ahead
+
+        if prompt_len is None or expected_output_len is None:
+            # Legacy fallback; new callers should always supply args.
+            return n_blockers * self.model_config.decode_base_ms
+
+        per_req_lifecycle_ms = (
+            prompt_len * self.model_config.prefill_cost_per_token_ms
+            + expected_output_len * (
+                self.model_config.decode_base_ms + self.model_config.marginal_decode_ms
+            )
+        )
+        return n_blockers * per_req_lifecycle_ms
 
     # ------------------------------------------------------------------
     # Request lifecycle (used by the simulation engine)
     # ------------------------------------------------------------------
 
-    def admit(self, request_id: str) -> None:
+    def admit(self, request_id: str) -> bool:
         """Admit a request — into `running_requests` if capacity allows, else `queue`.
 
         Args:
             request_id: Opaque ID owned by the scheduler/simulator.
 
         Returns:
-            None. The simulator inspects `running_requests` / `queue`
-            after the call to decide which event to emit next.
+            True if the request entered `running_requests` immediately and
+            can start processing. False if it was placed in `queue` because
+            capacity is exhausted; callers must defer downstream events until
+            :meth:`complete` promotes this request.
         """
         if len(self.running_requests) < self.node_config.capacity:
             self.running_requests.append(request_id)
-            logger.debug("node %s admitted %s", self.node_id, request_id)
-        else:
-            self.queue.append(request_id)
-            logger.debug("node %s queued %s", self.node_id, request_id)
+            logger.debug("node %s admitted %s (running)", self.node_id, request_id)
+            return True
+        self.queue.append(request_id)
+        logger.debug("node %s queued %s", self.node_id, request_id)
+        return False
 
-    def complete(self, request_id: str) -> None:
+    def complete(self, request_id: str) -> str | None:
         """Mark a request as finished and promote the next queued one if room frees up.
 
         Args:
@@ -132,9 +184,13 @@ class MockEngineNode:
                 because a request can be cancelled while still queued.
 
         Returns:
-            None. If a queued request gets promoted, it is appended to
-            `running_requests` so the caller can tell the simulator to
-            schedule it.
+            The request_id of the promoted request if one was moved from
+            `queue` into `running_requests`; `None` if the queue was
+            empty or the just-completed request was itself still queued.
+
+        Raises:
+            ValueError: If *request_id* is in neither `running_requests`
+                nor `queue`.
         """
         try:
             self.running_requests.remove(request_id)
@@ -146,3 +202,5 @@ class MockEngineNode:
             promoted = self.queue.pop(0)
             self.running_requests.append(promoted)
             logger.debug("node %s promoted queued %s", self.node_id, promoted)
+            return promoted
+        return None

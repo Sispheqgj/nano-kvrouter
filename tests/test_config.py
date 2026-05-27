@@ -61,10 +61,10 @@ def test_default_yaml_slo_values():
 def test_default_yaml_workload_values():
     cfg = load_config(str(DEFAULT_YAML))
     assert cfg.workload.request_rate == pytest.approx(50.0)
-    assert cfg.workload.duration_s == pytest.approx(60.0)
+    assert cfg.workload.duration_s == pytest.approx(10.0)
     assert cfg.workload.prefix_sharing_ratio == pytest.approx(0.6)
     assert cfg.workload.avg_prompt_len == 1024
-    assert cfg.workload.avg_output_len == 256
+    assert cfg.workload.avg_output_len == 64
 
 
 def test_empty_yaml_uses_all_defaults(tmp_path):

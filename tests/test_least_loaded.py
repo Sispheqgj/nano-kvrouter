@@ -175,7 +175,10 @@ def test_ttft_equals_cold_prefill_plus_queue_wait(policy: LeastLoadedPolicy) -> 
     cache = NullCacheQuery(node_ids=["n0"])
     dec = policy.schedule(req, [node], cache)
 
-    expected_ttft = 20 * MODEL.prefill_cost_per_token_ms + 1 * MODEL.decode_base_ms
+    # 8 running == capacity, 1 queued → n_blockers = 1+1 = 2
+    # per_req = 20*0.1 + 32*(5.0+1.0) = 2.0 + 192.0 = 194.0
+    # queue_wait = 2 * 194.0 = 388.0; cold prefill = 2.0
+    expected_ttft = 20 * MODEL.prefill_cost_per_token_ms + 2 * (20 * MODEL.prefill_cost_per_token_ms + 32 * (MODEL.decode_base_ms + MODEL.marginal_decode_ms))
     assert dec.estimated_ttft_ms == pytest.approx(expected_ttft)
 
 

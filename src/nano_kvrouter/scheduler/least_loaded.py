@@ -82,7 +82,7 @@ class LeastLoadedPolicy:
         prompt_len = len(request.token_ids)
         # Cold prefill assumption: never call cache, so cached_tokens=0.
         prefill_ms = node.estimate_prefill_time(prompt_len, cached_tokens=0)
-        queue_ms = node.queue_wait_time()
+        queue_ms = node.queue_wait_time(prompt_len, request.expected_output_len)
         ttft_ms = prefill_ms + queue_ms
 
         # Batch size grows by 1 when this request is admitted.

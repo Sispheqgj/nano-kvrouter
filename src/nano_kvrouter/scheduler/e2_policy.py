@@ -47,7 +47,7 @@ class E2Policy:
 
     * **run_cost** (w_run): actual cost of running the request.
       ``estimate_prefill_time(prompt_len, cached_tokens) +
-      queue_wait_time()`` — lower when there is a cache hit and a short
+      queue_wait_time(prompt_len, expected_output_len)`` — lower when there is a cache hit and a short
       queue.
 
     Ties (equal score) are broken by stable index order in the ``nodes``
@@ -146,7 +146,7 @@ class E2Policy:
             hist = n.current_load() * prompt_len * ppt
             shortage = max(0, new_blocks - cache.free_blocks(n.node_id, "gpu"))
             evict = shortage * bs * ppt
-            run = n.estimate_prefill_time(prompt_len, cached_tokens=matched) + n.queue_wait_time()
+            run = n.estimate_prefill_time(prompt_len, cached_tokens=matched) + n.queue_wait_time(prompt_len, request.expected_output_len)
             return self._w_h * hist + self._w_e * evict + self._w_r * run
 
         chosen = min(nodes, key=_score)
@@ -154,7 +154,7 @@ class E2Policy:
         chosen_matched = lookups[chosen.node_id].matched_tokens
         ttft_ms = (
             chosen.estimate_prefill_time(prompt_len, cached_tokens=chosen_matched)
-            + chosen.queue_wait_time()
+            + chosen.queue_wait_time(prompt_len, request.expected_output_len)
         )
         tbt_ms = chosen.estimate_decode_time(len(chosen.running_requests) + 1)
 

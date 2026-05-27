@@ -224,7 +224,8 @@ def test_beta_zero_ignores_load(
         nodes[1].admit(f"q{i}")
     # n0 is completely idle
 
-    req = _req(list(range(64)))
+    # slo_ttft must exceed n1's queue_wait(64,32) = 11×182.4 = 2006.4 ms
+    req = _req(list(range(64)), slo_ttft=5000.0)
     dec = MooncakeConductor(alpha=1, beta=0, gamma=0, model_config=_MC).schedule(
         req, nodes[:2], cm
     )
@@ -269,34 +270,34 @@ def test_empty_nodes_returns_no_nodes_available(cm: CacheManager) -> None:
 def test_slo_check_based_on_chosen_node_not_all_nodes(
     cm: CacheManager, nodes: list[MockEngineNode]
 ) -> None:
-    """Design 6A verification: Conductor rejects when the max-score node
-    fails SLO — it does not try alternative nodes that could pass.
+    """Design 6A: Conductor rejects when the max-score node fails SLO,
+    even though another node could serve the request.
 
-    Setup:
-    * n0: no cache, idle → est_ttft = 6.4 ms < slo_ttft=10 → would pass
-    * n1: full cache hit, 8 running + 10 queued
-         → est_ttft = 0 + 10×5.0 = 50 ms > slo_ttft=10 → would fail
-         → but cache_benefit is huge so score(n1) >> score(n0)
+    Setup (α=20, β=1, γ=0, model ppt=0.1, base=5.0, marginal=0.5):
+    * n0: cold, idle → est_ttft = 12.8 ms < slo_ttft=100 → would pass
+    * n1: 7 blocks (112 tokens) cached, 8 running (at capacity)
+         → queue_wait(128, 32) = 1×(128×0.1 + 32×5.5) = 188.8 ms
+         → est_ttft = 16×0.1 + 188.8 = 190.4 ms > slo_ttft=100 → fails
+         → but cache_benefit drives score(n1) above score(n0)
 
-    With α=20 β=1:
-      score(n0) = 0
-      score(n1) = 20×6.4 − (1.0×64×0.1 + 50.0) = 128 − 56.4 = 71.6 > 0
+    Score arithmetic:
+      score(n0) = 20×0 − (0 + 0) = 0
+      score(n1) = 20×(112×0.1) − ((8/8)×128×0.1 + 188.8)
+               = 224 − 201.6 = 22.4 > 0
 
-    Conductor picks n1, finds its est_ttft=50 > slo=10, rejects.
+    Conductor picks n1, finds est_ttft=190.4 > slo=100, rejects.
     n0 could serve the request but is never tried (design 6A, not 6B).
     """
-    cm.admit(list(range(64)), "n1")           # 4 blocks cached on n1
-    for i in range(8):
-        nodes[1].admit(f"run{i}")             # fill running slots
-    for i in range(10):
-        nodes[1].admit(f"que{i}")             # add 10 queued requests
+    cm.admit(list(range(112)), "n1")     # 7 blocks (112 tokens) cached on n1
+    for i in range(8):                    # fill n1 to capacity
+        nodes[1].admit(f"run{i}")         # 8 running = capacity
 
-    req = _req(list(range(64)), slo_ttft=10.0, slo_tbt=100.0)
+    req = _req(list(range(128)), slo_ttft=100.0, slo_tbt=100.0)
     dec = MooncakeConductor(
         alpha=20, beta=1, gamma=0, model_config=_MC
     ).schedule(req, nodes[:2], cm)
 
     assert dec.is_rejected
     assert dec.reject_reason == "ttft_slo_exceeded"
-    # Estimated TTFT reflects n1's queue (50 ms), not n0's cold prefill
-    assert dec.estimated_ttft_ms == pytest.approx(50.0)
+    # est_ttft = prefill(16 uncached) + queue_wait = 1.6 + 188.8 = 190.4 ms
+    assert dec.estimated_ttft_ms == pytest.approx(190.4)

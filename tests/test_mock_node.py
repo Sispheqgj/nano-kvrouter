@@ -119,7 +119,8 @@ def test_queue_wait_time_one_queued(node: MockEngineNode, node_config: NodeConfi
     for i in range(node_config.capacity):
         node.admit(f"req-{i}")
     node.admit("overflow-1")
-    assert node.queue_wait_time() == pytest.approx(5.0)  # 1 * decode_base_ms
+    # 32 running == capacity, 1 queued → n_blockers = 1+1 = 2; legacy = 2 * decode_base_ms
+    assert node.queue_wait_time() == pytest.approx(2 * 5.0)
 
 
 def test_queue_wait_time_many_queued(node: MockEngineNode, node_config: NodeConfig) -> None:
@@ -127,7 +128,59 @@ def test_queue_wait_time_many_queued(node: MockEngineNode, node_config: NodeConf
         node.admit(f"req-{i}")
     for j in range(3):
         node.admit(f"overflow-{j}")
-    assert node.queue_wait_time() == pytest.approx(3 * 5.0)
+    # 32 running == capacity, 3 queued → n_blockers = 3+1 = 4; legacy = 4 * decode_base_ms
+    assert node.queue_wait_time() == pytest.approx(4 * 5.0)
+
+
+def test_queue_wait_time_with_args_uses_accurate_formula(
+    model_config: ModelConfig
+) -> None:
+    nc = NodeConfig(capacity=1)
+    node = MockEngineNode("n", model_config, nc)
+    node.admit("req-0")   # 1 running == capacity → next request is blocked
+    per_req = (
+        100 * model_config.prefill_cost_per_token_ms
+        + 50 * (model_config.decode_base_ms + model_config.marginal_decode_ms)
+    )
+    # n_blockers = 0 (queue) + 1 = 1
+    assert node.queue_wait_time(prompt_len=100, expected_output_len=50) == pytest.approx(per_req)
+
+
+def test_queue_wait_time_zero_pending_returns_zero_with_args(node: MockEngineNode) -> None:
+    assert node.queue_wait_time(prompt_len=100, expected_output_len=50) == pytest.approx(0.0)
+
+
+def test_queue_wait_time_returns_zero_when_slot_available(node: MockEngineNode) -> None:
+    node.admit("req-0")   # 1 running, capacity=32 → slot still available
+    assert node.queue_wait_time() == pytest.approx(0.0)
+    assert node.queue_wait_time(prompt_len=100, expected_output_len=50) == pytest.approx(0.0)
+
+
+def test_queue_wait_time_legacy_counts_n_blockers(
+    model_config: ModelConfig
+) -> None:
+    nc = NodeConfig(capacity=1)
+    node = MockEngineNode("n", model_config, nc)
+    node.admit("req-0")   # running (at capacity)
+    node.admit("req-1")   # queued
+    # n_blockers = 1 (queued) + 1 = 2; legacy = 2 * decode_base_ms
+    assert node.queue_wait_time() == pytest.approx(2 * model_config.decode_base_ms)
+
+
+def test_queue_wait_time_full_with_queue_typed() -> None:
+    """满载 + 2 queued + typed args → n_blockers=3 × per_req_lifecycle."""
+    model = ModelConfig(prefill_cost_per_token_ms=0.1, decode_base_ms=5.0, marginal_decode_ms=0.5)
+    node = MockEngineNode("n0", model, NodeConfig(capacity=1))
+    node.admit("running-0")   # at capacity
+    node.admit("queued-0")    # → queue
+    node.admit("queued-1")    # → queue
+    assert len(node.running_requests) == 1
+    assert len(node.queue) == 2
+    # n_blockers = 2 + 1 = 3
+    # per_req = 128×0.1 + 32×(5.0+0.5) = 12.8 + 176.0 = 188.8
+    # expected = 3 × 188.8 = 566.4
+    wait = node.queue_wait_time(prompt_len=128, expected_output_len=32)
+    assert wait == pytest.approx(566.4)
 
 
 # ------------------------------------------------------------------
@@ -195,3 +248,36 @@ def test_custom_marginal_decode() -> None:
     cfg = ModelConfig(prefill_cost_per_token_ms=0.033, decode_base_ms=5.0, marginal_decode_ms=1.0)
     n = MockEngineNode("n", cfg, NodeConfig())
     assert n.estimate_decode_time(10) == pytest.approx(15.0)
+
+
+# ------------------------------------------------------------------
+# admit / complete return value tests (new: bool / str | None)
+# ------------------------------------------------------------------
+
+def test_admit_returns_true_when_room() -> None:
+    node = MockEngineNode("n", ModelConfig(), NodeConfig(capacity=2))
+    assert node.admit("r0") is True
+    assert node.admit("r1") is True
+
+
+def test_admit_returns_false_when_full() -> None:
+    node = MockEngineNode("n", ModelConfig(), NodeConfig(capacity=1))
+    assert node.admit("r0") is True
+    assert node.admit("r1") is False
+    assert node.queue == ["r1"]
+
+
+def test_complete_returns_none_when_queue_empty() -> None:
+    node = MockEngineNode("n", ModelConfig(), NodeConfig(capacity=2))
+    node.admit("r0")
+    assert node.complete("r0") is None
+
+
+def test_complete_returns_promoted_id_when_queue_nonempty() -> None:
+    node = MockEngineNode("n", ModelConfig(), NodeConfig(capacity=1))
+    node.admit("r0")   # running
+    node.admit("r1")   # queued
+    result = node.complete("r0")
+    assert result == "r1"
+    assert "r1" in node.running_requests
+    assert node.queue == []

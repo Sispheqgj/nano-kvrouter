@@ -135,9 +135,10 @@ def test_ttft_includes_queue_wait(
     cache = NullCacheQuery(node_ids=["n0"])
     req = _make_request(10)
     dec = policy.schedule(req, [node], cache)
-    # queue_wait = 1 * decode_base_ms = 5.0
-    # prefill = 10 * 0.1 = 1.0
-    assert dec.estimated_ttft_ms == pytest.approx(10 * 0.1 + 1 * 5.0)
+    # 8 running == capacity, 1 queued → n_blockers = 1+1 = 2
+    # per_req = 10*0.1 + 32*(5.0+1.0) = 1.0 + 192.0 = 193.0
+    # queue_wait = 2 * 193.0 = 386.0; prefill = 1.0
+    assert dec.estimated_ttft_ms == pytest.approx(10 * 0.1 + 2 * (10 * 0.1 + 32 * 6.0))
 
 
 # ---------------------------------------------------------------------------
