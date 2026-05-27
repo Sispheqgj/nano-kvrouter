@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Any
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
@@ -102,6 +103,37 @@ class WorkloadConfig(BaseModel):
     avg_output_len: int = Field(default=256, ge=1)
 
 
+class SchedulerConfig(BaseModel):
+    """Scheduler selection and its specific parameters.
+
+    ``name`` selects the scheduler class to instantiate; ``params`` is
+    forwarded to its ``__init__`` as keyword arguments. The schema is
+    intentionally open (``dict[str, Any]``) — ``cli.py`` is responsible
+    for mapping names to concrete classes and validating params.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(default="round_robin")
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
+class GeneratorConfig(BaseModel):
+    """Request generator parameters.
+
+    Controls the K-bucket conversation model: ``num_buckets`` shared
+    prefixes are pre-generated at startup; each request randomly draws
+    one and appends a per-request suffix. ``seed`` pins the PRNG for
+    reproducible experiments.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    num_buckets: int = Field(default=10, ge=1)
+    vocab_size: int = Field(default=32_000, ge=1)
+    seed: int = Field(default=42)
+
+
 class NanoKVConfig(BaseModel):
     """Root configuration aggregating every sub-config.
 
@@ -117,6 +149,8 @@ class NanoKVConfig(BaseModel):
     bandwidth: BandwidthConfig = Field(default_factory=BandwidthConfig)
     slo: SLOConfig = Field(default_factory=SLOConfig)
     workload: WorkloadConfig = Field(default_factory=WorkloadConfig)
+    scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
+    generator: GeneratorConfig = Field(default_factory=GeneratorConfig)
 
 
 def load_config(path: str) -> NanoKVConfig:

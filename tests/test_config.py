@@ -151,3 +151,70 @@ def test_type_error_from_yaml_file(tmp_path):
 def test_file_not_found_raises():
     with pytest.raises(FileNotFoundError):
         load_config("/nonexistent/path/config.yaml")
+
+
+# ------------------------------------------------------------------
+# SchedulerConfig 新字段
+# ------------------------------------------------------------------
+
+def test_default_scheduler_config():
+    cfg = NanoKVConfig()
+    assert cfg.scheduler.name == "round_robin"
+    assert cfg.scheduler.params == {}
+
+
+def test_scheduler_config_accepts_arbitrary_params():
+    cfg = NanoKVConfig.model_validate({
+        "scheduler": {"name": "conductor", "params": {"alpha": 2.0, "beta": 0.5}}
+    })
+    assert cfg.scheduler.name == "conductor"
+    assert cfg.scheduler.params["alpha"] == 2.0
+
+
+def test_scheduler_extra_field_raises():
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError):
+        NanoKVConfig.model_validate({"scheduler": {"name": "x", "unknown_key": 1}})
+
+
+# ------------------------------------------------------------------
+# GeneratorConfig 新字段
+# ------------------------------------------------------------------
+
+def test_default_generator_config():
+    cfg = NanoKVConfig()
+    assert cfg.generator.num_buckets == 10
+    assert cfg.generator.vocab_size == 32_000
+    assert cfg.generator.seed == 42
+
+
+def test_generator_config_custom_values():
+    cfg = NanoKVConfig.model_validate({
+        "generator": {"num_buckets": 5, "vocab_size": 1000, "seed": 0}
+    })
+    assert cfg.generator.num_buckets == 5
+    assert cfg.generator.vocab_size == 1000
+    assert cfg.generator.seed == 0
+
+
+def test_generator_num_buckets_zero_raises():
+    with pytest.raises(Exception):
+        NanoKVConfig.model_validate({"generator": {"num_buckets": 0}})
+
+
+def test_load_config_with_scheduler_and_generator(tmp_path):
+    f = tmp_path / "full.yaml"
+    f.write_text(
+        "scheduler:\n"
+        "  name: e2_policy\n"
+        "  params:\n"
+        "    w_historical: 2.0\n"
+        "generator:\n"
+        "  num_buckets: 20\n"
+        "  seed: 99\n"
+    )
+    cfg = load_config(str(f))
+    assert cfg.scheduler.name == "e2_policy"
+    assert cfg.scheduler.params["w_historical"] == 2.0
+    assert cfg.generator.num_buckets == 20
+    assert cfg.generator.seed == 99
