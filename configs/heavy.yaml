@@ -1,0 +1,58 @@
+# nano-kvrouter — heavy load demo configuration
+#
+# 15-second high-load scenario, designed to:
+# - drive the cluster into saturation so queue_wait dominates TTFT
+# - showcase MooncakeConductor's SLO early rejection vs baselines
+# - cache-aware schedulers reduce prefill, but only conductor maintains SLO hit rate
+#
+# Expected sweep behavior:
+#   round_robin   — rejection ≈ 0%, slo_ttft_hit < 40%   (oblivious overload)
+#   least_loaded  — rejection ≈ 0%, slo_ttft_hit < 50%
+#   prefix_greedy — rejection ≈ 0%, slo_ttft_hit 50-70%  (cache reduces prefill, not queue_wait)
+#   e2_policy     — rejection ≈ 0%, slo_ttft_hit 50-70%
+#   conductor     — rejection 30-60%, slo_ttft_hit > 80% ← the story
+
+cluster:
+  prefill_nodes: 4
+  decode_nodes: 4
+
+node:
+  gpu_blocks: 1000
+  cpu_blocks: 5000
+  disk_blocks: 50000
+  capacity: 4              # 8x tighter than default (32) — queue_wait dominates
+
+model:
+  block_size: 16
+  kv_bytes_per_token: 512
+  prefill_cost_per_token_ms: 0.033
+  decode_base_ms: 5.0
+  marginal_decode_ms: 0.5
+
+bandwidth:
+  gpu_to_gpu: 3.0e11
+  gpu_to_cpu: 3.2e10
+  cpu_to_disk: 5.0e9
+
+slo:
+  ttft_target_ms: 400.0    # 5x tighter than default — full+1-queued (~770ms) violates SLO
+  tbt_target_ms: 30.0      # 3x tighter — base=5ms, marginal=0.5ms x 5 slots = 7ms, safe headroom
+
+workload:
+  request_rate: 80.0        # 1.6x default — 4 nodes x cap=4 near saturation
+  duration_s: 15.0          # 50% longer sampling
+  prefix_sharing_ratio: 0.6 # same as default; cache benefit preserved
+  avg_prompt_len: 1024
+  avg_output_len: 64
+
+generator:
+  num_buckets: 6            # tight cache reuse
+  vocab_size: 32000
+  seed: 42
+
+scheduler:
+  name: conductor
+  params:
+    alpha: 1.0
+    beta: 1.0
+    gamma: 1.0
