@@ -16,6 +16,7 @@
 | `src/nano_kvrouter/engine/mock_node.py` | [`engine/mock_node.md`](engine/mock_node.md) | 已审阅 | Sarathi-Serve |
 | `src/nano_kvrouter/kv_cache/cache_manager.py` | [`kv_cache/cache_manager.md`](kv_cache/cache_manager.md) | 已审阅 | RadixTree / BlockPool |
 | `src/nano_kvrouter/metrics/collector.py` | [`metrics/collector.md`](metrics/collector.md) | 已审阅 | Mooncake / Sarathi-Serve |
+| `src/nano_kvrouter/simulator/generator.py` | [`simulator/generator.md`](simulator/generator.md) | 已审阅 | BurstGPT / Preble / Mooncake / vLLM / AIPerf |
 
 ## 待补文档
 

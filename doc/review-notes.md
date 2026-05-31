@@ -29,6 +29,7 @@ nano-kvrouter 是一个 KV-cache-centric LLM serving control-plane simulator。
 - `mock_node.py` review：[`doc/code-review/engine/mock_node.md`](code-review/engine/mock_node.md)
 - `cache_manager.py` review：[`doc/code-review/kv_cache/cache_manager.md`](code-review/kv_cache/cache_manager.md)
 - `collector.py` review：[`doc/code-review/metrics/collector.md`](code-review/metrics/collector.md)
+- `generator.py` review：[`doc/code-review/simulator/generator.md`](code-review/simulator/generator.md)
 
 ## 待审阅模块 Backlog
 
@@ -38,6 +39,7 @@ nano-kvrouter 是一个 KV-cache-centric LLM serving control-plane simulator。
 |------|-------------|----------|----------|
 | Mock node | [`doc/code-review/engine/mock_node.md`](code-review/engine/mock_node.md) | Sarathi-Serve | chunked prefill、token budget、generation stall |
 | Cache manager | [`doc/code-review/kv_cache/cache_manager.md`](code-review/kv_cache/cache_manager.md) | RadixTree / BlockPool | split-aware reconcile rollback，区分逻辑命中和物理占用 |
+| Request generator | [`doc/code-review/simulator/generator.md`](code-review/simulator/generator.md) | BurstGPT / Preble / Mooncake / vLLM / AIPerf | trace replay、混合长度、burst、session-aware prefix |
 | Radix prefix cache | 待建 | SGLang RadixAttention | prefix match、node split、LRU eviction 是否表达清楚 |
 | Block pool | 待建 | vLLM v1 / HiCache | block metadata、tier movement、capacity pressure |
 | Scheduler protocol | 待建 | SGLang / Mooncake / Preble | policy interface 是否能承载 cache-aware 和 SLO-aware 决策 |
