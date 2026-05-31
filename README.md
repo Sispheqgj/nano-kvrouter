@@ -126,6 +126,23 @@ streaming Poisson workload generation, and rich-formatted sweep output.
 **264 tests pass.** Every public class has a docstring; every scheduler
 module header cites its paper.
 
+### Known dead config (P1 simplifications)
+
+The following YAML fields are accepted by the config loader but are
+**not yet read by any business logic** — changing them has no effect
+on sweep results in P1. They will be activated in P2-Infra milestones:
+
+| Field                           | Activated in | Reason |
+| ------------------------------- | ------------ | ------ |
+| `cluster.decode_nodes`          | M5           | No P/D separation yet — `cli.py` uses only `prefill_nodes` |
+| `bandwidth.gpu_to_gpu`          | M5           | No KV transfer between prefill and decode nodes yet |
+| `bandwidth.gpu_to_cpu`          | M6           | No multi-tier promotion / demotion yet |
+| `bandwidth.cpu_to_disk`         | M6           | Same as above |
+| `model.kv_bytes_per_token`      | M5           | KV size not used in any cost calculation |
+
+If your sweep numbers don't move when you change one of these, that's
+expected. See the P2-Infra plan for the activation roadmap.
+
 ---
 
 ## Schedulers

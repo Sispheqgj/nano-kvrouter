@@ -13,14 +13,22 @@ logger = logging.getLogger(__name__)
 class ClusterConfig(BaseModel):
     """Cluster topology: how many prefill / decode mock nodes to spin up.
 
-    Mirrors Mooncake's P/D separation — prefill and decode counts are
-    independent so experiments can vary the ratio.
+    NOTE (v1): ``decode_nodes`` is currently DEAD. ``cli.py`` builds only
+    ``prefill_nodes``-many ``MockEngineNode`` instances and every scheduler
+    hard-codes ``decode_node == prefill_node``. Real P/D separation lands
+    in P2-Infra M5.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     prefill_nodes: int = Field(default=4, ge=1)
-    decode_nodes: int = Field(default=4, ge=1)
+    decode_nodes: int = Field(
+        default=4,
+        ge=1,
+        description="DEAD until P2-Infra M5. cli.py currently builds only "
+                    "prefill_nodes-many MockEngineNodes and all schedulers "
+                    "force decode_node == prefill_node.",
+    )
 
 
 class NodeConfig(BaseModel):
@@ -51,7 +59,13 @@ class ModelConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     block_size: int = Field(default=16, ge=1)
-    kv_bytes_per_token: int = Field(default=512, ge=1)
+    kv_bytes_per_token: int = Field(
+        default=512,
+        ge=1,
+        description="DEAD until P2-Infra M5. Will drive KV transfer time "
+                    "(prompt_len * kv_bytes_per_token / bandwidth.gpu_to_gpu) "
+                    "once P/D separation lands.",
+    )
     prefill_cost_per_token_ms: float = Field(default=0.033, gt=0)
     decode_base_ms: float = Field(default=5.0, gt=0)
     marginal_decode_ms: float = Field(default=0.5, gt=0)
@@ -60,16 +74,30 @@ class ModelConfig(BaseModel):
 class BandwidthConfig(BaseModel):
     """Inter-tier transfer bandwidths in bytes/second.
 
-    Used to estimate KV-block transfer latency for tier promotion /
-    demotion and cross-node migration. Defaults approximate A100-class
-    hardware: NVLink GPU↔GPU, PCIe Gen4 GPU↔CPU, NVMe CPU↔Disk.
+    NOTE (v1): ALL THREE fields are currently DEAD. No scheduler or engine
+    code reads them. They will be activated in:
+      - P2-Infra M5: ``gpu_to_gpu`` for P/D KV transfer cost
+      - P2-Infra M6: ``gpu_to_cpu`` / ``cpu_to_disk`` for HiCache tier
+        promotion / demotion latency
+
+    Defaults approximate A100-class hardware: NVLink GPU↔GPU, PCIe Gen4
+    GPU↔CPU, NVMe CPU↔Disk.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    gpu_to_gpu: float = Field(default=300e9, gt=0)
-    gpu_to_cpu: float = Field(default=32e9, gt=0)
-    cpu_to_disk: float = Field(default=5e9, gt=0)
+    gpu_to_gpu: float = Field(
+        default=300e9, gt=0,
+        description="DEAD until P2-Infra M5. Will set KV transfer cost for P/D disaggregation.",
+    )
+    gpu_to_cpu: float = Field(
+        default=32e9, gt=0,
+        description="DEAD until P2-Infra M6. Will set GPU→CPU tier demotion bandwidth.",
+    )
+    cpu_to_disk: float = Field(
+        default=5e9, gt=0,
+        description="DEAD until P2-Infra M6. Will set CPU→Disk tier demotion bandwidth.",
+    )
 
 
 class SLOConfig(BaseModel):
