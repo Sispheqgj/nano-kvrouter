@@ -146,9 +146,15 @@ class MooncakeConductor:
         chosen = max(nodes, key=score)
 
         chosen_matched = lookups[chosen.node_id].matched_tokens
+        # +1 for the request being admitted; this is the batch size at the first
+        # decode step (Conservative: ignores requests that might complete before
+        # our prefill finishes, but correct for heavily loaded nodes).
+        bs_at_first_decode = len(chosen.running_requests) + 1
+        first_tick_ms = chosen.estimate_decode_time(bs_at_first_decode)
         est_ttft = (
             chosen.estimate_prefill_time(prompt_len, cached_tokens=chosen_matched)
             + chosen.queue_wait_time(prompt_len, request.expected_output_len)
+            + first_tick_ms
         )
         est_tbt = chosen.estimate_decode_time(len(chosen.running_requests) + 1)
 

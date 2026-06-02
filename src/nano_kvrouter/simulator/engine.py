@@ -43,7 +43,7 @@ class SimulationEngine:
     objects ordered by ``(time, seq)``. Callers register handlers for specific
     :class:`~nano_kvrouter.simulator.event.EventType` values via :meth:`on`;
     handlers may call :meth:`schedule` to chain further events (e.g.
-    ``PREFILL_COMPLETE`` → ``DECODE_STEP``).
+    ``PREFILL_COMPLETE`` → ``TOKEN_GENERATED``).
 
     Usage::
 

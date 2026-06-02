@@ -263,8 +263,10 @@ def test_ttft_reflects_cache_hit(
 
     dec = _policy().schedule(req, nodes, cm_large)
     assert dec.prefill_node == "n0"
-    # uncached = 128 - 64 = 64 tokens × 0.1 ms = 6.4 ms; queue = 0
-    assert dec.estimated_ttft_ms == pytest.approx(64 * 0.1)
+    # n0: 0 running, 0 decoding → first_tick = 5.0 + 1*1.0 = 6.0 ms
+    # uncached = 128 - 64 = 64 tokens × 0.1 ms = 6.4 ms; queue_wait = 0
+    # est_ttft = 6.4 + 0 + 6.0 = 12.4 ms
+    assert dec.estimated_ttft_ms == pytest.approx(64 * 0.1 + MODEL.decode_base_ms + MODEL.marginal_decode_ms)
 
 
 # ---------------------------------------------------------------------------
@@ -294,3 +296,38 @@ def test_full_hit_node_at_capacity_not_eviction_penalised(
     dec = policy.schedule(req, nodes[:2], cm)
     # n0 is fully cached — no eviction needed — must be chosen over cold n1
     assert dec.prefill_node == "n0"
+
+
+# ---------------------------------------------------------------------------
+# 14. first_tick in run_cost changes routing decision (Important #5)
+# ---------------------------------------------------------------------------
+
+
+def test_first_tick_in_score_changes_choice(
+    cm_large: CacheManager, nodes: list[MockEngineNode]
+) -> None:
+    """Without first_tick in run_cost, E2 picks the busy-warm node because its
+    cache benefit lowers prefill cost. With first_tick included, the idle-cold
+    node wins because its first-token latency is much lower.
+
+    Setup (w_historical=0, w_eviction=0, w_run=1):
+    * busy-warm (n1): 7 running, warm cache (64 tokens)
+      run = prefill(0 uncached) + queue_wait(0) + first_tick(8) = 5+8=13.0
+    * idle-cold (n0): 0 running, cold cache
+      run = prefill(64 cold) + queue_wait(0) + first_tick(1) = 6.4+0+6.0 = 12.4
+
+    idle-cold (12.4) < busy-warm (13.0) → n0 should win.
+    """
+    cm_large.admit(list(range(64)), "n1")   # warm cache on n1
+    for i in range(7):
+        nodes[1].admit(f"load{i}")          # 7 running on n1
+
+    req = _make_request(list(range(64)))
+    # Pure run-cost routing: no historical/eviction penalty
+    policy = E2Policy(w_historical=0, w_eviction=0, w_run=1, model_config=MODEL)
+    dec = policy.schedule(req, nodes[:2], cm_large)
+    # n0 (idle-cold) has lower total run cost → must be picked
+    assert dec.prefill_node == "n0", (
+        f"Expected idle-cold n0 (lower first_tick), got {dec.prefill_node}; "
+        "first_tick missing from E2 run_cost?"
+    )

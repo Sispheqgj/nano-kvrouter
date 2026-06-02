@@ -116,8 +116,9 @@ def test_ttft_equals_cold_prefill_with_empty_queue(
 ) -> None:
     req = _make_request(20)
     dec = policy.schedule(req, three_nodes, null_cache)
-    # queue is empty → queue_wait=0; cold prefill for all 20 tokens
-    expected_ttft = 20 * MODEL.prefill_cost_per_token_ms
+    # queue_wait=0 (idle node); cold prefill + first decode step (bs=0+1=1)
+    # first_tick = decode_base + 1*marginal = 5.0 + 1.0 = 6.0
+    expected_ttft = 20 * MODEL.prefill_cost_per_token_ms + MODEL.decode_base_ms + MODEL.marginal_decode_ms
     assert dec.estimated_ttft_ms == pytest.approx(expected_ttft)
 
 
@@ -135,10 +136,13 @@ def test_ttft_includes_queue_wait(
     cache = NullCacheQuery(node_ids=["n0"])
     req = _make_request(10)
     dec = policy.schedule(req, [node], cache)
-    # 8 running == capacity, 1 queued → n_blockers = 1+1 = 2
-    # per_req = 10*0.1 + 32*(5.0+1.0) = 1.0 + 192.0 = 193.0
-    # queue_wait = 2 * 193.0 = 386.0; prefill = 1.0
-    assert dec.estimated_ttft_ms == pytest.approx(10 * 0.1 + 2 * (10 * 0.1 + 32 * 6.0))
+    # 8 running, 0 decoding → bs = max(0,8) = 8, step_time = 5.0+8*1.0 = 13.0
+    # n_blockers=2; per_req = 10*0.1+32*13.0 = 417.0; queue_wait = 834.0
+    # prefill = 1.0; first_tick = 5.0+(8+1)*1.0 = 14.0
+    # expected_ttft = 1.0 + 834.0 + 14.0 = 849.0
+    assert dec.estimated_ttft_ms == pytest.approx(
+        10 * 0.1 + 2 * (10 * 0.1 + 32 * (5.0 + 8 * 1.0)) + (5.0 + 9 * 1.0)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -242,5 +246,8 @@ def test_ttft_assumes_cold_prefill_regardless_of_cache(
 
     req = _make_request(20)
     dec = policy.schedule(req, three_nodes, FullHitCache())  # type: ignore[arg-type]
-    # RoundRobin never calls lookup/lookup_all — it always uses cached_tokens=0
-    assert dec.estimated_ttft_ms == pytest.approx(20 * MODEL.prefill_cost_per_token_ms)
+    # RoundRobin never calls lookup/lookup_all — cached_tokens=0 always.
+    # TTFT = cold prefill + first_tick (idle node, bs=1): 2.0 + 6.0 = 8.0
+    assert dec.estimated_ttft_ms == pytest.approx(
+        20 * MODEL.prefill_cost_per_token_ms + MODEL.decode_base_ms + MODEL.marginal_decode_ms
+    )

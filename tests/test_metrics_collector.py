@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import pytest
 
+from nano_kvrouter.config import ModelConfig, NodeConfig
+from nano_kvrouter.engine.mock_node import MockEngineNode
 from nano_kvrouter.metrics.collector import MetricsCollector
 from nano_kvrouter.request import Request
 from nano_kvrouter.simulator.engine import SimulationEngine
@@ -65,7 +67,7 @@ def _prefill_done(req_id: str, t: float) -> Event:
 def _decode_step(req_id: str, t: float, step: int = 0) -> Event:
     return Event(
         time=t,
-        type=EventType.DECODE_STEP,
+        type=EventType.TOKEN_GENERATED,
         payload={"request_id": req_id, "step_index": step},
     )
 
@@ -94,6 +96,8 @@ def test_initial_summary_is_empty(collector):
     assert s["slo_ttft_hit_rate"] is None
     assert s["cache_hit_ratio"] is None
     assert s["throughput_req_per_s"] is None
+    assert s["avg_batch_size"] is None
+    assert s["decode_throughput_tokens_per_s"] is None
 
 
 # ------------------------------------------------------------------
@@ -126,11 +130,11 @@ def test_reject_counts(engine, collector):
 
 
 # ------------------------------------------------------------------
-# Test 4 (v2): TTFT 在 DECODE_STEP[step_index=0] 时计算
+# Test 4 (v2): TTFT 在 TOKEN_GENERATED[step_index=0] 时计算
 # ------------------------------------------------------------------
 
 def test_ttft_recorded_on_first_decode_step(engine, collector):
-    """v2: TTFT = first DECODE_STEP time - arrival time."""
+    """v2: TTFT = first TOKEN_GENERATED time - arrival time."""
     collector.attach(engine)
     req = _make_request("r0")
     engine.schedule(_arrive(req, t=10.0))
@@ -157,7 +161,7 @@ def test_e2e_recorded_on_decode_complete(engine, collector):
 
 
 # ------------------------------------------------------------------
-# Test 6: TBT 跨多个 DECODE_STEP 计算平均
+# Test 6: TBT 跨多个 TOKEN_GENERATED 计算平均
 # ------------------------------------------------------------------
 
 def test_tbt_avg_over_multiple_steps(engine, collector):
@@ -178,7 +182,7 @@ def test_tbt_avg_over_multiple_steps(engine, collector):
 
 
 # ------------------------------------------------------------------
-# Test 7: SLO TTFT 命中率（事件序列改为 DECODE_STEP step=0）
+# Test 7: SLO TTFT 命中率（事件序列改为 TOKEN_GENERATED step=0）
 # ------------------------------------------------------------------
 
 def test_slo_ttft_hit_rate_all_hit(engine, collector):
@@ -240,7 +244,7 @@ def test_throughput_from_first_arrive_to_last_complete(engine, collector):
 
 
 # ------------------------------------------------------------------
-# Test 10: attach 注册了全部 6 个 handler（不变）
+# Test 10: attach 注册了全部 7 个 handler（M2: 新增 DECODE_BATCH_STEP）
 # ------------------------------------------------------------------
 
 def test_attach_registers_all_handlers(engine, collector):
@@ -250,7 +254,8 @@ def test_attach_registers_all_handlers(engine, collector):
         EventType.SCHEDULED,
         EventType.REQUEST_REJECTED,
         EventType.PREFILL_COMPLETE,
-        EventType.DECODE_STEP,
+        EventType.TOKEN_GENERATED,
+        EventType.DECODE_BATCH_STEP,
         EventType.DECODE_COMPLETE,
     }
     assert set(engine._handlers.keys()) == expected
@@ -264,7 +269,7 @@ def test_attach_registers_all_handlers(engine, collector):
 
 def test_prefill_complete_does_not_record_ttft(engine, collector):
     """v2: PREFILL_COMPLETE alone must not register a TTFT sample.
-    TTFT only counts at first DECODE_STEP."""
+    TTFT only counts at first TOKEN_GENERATED."""
     collector.attach(engine)
     req = _make_request("r0")
     engine.schedule(_arrive(req, t=10.0))
@@ -277,16 +282,16 @@ def test_prefill_complete_does_not_record_ttft(engine, collector):
 
 
 # ------------------------------------------------------------------
-# Test 12: DECODE_STEP 缺 step_index 时跳过而不崩溃
+# Test 12: TOKEN_GENERATED 缺 step_index 时跳过而不崩溃
 # ------------------------------------------------------------------
 
-def test_decode_step_without_step_index_skipped(engine, collector):
+def test_token_generated_without_step_index_skipped(engine, collector):
     collector.attach(engine)
     req = _make_request("r0")
     engine.schedule(_arrive(req, t=0.0))
-    # DECODE_STEP without step_index in payload — must not crash
+    # TOKEN_GENERATED without step_index in payload — must not crash
     engine.schedule(Event(
-        time=10.0, type=EventType.DECODE_STEP,
+        time=10.0, type=EventType.TOKEN_GENERATED,
         payload={"request_id": "r0"},   # no step_index
     ))
     engine.run()
@@ -372,3 +377,115 @@ def test_duplicate_step_zero_does_not_reset_tbt_anchor(engine, collector):
     s = collector.summary()
     assert s["ttft_p50_ms"] == pytest.approx(100.0)   # TTFT not double-counted
     assert s["tbt_avg_ms"] == pytest.approx(10.0)     # anchor is 100, not 105
+
+
+# ------------------------------------------------------------------
+# Helpers for M2 batch-step tests
+# ------------------------------------------------------------------
+
+def _decode_batch_step_event(node_id: str, t: float, batch_size: int) -> Event:
+    return Event(
+        time=t,
+        type=EventType.DECODE_BATCH_STEP,
+        payload={"node_id": node_id, "node_pool": "decode", "batch_size": batch_size},
+    )
+
+
+# ------------------------------------------------------------------
+# Test 17: avg_batch_size
+# ------------------------------------------------------------------
+
+def test_avg_batch_size(engine, collector):
+    """avg_batch_size is the arithmetic mean of batch_size values from all DECODE_BATCH_STEP events."""
+    collector.attach(engine)
+    engine.schedule(_decode_batch_step_event("n0", 10.0, batch_size=4))
+    engine.schedule(_decode_batch_step_event("n0", 20.0, batch_size=2))
+    engine.run()
+    assert collector.summary()["avg_batch_size"] == pytest.approx(3.0)
+
+
+def test_avg_batch_size_none_when_no_steps(engine, collector):
+    """avg_batch_size is None when no DECODE_BATCH_STEP events have fired."""
+    collector.attach(engine)
+    engine.run()
+    assert collector.summary()["avg_batch_size"] is None
+
+
+def test_avg_batch_size_single_step(engine, collector):
+    """Single DECODE_BATCH_STEP with batch_size=5 → avg=5."""
+    collector.attach(engine)
+    engine.schedule(_decode_batch_step_event("n0", 5.0, batch_size=5))
+    engine.run()
+    assert collector.summary()["avg_batch_size"] == pytest.approx(5.0)
+
+
+# ------------------------------------------------------------------
+# Test 18: decode_throughput_tokens_per_s
+# ------------------------------------------------------------------
+
+def test_decode_throughput_tokens_per_s(engine, collector):
+    """3 batch steps × 4 tokens each over 2000 ms → 6.0 tok/s."""
+    collector.attach(engine)
+    req = _make_request("r0")
+    engine.schedule(_arrive(req, t=0.0))
+    engine.schedule(_decode_batch_step_event("n0", 500.0, batch_size=4))
+    engine.schedule(_decode_batch_step_event("n0", 1000.0, batch_size=4))
+    engine.schedule(_decode_batch_step_event("n0", 1500.0, batch_size=4))
+    engine.schedule(_decode_done("r0", t=2000.0))   # sets _end_time
+    engine.run()
+    s = collector.summary()
+    # total_tokens = 12, duration = (2000 - 0) / 1000 = 2s → 6.0 tok/s
+    assert s["decode_throughput_tokens_per_s"] == pytest.approx(6.0)
+
+
+def test_decode_throughput_none_when_no_arrivals(engine, collector):
+    """decode_throughput_tokens_per_s is None when no duration can be measured."""
+    collector.attach(engine)
+    engine.schedule(_decode_batch_step_event("n0", 100.0, batch_size=3))
+    engine.run()
+    # No REQUEST_ARRIVE → _start_time is None → throughput is None
+    assert collector.summary()["decode_throughput_tokens_per_s"] is None
+
+
+# ------------------------------------------------------------------
+# Test 19: execute-time batch_size via node fallback (reversed-order attach)
+# ------------------------------------------------------------------
+
+
+def test_batch_size_uses_execute_time(engine):
+    """Collector must record execute-time batch_size via node fallback.
+
+    Simulates the reversed-attach-order case: collector handler runs before
+    the simulator handler, so event.payload has no 'batch_size'.  Collector
+    must fall back to reading len(node.decoding) at handler-execution time,
+    which is the pre-tick execute-time stream count.
+
+    Schedule-time count = 1 (only r0 in decoding at schedule time).
+    Execute-time count  = 2 (r1 joined before the event fires).
+    Collector must record 2, not 1.
+    """
+    model = ModelConfig(prefill_cost_per_token_ms=0.1, decode_base_ms=5.0, marginal_decode_ms=1.0)
+    node = MockEngineNode("n0", model, NodeConfig(capacity=8))
+    # admit puts request into running_requests; start_decode moves it to decoding.
+    node.admit("r0")
+    node.start_decode("r0")   # 1 stream in decoding at schedule time
+
+    collector = MetricsCollector()
+    # Pass nodes so collector can fall back to node state when payload is empty.
+    collector.attach(engine, nodes={"n0": node})
+
+    # Schedule the batch step with NO batch_size in payload (reversed-order scenario).
+    engine.schedule(Event(
+        time=10.0,
+        type=EventType.DECODE_BATCH_STEP,
+        payload={"node_id": "n0"},   # no batch_size — collector must use node fallback
+    ))
+
+    # A 2nd stream joins decoding before the event fires (execute-time count = 2).
+    node.admit("r1")
+    node.start_decode("r1")
+
+    engine.run()
+
+    # Collector must see 2 (execute-time), not 1 (schedule-time) and not None.
+    assert collector.summary()["avg_batch_size"] == pytest.approx(2.0)

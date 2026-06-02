@@ -210,9 +210,10 @@ def test_ttft_reflects_cache_hit(
 
     dec = PrefixGreedyPolicy().schedule(req, nodes[:1], cm)
 
-    # uncached = 128 - 64 = 64; prefill_cost_per_token_ms = 0.1 → 6.4 ms
-    # queue_wait = 0 (empty queue)
-    assert dec.estimated_ttft_ms == pytest.approx(64 * 0.1)
+    # uncached = 64 tokens × 0.1 ms = 6.4 ms; queue_wait=0 (idle n0)
+    # first_tick = decode_base + (0+1)*marginal = 5.0 + 0.5 = 5.5
+    # expected_ttft = 6.4 + 0 + 5.5 = 11.9
+    assert dec.estimated_ttft_ms == pytest.approx(64 * 0.1 + 5.0 + 0.5)
 
 
 # ---------------------------------------------------------------------------

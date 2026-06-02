@@ -12,8 +12,8 @@ class MockEngineNode:
 
     Holds no tensors. The node tracks two queues — `running_requests`
     (admitted, bounded by `node_config.capacity`) and `queue` (waiting) —
-    and answers latency questions the scheduler asks before placing a
-    request: prefill time, decode-step time, current load, queue wait.
+    plus a `decoding` set of requests that have finished prefill and are
+    actively participating in batch decode steps.
 
     Design notes:
         * All time values are milliseconds and *simulated* — never wall
@@ -26,6 +26,11 @@ class MockEngineNode:
           (rather than merged into one) so a heterogeneous cluster can
           give different nodes different capacity without duplicating
           model constants.
+        * Decode batch state (`decoding`, `_output_tokens`,
+          `_expected_output`) is populated at admit() / start_decode()
+          time and cleaned up by complete(). tick_batch_step() advances
+          only the `decoding` set — prefilling requests in
+          `running_requests` are untouched.
     """
 
     def __init__(self, node_id: str, model_config: ModelConfig, node_config: NodeConfig) -> None:
@@ -41,6 +46,15 @@ class MockEngineNode:
         self.node_config = node_config
         self.running_requests: list[str] = []
         self.queue: list[str] = []
+        # Requests that have finished prefill and are in the decode batch.
+        self.decoding: set[str] = set()
+        # Decode progress tracking (only for requests in `decoding`).
+        self._output_tokens: dict[str, int] = {}
+        self._expected_output: dict[str, int] = {}
+        # True between mark_batch_step_scheduled() and mark_batch_step_completed().
+        # Prevents double-scheduling a DECODE_BATCH_STEP event when a new request
+        # joins decoding while a step is already in flight.
+        self._batch_step_in_flight: bool = False
 
     # ------------------------------------------------------------------
     # Latency estimation
@@ -126,13 +140,26 @@ class MockEngineNode:
             already-admitted requests. Accurate for the current fixed-length
             :class:`RequestGenerator`. For trace replay / bursty workloads
             with heterogeneous lengths, short blockers ahead of a long new
-            request will underestimate wait, and a long blocker ahead of a
-            short new request will overestimate. This is acceptable for v1
-            because the Conductor's SLO check is intentionally a conservative
-            *gate* (false accepts are worse than false rejects); to make it
-            length-aware in v2, ``MockEngineNode`` would need to track the
+            request will **overestimate** wait (we apply the long lifecycle
+            to short blockers), and a long blocker ahead of a short new
+            request will **underestimate** (we apply the short lifecycle to
+            long blockers). This is acceptable for v1 because the Conductor's
+            SLO check is intentionally a conservative *gate* (false accepts
+            are worse than false rejects); to make it length-aware in v2,
+            ``MockEngineNode`` would need to track the
             ``(prompt_len, expected_output_len)`` of each running/queued
             request.
+
+        Formula:
+            ``n_blockers × (prompt_len × ppt + output_len × step_time)``
+            where ``step_time = decode_base + bs × marginal``
+            and ``bs = max(len(decoding), len(running_requests))``.
+
+            Using ``running_requests`` as the lower bound on ``bs`` handles
+            the common case where all slots are occupied but none have yet
+            entered decode (all still prefilling): once prefill finishes,
+            every running request will join the decode batch, so using
+            ``running_requests`` is a more accurate upper bound than 0.
         """
         if len(self.running_requests) < self.node_config.capacity:
             return 0.0
@@ -143,11 +170,14 @@ class MockEngineNode:
             # Legacy fallback; new callers should always supply args.
             return n_blockers * self.model_config.decode_base_ms
 
+        # Use max(decoding, running) as batch-size estimate. When all requests
+        # are still prefilling (decoding=0), running_requests is the upper
+        # bound because they will all join the decode batch once prefill ends.
+        bs = max(len(self.decoding), len(self.running_requests))
+        step_time = self.model_config.decode_base_ms + bs * self.model_config.marginal_decode_ms
         per_req_lifecycle_ms = (
             prompt_len * self.model_config.prefill_cost_per_token_ms
-            + expected_output_len * (
-                self.model_config.decode_base_ms + self.model_config.marginal_decode_ms
-            )
+            + expected_output_len * step_time
         )
         return n_blockers * per_req_lifecycle_ms
 
@@ -155,11 +185,20 @@ class MockEngineNode:
     # Request lifecycle (used by the simulation engine)
     # ------------------------------------------------------------------
 
-    def admit(self, request_id: str) -> bool:
+    def admit(self, request_id: str, expected_output_len: int = 0) -> bool:
         """Admit a request — into `running_requests` if capacity allows, else `queue`.
+
+        Also initialises output-tracking state (`_output_tokens`,
+        `_expected_output`) when the request enters `running_requests` so
+        that :meth:`tick_batch_step` can advance it once :meth:`start_decode`
+        is called.
 
         Args:
             request_id: Opaque ID owned by the scheduler/simulator.
+            expected_output_len: Total number of decode tokens this request
+                is expected to produce. Used by :meth:`tick_batch_step` to
+                detect completion. Defaults to 0 for backward compatibility
+                with tests that do not exercise the decode path.
 
         Returns:
             True if the request entered `running_requests` immediately and
@@ -169,14 +208,161 @@ class MockEngineNode:
         """
         if len(self.running_requests) < self.node_config.capacity:
             self.running_requests.append(request_id)
+            self._output_tokens[request_id] = 0
+            self._expected_output[request_id] = expected_output_len
             logger.debug("node %s admitted %s (running)", self.node_id, request_id)
             return True
         self.queue.append(request_id)
         logger.debug("node %s queued %s", self.node_id, request_id)
         return False
 
+    # ------------------------------------------------------------------
+    # Batch-step scheduling guards (Critical #1 lost-wakeup fix)
+    # ------------------------------------------------------------------
+
+    def mark_batch_step_scheduled(self) -> None:
+        """Record that a DECODE_BATCH_STEP event has been enqueued for this node.
+
+        Must be called exactly once per in-flight step. Raises RuntimeError
+        on double-scheduling so double-schedule bugs surface immediately rather
+        than silently running two overlapping batch pipelines.
+
+        Raises:
+            RuntimeError: If a batch step is already in flight.
+        """
+        if self._batch_step_in_flight:
+            raise RuntimeError(
+                f"node {self.node_id}: double-scheduled batch step"
+            )
+        self._batch_step_in_flight = True
+
+    def mark_batch_step_completed(self) -> None:
+        """Record that the DECODE_BATCH_STEP handler has started executing.
+
+        Called at the top of the DECODE_BATCH_STEP event handler so that
+        any new decode stream added during the same tick can immediately
+        reschedule the pipeline.
+        """
+        self._batch_step_in_flight = False
+
+    def is_batch_step_in_flight(self) -> bool:
+        """Return True if a DECODE_BATCH_STEP is already scheduled for this node."""
+        return self._batch_step_in_flight
+
+    # ------------------------------------------------------------------
+    # Request lifecycle (used by the simulation engine)
+    # ------------------------------------------------------------------
+
+    def start_decode(self, request_id: str) -> None:
+        """Mark a request as finished with prefill and ready for batch decoding.
+
+        After this call, :meth:`tick_batch_step` will advance `request_id`
+        on every batch tick. The request must already be in `running_requests`
+        (i.e., :meth:`admit` must have returned True for it).
+
+        Args:
+            request_id: ID previously admitted via :meth:`admit`.
+
+        Raises:
+            RuntimeError: If *request_id* is not currently in
+                ``running_requests`` — indicates a caller bug (e.g. calling
+                start_decode before admit, or after complete).
+        """
+        if request_id not in self.running_requests:
+            raise RuntimeError(
+                f"node {self.node_id}: start_decode called for {request_id!r} "
+                "which is not in running_requests"
+            )
+        self.decoding.add(request_id)
+        logger.debug("node %s started decode for %s", self.node_id, request_id)
+
+    def init_promoted(self, request_id: str, expected_output_len: int) -> None:
+        """Initialise output-tracking for a request promoted from `queue` to `running_requests`.
+
+        Requests that were originally queued (admit returned False) bypass
+        the normal admit() output-tracking initialisation. Call this from
+        the simulator after :meth:`complete` returns a promoted ID and
+        before scheduling PREFILL_START for the promoted request.
+
+        Args:
+            request_id: ID returned by :meth:`complete` as the promoted request.
+            expected_output_len: Expected decode output tokens for this request.
+
+        Raises:
+            RuntimeError: If *request_id* is not in ``running_requests`` —
+                indicates init_promoted was called before complete() promoted
+                the request, which is a caller bug.
+        """
+        if request_id not in self.running_requests:
+            raise RuntimeError(
+                f"node {self.node_id}: init_promoted called for {request_id!r} "
+                "which is not in running_requests"
+            )
+        self._output_tokens[request_id] = 0
+        self._expected_output[request_id] = expected_output_len
+
+    def tick_batch_step(self, now: float) -> tuple[float, list[str]]:
+        """Advance one decode batch step for all active decode streams.
+
+        Increments `_output_tokens` by 1 for every request in `decoding`.
+        The batch step time is computed from the current `decoding` size:
+        ``step_time = decode_base_ms + len(decoding) * marginal_decode_ms``.
+
+        Engine invariant: each token is an integer event — no fractional
+        tokens. This preserves the contract for future P3+ spec-decoding
+        integration where draft+verify rounds are integer-length chains.
+
+        Args:
+            now: Current simulated time in milliseconds.
+
+        Returns:
+            ``(next_time, completed_ids)`` where:
+
+            - ``next_time`` = now + step_time: the simulated time at which
+              this batch step completes (and the next one may start).
+            - ``completed_ids``: request IDs whose ``_output_tokens`` have
+              reached or exceeded ``_expected_output`` after this tick.
+              These requests should have ``DECODE_COMPLETE`` scheduled at
+              ``next_time`` by the caller.
+
+            **Critical invariant**: completed streams are removed from
+            ``decoding`` before this method returns, so a re-wakeup that
+            fires between the tick and the ``DECODE_COMPLETE`` handler
+            cannot advance the same stream a second time. ``running_requests``
+            is NOT modified here — ``complete()`` is responsible for
+            releasing the capacity slot.
+
+        Raises:
+            RuntimeError: If ``decoding`` is empty. Callers must only invoke
+                this method when at least one decode stream is active.
+        """
+        if not self.decoding:
+            raise RuntimeError(
+                f"tick_batch_step called on idle node {self.node_id} (no active decode streams)"
+            )
+        bs = len(self.decoding)
+        step_time = self.model_config.decode_base_ms + bs * self.model_config.marginal_decode_ms
+
+        # Iterate in sorted order so completed_ids is deterministic regardless
+        # of set iteration order — important for reproducible test assertions.
+        completed: list[str] = []
+        for req_id in sorted(self.decoding):
+            self._output_tokens[req_id] += 1
+            if self._output_tokens[req_id] >= self._expected_output[req_id]:
+                completed.append(req_id)
+
+        # Critical #1: immediately remove terminal streams from decoding.
+        # Prevents a subsequent wake from advancing them again before
+        # DECODE_COMPLETE fires and calls complete().
+        for req_id in completed:
+            self.decoding.discard(req_id)
+
+        return (now + step_time, completed)
+
     def complete(self, request_id: str) -> str | None:
         """Mark a request as finished and promote the next queued one if room frees up.
+
+        Also cleans up decode-tracking state for `request_id`.
 
         Args:
             request_id: ID previously passed to `admit()`. May live in
@@ -197,6 +383,12 @@ class MockEngineNode:
         except ValueError:
             # Not running — must be queued (or the caller has a bug).
             self.queue.remove(request_id)
+
+        # Clean up decode tracking.
+        self._output_tokens.pop(request_id, None)
+        self._expected_output.pop(request_id, None)
+        self.decoding.discard(request_id)
+
         logger.debug("node %s completed %s", self.node_id, request_id)
         if self.queue and len(self.running_requests) < self.node_config.capacity:
             promoted = self.queue.pop(0)

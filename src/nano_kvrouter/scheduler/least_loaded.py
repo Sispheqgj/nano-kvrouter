@@ -83,10 +83,10 @@ class LeastLoadedPolicy:
         # Cold prefill assumption: never call cache, so cached_tokens=0.
         prefill_ms = node.estimate_prefill_time(prompt_len, cached_tokens=0)
         queue_ms = node.queue_wait_time(prompt_len, request.expected_output_len)
-        ttft_ms = prefill_ms + queue_ms
-
-        # Batch size grows by 1 when this request is admitted.
-        tbt_ms = node.estimate_decode_time(len(node.running_requests) + 1)
+        # first_tick: first decode step time once this request joins the batch.
+        first_tick_ms = node.estimate_decode_time(len(node.running_requests) + 1)
+        ttft_ms = prefill_ms + queue_ms + first_tick_ms
+        tbt_ms = first_tick_ms
 
         logger.debug(
             "LeastLoaded: request %s → node %s (load=%.3f)",

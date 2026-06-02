@@ -108,8 +108,9 @@ class PrefixGreedyPolicy:
         chosen_matched = lookups[chosen.node_id].matched_tokens
         prefill_ms = chosen.estimate_prefill_time(prompt_len, cached_tokens=chosen_matched)
         queue_ms = chosen.queue_wait_time(prompt_len, request.expected_output_len)
-        ttft_ms = prefill_ms + queue_ms
-        tbt_ms = chosen.estimate_decode_time(len(chosen.running_requests) + 1)
+        first_tick_ms = chosen.estimate_decode_time(len(chosen.running_requests) + 1)
+        ttft_ms = prefill_ms + queue_ms + first_tick_ms
+        tbt_ms = first_tick_ms
 
         logger.debug(
             "PrefixGreedy: request %s → node %s (matched=%d/%d, fallback=%s)",

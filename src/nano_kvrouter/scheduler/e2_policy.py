@@ -146,17 +146,26 @@ class E2Policy:
             hist = n.current_load() * prompt_len * ppt
             shortage = max(0, new_blocks - cache.free_blocks(n.node_id, "gpu"))
             evict = shortage * bs * ppt
-            run = n.estimate_prefill_time(prompt_len, cached_tokens=matched) + n.queue_wait_time(prompt_len, request.expected_output_len)
+            # first_tick_ms: time until new request gets its first token
+            # (decode_base + (running+1) × marginal). Aligns with Conductor TTFT.
+            first_tick_ms = n.estimate_decode_time(len(n.running_requests) + 1)
+            run = (
+                n.estimate_prefill_time(prompt_len, cached_tokens=matched)
+                + n.queue_wait_time(prompt_len, request.expected_output_len)
+                + first_tick_ms
+            )
             return self._w_h * hist + self._w_e * evict + self._w_r * run
 
         chosen = min(nodes, key=_score)
 
         chosen_matched = lookups[chosen.node_id].matched_tokens
+        first_tick_ms = chosen.estimate_decode_time(len(chosen.running_requests) + 1)
         ttft_ms = (
             chosen.estimate_prefill_time(prompt_len, cached_tokens=chosen_matched)
             + chosen.queue_wait_time(prompt_len, request.expected_output_len)
+            + first_tick_ms
         )
-        tbt_ms = chosen.estimate_decode_time(len(chosen.running_requests) + 1)
+        tbt_ms = first_tick_ms
 
         logger.debug(
             "E2Policy: request %s → node %s (score=%.3f, matched=%d/%d)",

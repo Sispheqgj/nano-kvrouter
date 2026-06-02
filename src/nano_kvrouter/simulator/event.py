@@ -13,7 +13,7 @@ nodes, and metrics collectors at startup.
 
 Design notes
 ------------
-* **Minimal event set (7 types).** Cross-tier / cross-node transfers
+* **Event set (8 types).** Cross-tier / cross-node transfers
   and rebalance ticks will be added when the corresponding features
   land (Llumnix migration, Mooncake transfer-aware scoring).
 * **dict payload, not per-event dataclasses.** Handlers reach into
@@ -38,15 +38,20 @@ __all__ = ["EventType", "Event"]
 class EventType(Enum):
     """All event kinds the simulator currently understands.
 
-    Lifecycle of a normal request:
+    Lifecycle of a normal request (M2 continuous-batching model):
 
     ``REQUEST_ARRIVE`` → ``SCHEDULED`` → ``PREFILL_START`` →
-    ``PREFILL_COMPLETE`` → ``DECODE_STEP`` × N → ``DECODE_COMPLETE``
+    ``PREFILL_COMPLETE`` → [joins node decode batch] →
+    ``TOKEN_GENERATED`` × N (per-request metrics signal, one per batch tick) →
+    ``DECODE_COMPLETE``
+
+    Node-level decode pipeline (one per active node):
+    ``DECODE_BATCH_STEP`` → ``DECODE_BATCH_STEP`` → … (until node idle)
 
     Rejected requests skip everything after ``SCHEDULED`` and emit
     ``REQUEST_REJECTED`` instead.
 
-    Future additions (not in scope for the first milestone):
+    Future additions (not in scope for the current milestone):
     ``KV_TRANSFER_COMPLETE`` (Llumnix migration), ``REBALANCE_TICK``
     (periodic rebalance trigger).
     """
@@ -55,7 +60,8 @@ class EventType(Enum):
     SCHEDULED = "scheduled"
     PREFILL_START = "prefill_start"
     PREFILL_COMPLETE = "prefill_complete"
-    DECODE_STEP = "decode_step"
+    TOKEN_GENERATED = "token_generated"  # per-request metrics signal; renamed from DECODE_STEP
+    DECODE_BATCH_STEP = "decode_batch_step"
     DECODE_COMPLETE = "decode_complete"
     REQUEST_REJECTED = "request_rejected"
 
@@ -86,7 +92,7 @@ class Event:
             * ``node_id`` — present on ``SCHEDULED`` and lifecycle events
             * ``decision`` — :class:`SchedulingDecision` on ``SCHEDULED``
             * ``reason`` — rejection reason string on ``REQUEST_REJECTED``
-            * ``step_index`` — decode step number on ``DECODE_STEP``
+            * ``step_index`` — decode step number on ``TOKEN_GENERATED``
     """
 
     time: float

@@ -77,13 +77,13 @@ class RoundRobinPolicy:
         prompt_len = len(request.token_ids)
         # Assume cold prefill: cached_tokens=0 because we never query cache.
         prefill_ms = node.estimate_prefill_time(prompt_len, cached_tokens=0)
-        # Queue wait is added so the estimate reflects real back-pressure even
-        # without cache-awareness; helps MetricsCollector see realistic TTFT.
+        # Queue wait reflects real back-pressure even without cache-awareness.
         queue_ms = node.queue_wait_time(prompt_len, request.expected_output_len)
-        ttft_ms = prefill_ms + queue_ms
-
-        # Batch size grows by 1 when this request is admitted to running.
-        tbt_ms = node.estimate_decode_time(len(node.running_requests) + 1)
+        # first_tick: time of the first decode step once the request is admitted
+        # (batch grows by 1). Included in TTFT so all schedulers are comparable.
+        first_tick_ms = node.estimate_decode_time(len(node.running_requests) + 1)
+        ttft_ms = prefill_ms + queue_ms + first_tick_ms
+        tbt_ms = first_tick_ms
 
         logger.debug(
             "RoundRobin: request %s → node %s (cursor_idx=%d)",

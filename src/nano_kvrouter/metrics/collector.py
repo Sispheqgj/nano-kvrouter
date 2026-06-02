@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import logging
 import statistics
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Mapping
 
 from nano_kvrouter.simulator.event import Event, EventType
 
 if TYPE_CHECKING:
+    from nano_kvrouter.engine.mock_node import MockEngineNode
     from nano_kvrouter.simulator.engine import SimulationEngine
 
 logger = logging.getLogger(__name__)
@@ -18,20 +19,20 @@ class MetricsCollector:
     """Passive observer: subscribes to simulation events and accumulates metrics.
 
     TTFT / TBT definitions (v2, aligned with Mooncake §3 and Sarathi-Serve):
-        TTFT = DECODE_STEP[step_index=0].time - ARRIVE.time
-        TBT  = avg(DECODE_STEP[i+1].time - DECODE_STEP[i].time) for i >= 0
+        TTFT = TOKEN_GENERATED[step_index=0].time - ARRIVE.time
+        TBT  = avg(TOKEN_GENERATED[i+1].time - TOKEN_GENERATED[i].time) for i >= 0
 
     PREFILL_COMPLETE no longer participates in TTFT/TBT — its handler is
     retained as a no-op extension point for future prefill-stage metrics.
 
     Event payload contract:
-        REQUEST_ARRIVE:   {"request": Request}
-        SCHEDULED:        {"request_id": str, "decision": SchedulingDecision,
-                           "matched_tokens": int}
-        REQUEST_REJECTED: {"request_id": str, "reason": str}
-        PREFILL_COMPLETE: {"request_id": str}                       # no-op
-        DECODE_STEP:      {"request_id": str, "step_index": int}    # REQUIRED
-        DECODE_COMPLETE:  {"request_id": str}
+        REQUEST_ARRIVE:    {"request": Request}
+        SCHEDULED:         {"request_id": str, "decision": SchedulingDecision,
+                            "matched_tokens": int}
+        REQUEST_REJECTED:  {"request_id": str, "reason": str}
+        PREFILL_COMPLETE:  {"request_id": str}                        # no-op
+        TOKEN_GENERATED:   {"request_id": str, "step_index": int}     # REQUIRED
+        DECODE_COMPLETE:   {"request_id": str}
     """
 
     def __init__(self) -> None:
@@ -46,18 +47,38 @@ class MetricsCollector:
         self._end_time: float | None = None
         self._last_decode_step_time: dict[str, float] = {}
         self._tbt_samples: dict[str, list[float]] = {}
+        # M2 batch-decode metrics
+        self._batch_size_samples: list[int] = []
+        self._total_decode_tokens: int = 0
+        # Optional node registry for execute-time batch_size fallback (order-independent).
+        self._nodes: dict[str, MockEngineNode] = {}
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def attach(self, engine: SimulationEngine) -> None:
-        """Register all handlers with *engine*."""
+    def attach(
+        self,
+        engine: SimulationEngine,
+        nodes: Mapping[str, MockEngineNode] | None = None,
+    ) -> None:
+        """Register all handlers with *engine*.
+
+        Args:
+            engine: The simulation engine to subscribe to.
+            nodes: Optional node registry used as a fallback in
+                ``_on_decode_batch_step`` when the event payload carries no
+                ``batch_size`` (i.e. when the collector handler is registered
+                before the simulator handler — reversed attach order).
+        """
+        if nodes is not None:
+            self._nodes = dict(nodes)
         engine.on(EventType.REQUEST_ARRIVE, self._on_arrive)
         engine.on(EventType.SCHEDULED, self._on_scheduled)
         engine.on(EventType.REQUEST_REJECTED, self._on_rejected)
         engine.on(EventType.PREFILL_COMPLETE, self._on_prefill_complete)
-        engine.on(EventType.DECODE_STEP, self._on_decode_step)
+        engine.on(EventType.TOKEN_GENERATED, self._on_decode_step)
+        engine.on(EventType.DECODE_BATCH_STEP, self._on_decode_batch_step)
         engine.on(EventType.DECODE_COMPLETE, self._on_decode_complete)
 
     def summary(self) -> dict:
@@ -80,6 +101,8 @@ class MetricsCollector:
             "slo_ttft_hit_rate": self._slo_ttft_hit_rate(),
             "cache_hit_ratio": self._cache_hit_ratio(),
             "throughput_req_per_s": self._throughput(),
+            "avg_batch_size": self._avg_batch_size(),
+            "decode_throughput_tokens_per_s": self._decode_throughput(),
         }
 
     # ------------------------------------------------------------------
@@ -127,7 +150,7 @@ class MetricsCollector:
         self._rejected_count += 1
 
     def _on_prefill_complete(self, event: Event, engine: SimulationEngine) -> None:
-        """No-op in v2 — TTFT is measured at first DECODE_STEP, not at
+        """No-op in v2 — TTFT is measured at first TOKEN_GENERATED, not at
         prefill completion. Handler retained for future prefill-stage metrics
         (e.g. prefill duration histogram) without forcing an attach() change.
         """
@@ -147,7 +170,7 @@ class MetricsCollector:
         step_index = event.payload.get("step_index")
         if step_index is None:
             logger.warning(
-                "DECODE_STEP payload missing 'step_index' for request_id=%s, skipping",
+                "TOKEN_GENERATED payload missing 'step_index' for request_id=%s, skipping",
                 request_id,
             )
             return
@@ -171,7 +194,7 @@ class MetricsCollector:
         if last is None:
             # step_index >= 1 arrived before step 0 — defensive fallback.
             logger.warning(
-                "DECODE_STEP request_id=%s step_index=%d arrived before step 0; "
+                "TOKEN_GENERATED request_id=%s step_index=%d arrived before step 0; "
                 "TBT skipped",
                 request_id,
                 step_index,
@@ -182,6 +205,29 @@ class MetricsCollector:
         tbt = event.time - last
         self._tbt_samples.setdefault(request_id, []).append(tbt)
         self._last_decode_step_time[request_id] = event.time
+
+    def _on_decode_batch_step(self, event: Event, engine: SimulationEngine) -> None:
+        """Accumulate batch-level decode metrics from DECODE_BATCH_STEP events.
+
+        ``batch_size`` is the execute-time stream count injected into the payload
+        by the simulator handler (cli.py) before ``tick_batch_step`` runs.
+        If the collector is registered before the simulator handler (reversed
+        attach order), the payload has no ``batch_size`` yet — fall back to
+        reading ``len(node.decoding)`` directly, which is also the pre-tick
+        execute-time count (tick hasn't run yet).  Both paths return the same
+        value, making this handler attach-order independent.
+        """
+        batch_size = event.payload.get("batch_size")
+        if batch_size is None:
+            node_id = event.payload.get("node_id")
+            if node_id is not None:
+                node = self._nodes.get(node_id)
+                if node is not None:
+                    batch_size = len(node.decoding)
+        if batch_size is None:
+            return
+        self._batch_size_samples.append(int(batch_size))
+        self._total_decode_tokens += int(batch_size)
 
     def _on_decode_complete(self, event: Event, engine: SimulationEngine) -> None:
         request_id = event.payload.get("request_id")
@@ -248,3 +294,14 @@ class MetricsCollector:
         if duration_s <= 0:
             return None
         return self._completed_count / duration_s
+
+    def _avg_batch_size(self) -> float | None:
+        return statistics.mean(self._batch_size_samples) if self._batch_size_samples else None
+
+    def _decode_throughput(self) -> float | None:
+        if self._start_time is None or self._end_time is None:
+            return None
+        duration_s = (self._end_time - self._start_time) / 1000.0
+        if duration_s <= 0:
+            return None
+        return self._total_decode_tokens / duration_s

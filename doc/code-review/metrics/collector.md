@@ -33,16 +33,16 @@
 当前定义与 Mooncake §3 和 Sarathi-Serve OSDI'24 对齐：
 
 ```text
-TTFT = DECODE_STEP[step_index=0].time - REQUEST_ARRIVE.time
+TTFT = TOKEN_GENERATED[step_index=0].time - REQUEST_ARRIVE.time
 
-TBT = average over all DECODE_STEP[step_index >= 1] of:
+TBT = average over all TOKEN_GENERATED[step_index >= 1] of:
       current_decode_step.time - previous_decode_step.time
 ```
 
 也就是说：
 
-- 第一个 `DECODE_STEP` 代表首 token 产出时间，用于计算 TTFT。
-- 从第二个 `DECODE_STEP` 开始，相邻 decode step 的时间差才是 TBT sample。
+- 第一个 `TOKEN_GENERATED` 代表首 token 产出时间，用于计算 TTFT。
+- 从第二个 `TOKEN_GENERATED` 开始，相邻 decode step 的时间差才是 TBT sample。
 - `PREFILL_COMPLETE` 不再参与 TTFT/TBT 计算。
 
 `PREFILL_COMPLETE` handler 保留为 no-op extension point，后续如果要统计 prefill duration histogram，可以继续使用这个事件。

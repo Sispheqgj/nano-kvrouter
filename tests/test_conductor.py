@@ -179,8 +179,10 @@ def test_rejection_preserves_estimated_values(
     req = _req(list(range(64)), slo_ttft=0.001)
     dec = MooncakeConductor(model_config=_MC).schedule(req, nodes[:1], cm)
     assert dec.is_rejected
-    # prefill 64 cold tokens at 0.1 ms/token = 6.4 ms
-    assert dec.estimated_ttft_ms == pytest.approx(6.4)
+    # prefill 64 cold tokens at 0.1 ms/token = 6.4 ms; queue_wait=0 (node idle)
+    # first_tick: bs=0+1=1, time = 5.0 + 1*0.5 = 5.5 ms
+    # est_ttft = 6.4 + 0 + 5.5 = 11.9 ms
+    assert dec.estimated_ttft_ms == pytest.approx(11.9)
     # decode with batch_size=1: 5.0 + 0.5 = 5.5 ms
     assert dec.estimated_tbt_ms == pytest.approx(5.5)
 
@@ -224,7 +226,12 @@ def test_beta_zero_ignores_load(
         nodes[1].admit(f"q{i}")
     # n0 is completely idle
 
-    # slo_ttft must exceed n1's queue_wait(64,32) = 11×182.4 = 2006.4 ms
+    # With Important #6 fix (bs=0): queue_wait = 11×(64*0.1+32*5.0) = 11×166.4 = 1830.4 ms
+    # Plus Critical #2 first_tick = 5+9*0.5=9.5 → est_ttft ~1839.9 < 5000 → accepted
+    # With Important #1 fix: bs = max(decoding, running) = max(0, 8) = 8
+    # step_time = 5.0 + 8*0.5 = 9.0
+    # queue_wait = 11×(64*0.1 + 32*9.0) = 11×294.4 = 3238.4 ms
+    # first_tick = 5.0 + 9*0.5 = 9.5; est_ttft ≈ 6.4 + 3238.4 + 9.5 = 3254.3 < 5000 → accepted
     req = _req(list(range(64)), slo_ttft=5000.0)
     dec = MooncakeConductor(alpha=1, beta=0, gamma=0, model_config=_MC).schedule(
         req, nodes[:2], cm
@@ -263,6 +270,33 @@ def test_empty_nodes_returns_no_nodes_available(cm: CacheManager) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 14. Critical #2: est_ttft includes first batch tick time
+# ---------------------------------------------------------------------------
+
+
+def test_ttft_includes_first_batch_tick(
+    cm: CacheManager, nodes: list[MockEngineNode]
+) -> None:
+    """est_ttft must include the first decode step time, not just prefill+queue.
+
+    On a loaded node (8 running), the first batch tick adds
+    decode_base + (8+1)*marginal = 5.0 + 9*0.5 = 9.5 ms.
+    """
+    for i in range(8):
+        nodes[0].admit(f"run{i}")   # fill to capacity (capacity=8)
+
+    req = _req(list(range(32)), slo_ttft=999999.0)
+    dec = MooncakeConductor(model_config=_MC).schedule(req, nodes[:1], cm)
+    assert not dec.is_rejected
+
+    first_tick_ms = _MC.decode_base_ms + 9 * _MC.marginal_decode_ms  # = 9.5
+    assert dec.estimated_ttft_ms >= first_tick_ms, (
+        f"est_ttft={dec.estimated_ttft_ms:.3f} < first_tick={first_tick_ms:.3f}; "
+        "TTFT prediction omits first batch step time"
+    )
+
+
+# ---------------------------------------------------------------------------
 # 13. SLO check based on chosen node, not all nodes (design choice 6A)
 # ---------------------------------------------------------------------------
 
@@ -273,19 +307,21 @@ def test_slo_check_based_on_chosen_node_not_all_nodes(
     """Design 6A: Conductor rejects when the max-score node fails SLO,
     even though another node could serve the request.
 
-    Setup (α=20, β=1, γ=0, model ppt=0.1, base=5.0, marginal=0.5):
-    * n0: cold, idle → est_ttft = 12.8 ms < slo_ttft=100 → would pass
-    * n1: 7 blocks (112 tokens) cached, 8 running (at capacity)
-         → queue_wait(128, 32) = 1×(128×0.1 + 32×5.5) = 188.8 ms
-         → est_ttft = 16×0.1 + 188.8 = 190.4 ms > slo_ttft=100 → fails
-         → but cache_benefit drives score(n1) above score(n0)
+    Setup (α=30, β=1, γ=0, model ppt=0.1, base=5.0, marginal=0.5):
+    * n0: cold, idle → est_ttft ≈ 18.3 ms < slo_ttft=100 → would pass
+    * n1: 7 blocks (112 tokens) cached, 8 running (at capacity, no decoding)
+         → bs = max(0, 8) = 8; step_time = 5.0 + 8×0.5 = 9.0
+         → queue_wait(128, 32) = 1×(128×0.1 + 32×9.0) = 300.8 ms
+         → first_tick = 5.0 + 9×0.5 = 9.5 ms
+         → est_ttft = 1.6 + 300.8 + 9.5 = 311.9 ms > slo=100 → fails
+         → cache_benefit still drives score(n1) above score(n0)
 
-    Score arithmetic:
-      score(n0) = 20×0 − (0 + 0) = 0
-      score(n1) = 20×(112×0.1) − ((8/8)×128×0.1 + 188.8)
-               = 224 − 201.6 = 22.4 > 0
+    Score arithmetic (load_penalty = current_load × prompt × ppt + queue_wait):
+      score(n0) = 30×0 − (0 + 0) = 0
+      score(n1) = 30×(112×0.1) − ((8/8)×128×0.1 + 300.8)
+               = 336 − 313.6 = 22.4 > 0
 
-    Conductor picks n1, finds est_ttft=190.4 > slo=100, rejects.
+    Conductor picks n1, finds est_ttft=311.9 > slo=100, rejects.
     n0 could serve the request but is never tried (design 6A, not 6B).
     """
     cm.admit(list(range(112)), "n1")     # 7 blocks (112 tokens) cached on n1
@@ -294,10 +330,15 @@ def test_slo_check_based_on_chosen_node_not_all_nodes(
 
     req = _req(list(range(128)), slo_ttft=100.0, slo_tbt=100.0)
     dec = MooncakeConductor(
-        alpha=20, beta=1, gamma=0, model_config=_MC
+        alpha=30, beta=1, gamma=0, model_config=_MC
     ).schedule(req, nodes[:2], cm)
 
     assert dec.is_rejected
     assert dec.reject_reason == "ttft_slo_exceeded"
-    # est_ttft = prefill(16 uncached) + queue_wait = 1.6 + 188.8 = 190.4 ms
-    assert dec.estimated_ttft_ms == pytest.approx(190.4)
+    # With Important #1 fix: bs = max(decoding=0, running=8) = 8
+    # step_time = 5.0 + 8*0.5 = 9.0; n_blockers=1
+    # per_req = 128*0.1 + 32*9.0 = 12.8 + 288 = 300.8 → wait=300.8
+    # first_tick: bs=8+1=9, time=5.0+9*0.5=9.5
+    # prefill = 16*0.1 = 1.6 (128-112 uncached)
+    # est_ttft = 1.6 + 300.8 + 9.5 = 311.9 ms
+    assert dec.estimated_ttft_ms == pytest.approx(311.9)

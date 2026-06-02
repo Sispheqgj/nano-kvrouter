@@ -204,8 +204,8 @@ e2_load(node, request) = (
 REQUEST_ARRIVE        -> scheduler.schedule() -> emit PREFILL_START or REJECTED
 PREFILL_START         -> wait prefill_time    -> emit PREFILL_COMPLETE
 PREFILL_COMPLETE      -> store KV to pool     -> emit DECODE_START
-DECODE_START          -> emit first DECODE_STEP
-DECODE_STEP           -> if done: emit DECODE_COMPLETE; else emit next DECODE_STEP
+DECODE_START          -> emit first TOKEN_GENERATED
+TOKEN_GENERATED       -> if done: emit DECODE_COMPLETE; else emit next TOKEN_GENERATED
 DECODE_COMPLETE       -> free resources, record metrics
 KV_TRANSFER_COMPLETE  -> update cache metadata
 REBALANCE_TICK        -> migration_planner.rebalance()

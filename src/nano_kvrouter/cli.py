@@ -89,11 +89,14 @@ def _wire_simulator(
     *,
     logger_: logging.Logger,
 ) -> None:
-    """Register the 5 simulation event handlers on *eng*.
+    """Register simulation event handlers on *eng* (M2 continuous-batching model).
 
-    All state flows through event payloads — no request-id -> node-id dict is
-    maintained externally. ``cm.admit()`` MemoryErrors and ``node.complete()``
-    ValueErrors are caught defensively so the simulation never crashes mid-run.
+    Decode path: after PREFILL_COMPLETE a request joins the per-node decode
+    batch via ``node.start_decode()``. A single DECODE_BATCH_STEP event drives
+    all active decode streams on a node together; each tick advances every
+    stream by one integer token and schedules the next batch step (if streams
+    remain). Per-request TOKEN_GENERATED events are emitted at each tick for
+    metrics (TTFT via step_index=0, TBT via inter-step gaps).
 
     Args:
         eng: Fresh engine to register handlers on.
@@ -107,6 +110,35 @@ def _wire_simulator(
     # Keyed by request_id; removed at DECODE_COMPLETE. Required so
     # on_decode_complete can fire PREFILL_START for the promoted request.
     _queued_reqs: dict[str, dict[str, Request]] = {n.node_id: {} for n in nodes}
+
+    def _wake_batch_step(
+        node: MockEngineNode,
+        node_id: str,
+        engine: SimulationEngine,
+        *,
+        time: float | None = None,
+    ) -> None:
+        """Schedule a DECODE_BATCH_STEP at *time* (default: now) if the node
+        has active decode streams and no step is already in flight.
+
+        This is the single, authoritative wakeup path. Every code site that
+        adds a request to ``decoding`` or reschedules the next batch step
+        calls this helper rather than scheduling the event directly, so the
+        ``_batch_step_in_flight`` flag is always managed consistently.
+
+        Args:
+            time: Simulated time for the new event. Pass ``None`` to schedule
+                  at the current engine time (for wakeups from idle) or
+                  ``next_time`` from tick_batch_step (for chaining steps).
+        """
+        if node.decoding and not node.is_batch_step_in_flight():
+            t = engine.now() if time is None else time
+            engine.schedule(Event(
+                time=t,
+                type=EventType.DECODE_BATCH_STEP,
+                payload={"node_id": node_id},
+            ))
+            node.mark_batch_step_scheduled()
 
     def on_arrive(event: Event, engine: SimulationEngine) -> None:
         req = event.payload["request"]
@@ -130,7 +162,7 @@ def _wire_simulator(
             },
         ))
         node = nodes_by_id[decision.prefill_node]
-        is_running = node.admit(req.request_id)
+        is_running = node.admit(req.request_id, expected_output_len=req.expected_output_len)
         # Store req so on_decode_complete can fire PREFILL_START if queued.
         _queued_reqs[decision.prefill_node][req.request_id] = req
         if is_running:
@@ -162,6 +194,7 @@ def _wire_simulator(
         req = event.payload["request"]
         node_id = event.payload["node_id"]
         request_id = event.payload["request_id"]
+        node = nodes_by_id[node_id]
         try:
             cm.admit(req.token_ids, node_id)
         except MemoryError:
@@ -171,47 +204,62 @@ def _wire_simulator(
             logger_.warning(
                 "cm.admit MemoryError for %s on %s; KV not cached", request_id, node_id
             )
-        engine.schedule(Event(
-            time=engine.now(),
-            type=EventType.DECODE_STEP,
-            payload={
-                "request_id": request_id,
-                "node_id": node_id,
-                "request": req,
-                "step_index": 0,
-            },
-        ))
+        # Transition request from prefill to decode batch.
+        node.start_decode(request_id)
+        # Wake the batch step pipeline if not already in flight.
+        # (Replaces the fragile `len(decoding)==1` guard — see Critical #1.)
+        _wake_batch_step(node, node_id, engine)
 
-    def on_decode_step(event: Event, engine: SimulationEngine) -> None:
-        req = event.payload["request"]
+    def on_decode_batch_step(event: Event, engine: SimulationEngine) -> None:
         node_id = event.payload["node_id"]
-        request_id = event.payload["request_id"]
-        step_index = event.payload["step_index"]
         node = nodes_by_id[node_id]
-        if step_index >= req.expected_output_len - 1:
+
+        # Mark the in-flight step as done so wakeup logic can re-arm if needed.
+        node.mark_batch_step_completed()
+
+        if not node.decoding:
+            return
+
+        # Inject execute-time batch_size into payload before tick so MetricsCollector
+        # sees the real stream count regardless of handler registration order.
+        # (In reversed-order attach, collector reads this value from payload; in
+        # normal order it reads directly from node — same pre-tick value either way.)
+        event.payload["batch_size"] = len(node.decoding)
+        next_time, completed_ids = node.tick_batch_step(engine.now())
+        # After tick_batch_step: completed_ids streams are removed from node.decoding
+        # (Critical #1 fix). node.decoding now contains only the remaining streams.
+
+        # Emit per-request TOKEN_GENERATED metrics signals for ALL streams that
+        # participated in this tick: remaining (still in node.decoding) PLUS
+        # completed (removed from node.decoding by tick_batch_step).
+        # step_index=0 → TTFT; step_index>0 → TBT inter-step gap.
+        step_streams = set(node.decoding) | set(completed_ids)
+        for req_id in step_streams:
+            step_idx = node._output_tokens[req_id] - 1  # tick already incremented
             engine.schedule(Event(
-                time=engine.now(),
+                time=next_time,
+                type=EventType.TOKEN_GENERATED,
+                payload={"request_id": req_id, "step_index": step_idx},
+            ))
+
+        # Schedule DECODE_COMPLETE for finished streams (before next batch step).
+        for req_id in completed_ids:
+            engine.schedule(Event(
+                time=next_time,
                 type=EventType.DECODE_COMPLETE,
-                payload={"request_id": request_id, "node_id": node_id},
+                payload={"request_id": req_id, "node_id": node_id},
             ))
-        else:
-            tbt = node.estimate_decode_time(len(node.running_requests))
-            engine.schedule(Event(
-                time=engine.now() + tbt,
-                type=EventType.DECODE_STEP,
-                payload={
-                    "request_id": request_id,
-                    "node_id": node_id,
-                    "request": req,
-                    "step_index": step_index + 1,
-                },
-            ))
+
+        # Schedule next batch step through the single authoritative helper
+        # (Important #2: no direct DECODE_BATCH_STEP schedules outside helper).
+        _wake_batch_step(node, node_id, engine, time=next_time)
 
     def on_decode_complete(event: Event, engine: SimulationEngine) -> None:
         request_id = event.payload["request_id"]
         node_id = event.payload["node_id"]
+        node = nodes_by_id[node_id]
         try:
-            promoted_id = nodes_by_id[node_id].complete(request_id)
+            promoted_id = node.complete(request_id)
         except ValueError:
             # Defensive: request already removed (duplicate DECODE_COMPLETE guard).
             promoted_id = None
@@ -219,7 +267,9 @@ def _wire_simulator(
         # Clean up the completed request's stored object.
         _queued_reqs[node_id].pop(request_id, None)
 
-        # If complete() promoted a queued request, fire its PREFILL_START now.
+        # If complete() promoted a queued request, initialise its output
+        # tracking and fire PREFILL_START so it goes through prefill before
+        # joining the decode batch.
         if promoted_id is not None:
             promoted_req = _queued_reqs[node_id].get(promoted_id)
             if promoted_req is None:
@@ -228,6 +278,7 @@ def _wire_simulator(
                     node_id, promoted_id,
                 )
             else:
+                node.init_promoted(promoted_id, expected_output_len=promoted_req.expected_output_len)
                 engine.schedule(Event(
                     time=engine.now(),
                     type=EventType.PREFILL_START,
@@ -238,10 +289,15 @@ def _wire_simulator(
                     },
                 ))
 
+        # Safety-net wakeup: if a stream joined decoding between the last
+        # DECODE_BATCH_STEP (remaining=0) and this DECODE_COMPLETE, it may
+        # be sitting in node.decoding with no batch step scheduled.
+        _wake_batch_step(node, node_id, engine)
+
     eng.on(EventType.REQUEST_ARRIVE, on_arrive)
     eng.on(EventType.PREFILL_START, on_prefill_start)
     eng.on(EventType.PREFILL_COMPLETE, on_prefill_complete)
-    eng.on(EventType.DECODE_STEP, on_decode_step)
+    eng.on(EventType.DECODE_BATCH_STEP, on_decode_batch_step)
     eng.on(EventType.DECODE_COMPLETE, on_decode_complete)
 
 
@@ -280,7 +336,7 @@ def _run_one(cfg: NanoKVConfig, scheduler_name: str) -> dict:
     gen = RequestGenerator(cfg)
 
     _wire_simulator(eng, sched, cm, nodes, logger_=logger)
-    metrics.attach(eng)
+    metrics.attach(eng, nodes={n.node_id: n for n in nodes})
     gen.attach(eng)
     eng.run()
 
@@ -304,6 +360,8 @@ _TABLE_KEYS = [
     "slo_ttft_hit_rate",
     "cache_hit_ratio",
     "throughput_req_per_s",
+    "avg_batch_size",
+    "decode_throughput_tokens_per_s",
 ]
 
 _SWEEP_KEYS = [
@@ -313,6 +371,8 @@ _SWEEP_KEYS = [
     "cache_hit_ratio",
     "rejection_rate",
     "throughput_req_per_s",
+    "avg_batch_size",
+    "decode_throughput_tokens_per_s",
 ]
 
 

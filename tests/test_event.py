@@ -13,14 +13,15 @@ from nano_kvrouter.simulator.event import Event, EventType
 # ---------------------------------------------------------------------------
 
 
-def test_event_type_has_minimal_set() -> None:
-    """First-milestone event set: exactly these 7 types, no more, no less."""
+def test_event_type_has_m2_set() -> None:
+    """M2 event set: 8 types — DECODE_BATCH_STEP added for batch decode pipeline."""
     assert {e.name for e in EventType} == {
         "REQUEST_ARRIVE",
         "SCHEDULED",
         "PREFILL_START",
         "PREFILL_COMPLETE",
-        "DECODE_STEP",
+        "TOKEN_GENERATED",
+        "DECODE_BATCH_STEP",
         "DECODE_COMPLETE",
         "REQUEST_REJECTED",
     }
@@ -42,7 +43,7 @@ def test_heap_pops_in_time_order() -> None:
     q: list[Event] = []
     heapq.heappush(q, Event(time=30, seq=0, type=EventType.PREFILL_COMPLETE))
     heapq.heappush(q, Event(time=10, seq=1, type=EventType.REQUEST_ARRIVE))
-    heapq.heappush(q, Event(time=20, seq=2, type=EventType.DECODE_STEP))
+    heapq.heappush(q, Event(time=20, seq=2, type=EventType.TOKEN_GENERATED))
 
     popped = [heapq.heappop(q).time for _ in range(3)]
     assert popped == [10, 20, 30]
@@ -53,7 +54,7 @@ def test_heap_breaks_ties_by_seq_fifo() -> None:
     q: list[Event] = []
     heapq.heappush(q, Event(time=5, seq=2, type=EventType.PREFILL_COMPLETE, payload={"id": "third"}))
     heapq.heappush(q, Event(time=5, seq=0, type=EventType.REQUEST_ARRIVE, payload={"id": "first"}))
-    heapq.heappush(q, Event(time=5, seq=1, type=EventType.DECODE_STEP, payload={"id": "second"}))
+    heapq.heappush(q, Event(time=5, seq=1, type=EventType.TOKEN_GENERATED, payload={"id": "second"}))
 
     order = [heapq.heappop(q).payload["id"] for _ in range(3)]
     assert order == ["first", "second", "third"]
