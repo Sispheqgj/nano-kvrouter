@@ -106,9 +106,12 @@ class PrefixGreedyPolicy:
             chosen = min(best, key=lambda n: n.current_load())
 
         chosen_matched = lookups[chosen.node_id].matched_tokens
-        prefill_ms = chosen.estimate_prefill_time(prompt_len, cached_tokens=chosen_matched)
+        bs_hint = len(chosen.running_requests) + 1
+        prefill_ms = chosen.estimate_prefill_time(
+            prompt_len, cached_tokens=chosen_matched, batch_size_hint=bs_hint
+        )
         queue_ms = chosen.queue_wait_time(prompt_len, request.expected_output_len)
-        first_tick_ms = chosen.estimate_decode_time(len(chosen.running_requests) + 1)
+        first_tick_ms = chosen.estimate_decode_time(bs_hint)
         ttft_ms = prefill_ms + queue_ms + first_tick_ms
         tbt_ms = first_tick_ms
 

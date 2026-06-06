@@ -75,13 +75,15 @@ class RoundRobinPolicy:
         node = nodes[idx]
 
         prompt_len = len(request.token_ids)
-        # Assume cold prefill: cached_tokens=0 because we never query cache.
-        prefill_ms = node.estimate_prefill_time(prompt_len, cached_tokens=0)
-        # Queue wait reflects real back-pressure even without cache-awareness.
+        # M3 chunked-prefill TTFT: assume cold prefill (cached_tokens=0).
+        # bs_hint uses running+1 as a proxy for decode batch size (RoundRobin
+        # has no decoding visibility; running+1 is a safe conservative estimate).
+        bs_hint = len(node.running_requests) + 1
+        prefill_ms = node.estimate_prefill_time(
+            prompt_len, cached_tokens=0, batch_size_hint=bs_hint
+        )
         queue_ms = node.queue_wait_time(prompt_len, request.expected_output_len)
-        # first_tick: time of the first decode step once the request is admitted
-        # (batch grows by 1). Included in TTFT so all schedulers are comparable.
-        first_tick_ms = node.estimate_decode_time(len(node.running_requests) + 1)
+        first_tick_ms = node.estimate_decode_time(bs_hint)
         ttft_ms = prefill_ms + queue_ms + first_tick_ms
         tbt_ms = first_tick_ms
 

@@ -179,10 +179,10 @@ def test_rejection_preserves_estimated_values(
     req = _req(list(range(64)), slo_ttft=0.001)
     dec = MooncakeConductor(model_config=_MC).schedule(req, nodes[:1], cm)
     assert dec.is_rejected
-    # prefill 64 cold tokens at 0.1 ms/token = 6.4 ms; queue_wait=0 (node idle)
-    # first_tick: bs=0+1=1, time = 5.0 + 1*0.5 = 5.5 ms
-    # est_ttft = 6.4 + 0 + 5.5 = 11.9 ms
-    assert dec.estimated_ttft_ms == pytest.approx(11.9)
+    # M3: 64 cold tokens, bs_hint=decoding+1=1; n_chunks=1 (64<512)
+    # step_per_chunk = 512*0.1+5.0+1*0.5 = 56.7; queue_wait=0; first_tick=5.5
+    # est_ttft = 56.7 + 0 + 5.5 = 62.2 ms
+    assert dec.estimated_ttft_ms == pytest.approx(62.2)
     # decode with batch_size=1: 5.0 + 0.5 = 5.5 ms
     assert dec.estimated_tbt_ms == pytest.approx(5.5)
 
@@ -308,12 +308,13 @@ def test_slo_check_based_on_chosen_node_not_all_nodes(
     even though another node could serve the request.
 
     Setup (α=30, β=1, γ=0, model ppt=0.1, base=5.0, marginal=0.5):
-    * n0: cold, idle → est_ttft ≈ 18.3 ms < slo_ttft=100 → would pass
+    * n0: cold, idle → est_ttft ≈ 62.2 ms < slo_ttft=100 → would pass
     * n1: 7 blocks (112 tokens) cached, 8 running (at capacity, no decoding)
-         → bs = max(0, 8) = 8; step_time = 5.0 + 8×0.5 = 9.0
-         → queue_wait(128, 32) = 1×(128×0.1 + 32×9.0) = 300.8 ms
-         → first_tick = 5.0 + 9×0.5 = 9.5 ms
-         → est_ttft = 1.6 + 300.8 + 9.5 = 311.9 ms > slo=100 → fails
+         → bs_hint = decoding+1 = 0+1 = 1
+         → queue_wait(128, 32): bs=max(0,8)=8, step=9.0, n_blockers=1 → 300.8 ms
+         → prefill_phase = 1×(512×0.1+5.0+1×0.5) = 56.7 ms
+         → first_tick = 5.0 + 1×0.5 = 5.5 ms
+         → est_ttft = 56.7 + 300.8 + 5.5 = 363.0 ms > slo=100 → fails
          → cache_benefit still drives score(n1) above score(n0)
 
     Score arithmetic (load_penalty = current_load × prompt × ppt + queue_wait):
@@ -321,7 +322,7 @@ def test_slo_check_based_on_chosen_node_not_all_nodes(
       score(n1) = 30×(112×0.1) − ((8/8)×128×0.1 + 300.8)
                = 336 − 313.6 = 22.4 > 0
 
-    Conductor picks n1, finds est_ttft=311.9 > slo=100, rejects.
+    Conductor picks n1, finds est_ttft=363.0 > slo=100, rejects.
     n0 could serve the request but is never tried (design 6A, not 6B).
     """
     cm.admit(list(range(112)), "n1")     # 7 blocks (112 tokens) cached on n1
@@ -335,10 +336,34 @@ def test_slo_check_based_on_chosen_node_not_all_nodes(
 
     assert dec.is_rejected
     assert dec.reject_reason == "ttft_slo_exceeded"
-    # With Important #1 fix: bs = max(decoding=0, running=8) = 8
-    # step_time = 5.0 + 8*0.5 = 9.0; n_blockers=1
-    # per_req = 128*0.1 + 32*9.0 = 12.8 + 288 = 300.8 → wait=300.8
-    # first_tick: bs=8+1=9, time=5.0+9*0.5=9.5
-    # prefill = 16*0.1 = 1.6 (128-112 uncached)
-    # est_ttft = 1.6 + 300.8 + 9.5 = 311.9 ms
-    assert dec.estimated_ttft_ms == pytest.approx(311.9)
+    # M3: bs_hint = decoding+1 = 0+1 = 1; uncached = 128-112 = 16 tokens
+    # prefill_phase = 1×(512×0.1+5.0+1×0.5) = 56.7 (conservative: full chunk_size)
+    # queue_wait: bs=max(0,8)=8, step=9.0, n_blockers=1, per_req=12.8+288=300.8
+    # first_tick = 5.0+1×0.5 = 5.5
+    # est_ttft = 56.7 + 300.8 + 5.5 = 363.0 ms
+    assert dec.estimated_ttft_ms == pytest.approx(363.0)
+
+
+# ---------------------------------------------------------------------------
+# 15. M3: est_ttft reflects chunked prefill (n_chunks × step_per_chunk)
+# ---------------------------------------------------------------------------
+
+
+def test_ttft_includes_chunked_prefill(
+    cm: CacheManager, nodes: list[MockEngineNode]
+) -> None:
+    """est_ttft must scale with the number of prefill chunks.
+
+    For a 1024-token cold prompt with chunk_size=512, n_chunks=2.
+    Idle node: bs_hint = decoding+1 = 1.
+    step_per_chunk = 512×0.1 + 5.0 + 1×0.5 = 56.7 ms
+    prefill_phase  = 2 × 56.7 = 113.4 ms
+    first_tick     = 5.0 + 1×0.5 = 5.5 ms
+    est_ttft       = 0 + 113.4 + 5.5 = 118.9 ms
+    """
+    req = _req(list(range(1024)), slo_ttft=2000.0)
+    dec = MooncakeConductor(model_config=_MC).schedule(req, nodes[:1], cm)
+    assert not dec.is_rejected
+    chunk = _MC.prefill_chunk_size  # 512
+    step_per_chunk = chunk * _MC.prefill_cost_per_token_ms + _MC.decode_base_ms + 1 * _MC.marginal_decode_ms
+    assert dec.estimated_ttft_ms == pytest.approx(2 * step_per_chunk + _MC.decode_base_ms + _MC.marginal_decode_ms)

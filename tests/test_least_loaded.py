@@ -175,12 +175,12 @@ def test_ttft_equals_cold_prefill_plus_queue_wait(policy: LeastLoadedPolicy) -> 
     cache = NullCacheQuery(node_ids=["n0"])
     dec = policy.schedule(req, [node], cache)
 
-    # 8 running == capacity, 0 decoding → bs = max(0,8) = 8, step_time = 13.0
-    # n_blockers=2; per_req = 20*0.1+32*13.0 = 418.0; queue_wait = 836.0
-    # cold prefill = 2.0; first_tick = 5.0+(8+1)*1.0 = 14.0
-    # expected_ttft = 2.0 + 836.0 + 14.0 = 852.0
+    # M3: bs_hint = running+1 = 8+1 = 9; step_per_chunk = 512*0.1+5+9*1 = 65.2
+    # queue_wait: bs=max(0,8)=8, step=13.0, n_blockers=2, per_req=20*0.1+32*13=418.0
+    # queue_wait = 2*418.0 = 836.0; first_tick = 5.0+(8+1)*1.0 = 14.0
+    # expected_ttft = 65.2 + 836.0 + 14.0 = 915.2
     expected_ttft = (
-        20 * MODEL.prefill_cost_per_token_ms
+        (512 * MODEL.prefill_cost_per_token_ms + MODEL.decode_base_ms + (NODE_CFG.capacity + 1) * MODEL.marginal_decode_ms)
         + 2 * (20 * MODEL.prefill_cost_per_token_ms + 32 * (MODEL.decode_base_ms + NODE_CFG.capacity * MODEL.marginal_decode_ms))
         + (MODEL.decode_base_ms + (NODE_CFG.capacity + 1) * MODEL.marginal_decode_ms)
     )
@@ -192,9 +192,11 @@ def test_ttft_zero_queue_cold_prefill(policy: LeastLoadedPolicy) -> None:
     node = _make_node("n0")
     cache = NullCacheQuery(node_ids=["n0"])
     dec = policy.schedule(req, [node], cache)
-    # idle node: queue_wait=0; cold prefill + first_tick (bs=1) = 3.0 + 6.0 = 9.0
+    # M3: idle node, bs_hint=1; 1 chunk (30<512); step_per_chunk=512*0.1+5+1=57.2
+    # queue_wait=0; first_tick=5+1=6.0; expected=57.2+6.0=63.2
     assert dec.estimated_ttft_ms == pytest.approx(
-        30 * MODEL.prefill_cost_per_token_ms + MODEL.decode_base_ms + MODEL.marginal_decode_ms
+        512 * MODEL.prefill_cost_per_token_ms + MODEL.decode_base_ms + MODEL.marginal_decode_ms
+        + MODEL.decode_base_ms + MODEL.marginal_decode_ms
     )
 
 

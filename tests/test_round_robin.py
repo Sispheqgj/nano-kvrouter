@@ -116,9 +116,15 @@ def test_ttft_equals_cold_prefill_with_empty_queue(
 ) -> None:
     req = _make_request(20)
     dec = policy.schedule(req, three_nodes, null_cache)
-    # queue_wait=0 (idle node); cold prefill + first decode step (bs=0+1=1)
-    # first_tick = decode_base + 1*marginal = 5.0 + 1.0 = 6.0
-    expected_ttft = 20 * MODEL.prefill_cost_per_token_ms + MODEL.decode_base_ms + MODEL.marginal_decode_ms
+    # M3 chunked-prefill: 20 tokens → 1 chunk (20 < chunk_size=512)
+    # bs_hint = running+1 = 0+1 = 1
+    # step_per_chunk = 512*ppt + base + 1*marginal = 51.2+5.0+1.0 = 57.2
+    # first_tick = base + 1*marginal = 6.0
+    # expected_ttft = 57.2 + 0 (queue_wait) + 6.0 = 63.2
+    expected_ttft = (
+        512 * MODEL.prefill_cost_per_token_ms + MODEL.decode_base_ms + MODEL.marginal_decode_ms
+        + MODEL.decode_base_ms + MODEL.marginal_decode_ms
+    )
     assert dec.estimated_ttft_ms == pytest.approx(expected_ttft)
 
 
@@ -136,12 +142,12 @@ def test_ttft_includes_queue_wait(
     cache = NullCacheQuery(node_ids=["n0"])
     req = _make_request(10)
     dec = policy.schedule(req, [node], cache)
-    # 8 running, 0 decoding → bs = max(0,8) = 8, step_time = 5.0+8*1.0 = 13.0
-    # n_blockers=2; per_req = 10*0.1+32*13.0 = 417.0; queue_wait = 834.0
-    # prefill = 1.0; first_tick = 5.0+(8+1)*1.0 = 14.0
-    # expected_ttft = 1.0 + 834.0 + 14.0 = 849.0
+    # M3: bs_hint = running+1 = 8+1 = 9; step_per_chunk = 512*0.1+5+9*1 = 65.2
+    # queue_wait: bs=max(0,8)=8, step=13.0, n_blockers=2, per_req=10*0.1+32*13=417.0
+    # queue_wait = 2*417.0 = 834.0; first_tick = 5+9*1 = 14.0
+    # expected_ttft = 65.2 + 834.0 + 14.0 = 913.2
     assert dec.estimated_ttft_ms == pytest.approx(
-        10 * 0.1 + 2 * (10 * 0.1 + 32 * (5.0 + 8 * 1.0)) + (5.0 + 9 * 1.0)
+        (512 * 0.1 + 5.0 + 9 * 1.0) + 2 * (10 * 0.1 + 32 * (5.0 + 8 * 1.0)) + (5.0 + 9 * 1.0)
     )
 
 
@@ -247,7 +253,8 @@ def test_ttft_assumes_cold_prefill_regardless_of_cache(
     req = _make_request(20)
     dec = policy.schedule(req, three_nodes, FullHitCache())  # type: ignore[arg-type]
     # RoundRobin never calls lookup/lookup_all — cached_tokens=0 always.
-    # TTFT = cold prefill + first_tick (idle node, bs=1): 2.0 + 6.0 = 8.0
+    # M3: 1 chunk (20 < 512), bs_hint=1; step_per_chunk=57.2; first_tick=6.0 → 63.2
     assert dec.estimated_ttft_ms == pytest.approx(
-        20 * MODEL.prefill_cost_per_token_ms + MODEL.decode_base_ms + MODEL.marginal_decode_ms
+        512 * MODEL.prefill_cost_per_token_ms + MODEL.decode_base_ms + MODEL.marginal_decode_ms
+        + MODEL.decode_base_ms + MODEL.marginal_decode_ms
     )

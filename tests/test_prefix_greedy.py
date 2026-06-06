@@ -210,10 +210,10 @@ def test_ttft_reflects_cache_hit(
 
     dec = PrefixGreedyPolicy().schedule(req, nodes[:1], cm)
 
-    # uncached = 64 tokens × 0.1 ms = 6.4 ms; queue_wait=0 (idle n0)
-    # first_tick = decode_base + (0+1)*marginal = 5.0 + 0.5 = 5.5
-    # expected_ttft = 6.4 + 0 + 5.5 = 11.9
-    assert dec.estimated_ttft_ms == pytest.approx(64 * 0.1 + 5.0 + 0.5)
+    # M3: uncached=64, bs_hint=running+1=1; n_chunks=1 (64<512)
+    # step_per_chunk = 512*0.1+5.0+1*0.5 = 56.7; first_tick = 5.0+0.5 = 5.5
+    # expected_ttft = 56.7 + 0 + 5.5 = 62.2
+    assert dec.estimated_ttft_ms == pytest.approx(56.7 + 5.5)
 
 
 # ---------------------------------------------------------------------------

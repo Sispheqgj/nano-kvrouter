@@ -52,6 +52,14 @@ class MetricsCollector:
         self._total_decode_tokens: int = 0
         # Optional node registry for execute-time batch_size fallback (order-independent).
         self._nodes: dict[str, MockEngineNode] = {}
+        # M3 chunked-prefill metrics
+        self._chunked_prefill_steps: list[int] = []   # n_chunks per completed request
+        self._interleave_step_count: int = 0           # batch steps with both prefill+decode
+        # Per-request n_chunks cache: populated by _on_prefill_start (reads from
+        # PREFILL_START payload injected at event-creation time in on_arrive),
+        # consumed by _on_decode_complete.  Attach-order independent because
+        # n_chunks is in the payload before any handler runs.
+        self._request_n_chunks: dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -76,6 +84,7 @@ class MetricsCollector:
         engine.on(EventType.REQUEST_ARRIVE, self._on_arrive)
         engine.on(EventType.SCHEDULED, self._on_scheduled)
         engine.on(EventType.REQUEST_REJECTED, self._on_rejected)
+        engine.on(EventType.PREFILL_START, self._on_prefill_start)
         engine.on(EventType.PREFILL_COMPLETE, self._on_prefill_complete)
         engine.on(EventType.TOKEN_GENERATED, self._on_decode_step)
         engine.on(EventType.DECODE_BATCH_STEP, self._on_decode_batch_step)
@@ -103,6 +112,11 @@ class MetricsCollector:
             "throughput_req_per_s": self._throughput(),
             "avg_batch_size": self._avg_batch_size(),
             "decode_throughput_tokens_per_s": self._decode_throughput(),
+            "avg_chunked_prefill_steps_per_request": (
+                statistics.mean(self._chunked_prefill_steps)
+                if self._chunked_prefill_steps else None
+            ),
+            "prefill_decode_interleave_step_count": self._interleave_step_count,
         }
 
     # ------------------------------------------------------------------
@@ -148,6 +162,19 @@ class MetricsCollector:
             logger.warning("REQUEST_REJECTED payload missing 'request_id', skipping")
             return
         self._rejected_count += 1
+
+    def _on_prefill_start(self, event: Event, engine: SimulationEngine) -> None:
+        """Cache per-request n_chunks from the PREFILL_START payload.
+
+        n_chunks is injected into the event at creation time (in cli.on_arrive),
+        so this handler reads the correct value regardless of whether it runs
+        before or after the cli PREFILL_START handler (attach-order independent).
+        """
+        request_id = event.payload.get("request_id")
+        if request_id is None:
+            return
+        n_chunks = event.payload.get("n_chunks", 0)
+        self._request_n_chunks[request_id] = int(n_chunks)
 
     def _on_prefill_complete(self, event: Event, engine: SimulationEngine) -> None:
         """No-op in v2 — TTFT is measured at first TOKEN_GENERATED, not at
@@ -209,25 +236,41 @@ class MetricsCollector:
     def _on_decode_batch_step(self, event: Event, engine: SimulationEngine) -> None:
         """Accumulate batch-level decode metrics from DECODE_BATCH_STEP events.
 
-        ``batch_size`` is the execute-time stream count injected into the payload
-        by the simulator handler (cli.py) before ``tick_batch_step`` runs.
-        If the collector is registered before the simulator handler (reversed
-        attach order), the payload has no ``batch_size`` yet — fall back to
-        reading ``len(node.decoding)`` directly, which is also the pre-tick
-        execute-time count (tick hasn't run yet).  Both paths return the same
-        value, making this handler attach-order independent.
+        Both ``batch_size`` and ``interleave`` use the same payload-with-fallback
+        pattern (M2.fix4 / M3.fix2) for attach-order independence:
+
+        ``batch_size``: the pre-tick decode stream count injected by the cli handler
+        at execute time. Fallback: ``len(node.decoding)`` (same pre-tick value).
+
+        ``interleave``: True when a prefill chunk was piggybacked with at least one
+        decode stream this step. Injected by the cli handler at execute time
+        (``bs > 0 and bool(node._prefill_remaining)``). Fallback: same expression
+        read directly from node (pre-tick state is the same regardless of handler
+        order, because tick_batch_step hasn't run yet in the reversed-order case).
+
+        Pre-injection at schedule time (old approach) was unreliable because
+        DECODE_COMPLETE can promote a request between schedule and execute time,
+        adding a new entry to ``_prefill_remaining`` that the schedule-time
+        ``will_interleave`` did not see.
         """
+        node_id = event.payload.get("node_id")
+        node = self._nodes.get(node_id) if node_id else None
+
         batch_size = event.payload.get("batch_size")
-        if batch_size is None:
-            node_id = event.payload.get("node_id")
-            if node_id is not None:
-                node = self._nodes.get(node_id)
-                if node is not None:
-                    batch_size = len(node.decoding)
+        if batch_size is None and node is not None:
+            batch_size = len(node.decoding)
         if batch_size is None:
             return
         self._batch_size_samples.append(int(batch_size))
         self._total_decode_tokens += int(batch_size)
+
+        # Interleave: read from payload (injected at execute time by cli handler);
+        # if absent (reversed attach order), derive from node pre-tick state.
+        interleave = event.payload.get("interleave")
+        if interleave is None and node is not None:
+            interleave = len(node.decoding) > 0 and bool(node._prefill_remaining)
+        if interleave:
+            self._interleave_step_count += 1
 
     def _on_decode_complete(self, event: Event, engine: SimulationEngine) -> None:
         request_id = event.payload.get("request_id")
@@ -241,6 +284,12 @@ class MetricsCollector:
         self._end_time = event.time
 
         self._e2e_per_request.append(event.time - rec["arrival_time"])
+
+        # Read n_chunks from the internal cache populated by _on_prefill_start,
+        # not from event.payload (which may be absent in reversed-attach scenarios).
+        n_chunks = self._request_n_chunks.pop(request_id, None)
+        if n_chunks is not None:
+            self._chunked_prefill_steps.append(n_chunks)
 
 
     # ------------------------------------------------------------------

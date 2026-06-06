@@ -146,16 +146,21 @@ class MooncakeConductor:
         chosen = max(nodes, key=score)
 
         chosen_matched = lookups[chosen.node_id].matched_tokens
-        # +1 for the request being admitted; this is the batch size at the first
-        # decode step (Conservative: ignores requests that might complete before
-        # our prefill finishes, but correct for heavily loaded nodes).
-        bs_at_first_decode = len(chosen.running_requests) + 1
-        first_tick_ms = chosen.estimate_decode_time(bs_at_first_decode)
+        # M3 chunked-prefill TTFT formula:
+        #   est_ttft = queue_wait + n_chunks * step_per_chunk + first_decode_tick
+        # bs_hint uses decoding (not running) because only actively-decoding streams
+        # contribute to piggyback step cost during this request's prefill phase.
+        bs_hint = len(chosen.decoding) + 1
+        prefill_phase_ms = chosen.estimate_prefill_time(
+            prompt_len, cached_tokens=chosen_matched, batch_size_hint=bs_hint
+        )
+        first_tick_ms = chosen.estimate_decode_time(bs_hint)
         est_ttft = (
-            chosen.estimate_prefill_time(prompt_len, cached_tokens=chosen_matched)
-            + chosen.queue_wait_time(prompt_len, request.expected_output_len)
+            chosen.queue_wait_time(prompt_len, request.expected_output_len)
+            + prefill_phase_ms
             + first_tick_ms
         )
+        # TBT uses running+1 (all running requests will eventually decode together).
         est_tbt = chosen.estimate_decode_time(len(chosen.running_requests) + 1)
 
         # SLO early rejection (design 6A): based on the best node only —

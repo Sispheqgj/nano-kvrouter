@@ -242,7 +242,12 @@ def test_capacity_full_node_throttles_throughput() -> None:
 def test_m2_batch_decode_all_same_length_complete_together() -> None:
     """Validation criterion 2: 16 requests with identical output_len on a single
     capacity=16 node should all generate their last token in the same batch step,
-    so all 16 DECODE_COMPLETE events share the same simulated time."""
+    so all 16 DECODE_COMPLETE events share the same simulated time.
+
+    M3 note: the shared prompt is pre-admitted to the cache so all requests have
+    0 uncached tokens, bypassing the FIFO prefill pipeline and entering the decode
+    batch simultaneously — preserving the M2 simultaneity invariant.
+    """
     from nano_kvrouter.engine.mock_node import MockEngineNode
     from nano_kvrouter.kv_cache.cache_manager import CacheManager
 
@@ -255,6 +260,11 @@ def test_m2_batch_decode_all_same_length_complete_together() -> None:
     nodes = [MockEngineNode("n0", cfg.model, cfg.node)]
     cm = CacheManager(["n0"], cfg.model, cfg.node, cfg.bandwidth, clock=eng.now)
     sched_obj = _build_scheduler("round_robin", {}, cfg.model)
+
+    # Pre-warm cache: all 16 requests share token_ids=[0]*64.
+    # Admitting once ensures matched=64 for every request → uncached=0 →
+    # PREFILL_COMPLETE fires immediately → all 16 enter decode at t=0.
+    cm.admit([0] * 64, "n0")
 
     _wire_simulator(eng, sched_obj, cm, nodes, logger_=logging.getLogger("test"))
 
@@ -439,4 +449,243 @@ def test_duplicate_completion_prevented_when_wake_during_terminal() -> None:
     )
     assert len(complete_ids) == 2, (
         f"Expected exactly 2 DECODE_COMPLETE events, got {len(complete_ids)}: {complete_ids}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# M3: Sarathi chunked-prefill tests
+# ---------------------------------------------------------------------------
+
+def test_long_prompt_does_not_freeze_decode() -> None:
+    """Sarathi invariant: chunked prefill must not block concurrent decode streams.
+
+    req_a has 0 uncached tokens (cache pre-warmed) → enters decode immediately.
+    req_b has 512 uncached tokens with chunk_size=128 → 4 prefill chunks needed.
+    Each tick processes one req_b chunk AND advances req_a's decode.
+    req_a must emit its first token BEFORE req_b finishes all prefill chunks.
+    """
+    from nano_kvrouter.config import BandwidthConfig, ModelConfig, NodeConfig
+    from nano_kvrouter.engine.mock_node import MockEngineNode
+    from nano_kvrouter.kv_cache.cache_manager import CacheManager
+    from nano_kvrouter.scheduler.round_robin import RoundRobinPolicy
+    from nano_kvrouter.simulator.engine import SimulationEngine
+    from nano_kvrouter.simulator.event import Event, EventType
+    from nano_kvrouter.request import Request
+
+    mc = ModelConfig(
+        prefill_cost_per_token_ms=0.1,
+        decode_base_ms=5.0,
+        marginal_decode_ms=0.5,
+        prefill_chunk_size=128,
+    )
+    nc = NodeConfig(capacity=4, gpu_blocks=200, cpu_blocks=400, disk_blocks=800)
+
+    eng = SimulationEngine()
+    nodes = [MockEngineNode("n0", mc, nc)]
+    cm = CacheManager(["n0"], mc, nc, BandwidthConfig(), clock=eng.now)
+    sched = RoundRobinPolicy()
+    _wire_simulator(eng, sched, cm, nodes, logger_=logging.getLogger("test"))
+
+    a_token_times: list[float] = []
+    b_prefill_complete_time: list[float] = []
+    eng.on(
+        EventType.TOKEN_GENERATED,
+        lambda ev, e: a_token_times.append(ev.time) if ev.payload["request_id"] == "a" else None,
+    )
+    eng.on(
+        EventType.PREFILL_COMPLETE,
+        lambda ev, e: b_prefill_complete_time.append(ev.time) if ev.payload["request_id"] == "b" else None,
+    )
+
+    # Pre-warm cache: req_a shares [0]*32 → 0 uncached → enters decode at t=0
+    cm.admit([0] * 32, "n0")
+    req_a = Request("a", [0] * 32, "ha", expected_output_len=4,
+                    arrival_time=0.0, slo_ttft=9999.0, slo_tbt=9999.0)
+    # req_b: 512 cold tokens, chunk_size=128 → 4 chunks needed
+    req_b = Request("b", list(range(512)), "hb", expected_output_len=2,
+                    arrival_time=0.0, slo_ttft=9999.0, slo_tbt=9999.0)
+
+    eng.schedule(Event(time=0.0, type=EventType.REQUEST_ARRIVE, payload={"request": req_a}))
+    eng.schedule(Event(time=0.0, type=EventType.REQUEST_ARRIVE, payload={"request": req_b}))
+    eng.run()
+
+    assert len(a_token_times) >= 1, "req_a should have received at least one decode token"
+    assert len(b_prefill_complete_time) == 1, "req_b should have completed prefill exactly once"
+    # Core Sarathi invariant: decode is NOT frozen while prefill chunks are being processed.
+    assert a_token_times[0] < b_prefill_complete_time[0], (
+        f"req_a first token at {a_token_times[0]:.2f}ms, "
+        f"req_b prefill complete at {b_prefill_complete_time[0]:.2f}ms — "
+        "decode stream was frozen during chunked prefill (Sarathi violated)"
+    )
+    # Stronger check: req_a must have advanced at least 3 tokens during req_b's prefill,
+    # proving all 4 prefill chunks interleaved with decode (not just the first).
+    tokens_during_prefill = [t for t in a_token_times if t < b_prefill_complete_time[0]]
+    assert len(tokens_during_prefill) >= 3, (
+        f"req_a produced only {len(tokens_during_prefill)} tokens before req_b prefill "
+        f"completed ({b_prefill_complete_time[0]:.2f}ms); expected ≥3 (one per chunk). "
+        "Decode may be partially frozen during chunked prefill."
+    )
+
+
+def test_short_prompt_completes_in_one_chunk() -> None:
+    """A prompt shorter than chunk_size completes prefill in exactly one batch tick."""
+    from nano_kvrouter.config import BandwidthConfig, ModelConfig, NodeConfig
+    from nano_kvrouter.engine.mock_node import MockEngineNode
+    from nano_kvrouter.kv_cache.cache_manager import CacheManager
+    from nano_kvrouter.scheduler.round_robin import RoundRobinPolicy
+    from nano_kvrouter.simulator.engine import SimulationEngine
+    from nano_kvrouter.simulator.event import Event, EventType
+    from nano_kvrouter.request import Request
+
+    mc = ModelConfig(
+        prefill_cost_per_token_ms=0.1,
+        decode_base_ms=5.0,
+        marginal_decode_ms=0.5,
+        prefill_chunk_size=512,
+    )
+    nc = NodeConfig(capacity=4, gpu_blocks=200, cpu_blocks=400, disk_blocks=800)
+
+    eng = SimulationEngine()
+    nodes = [MockEngineNode("n0", mc, nc)]
+    cm = CacheManager(["n0"], mc, nc, BandwidthConfig(), clock=eng.now)
+    sched = RoundRobinPolicy()
+    _wire_simulator(eng, sched, cm, nodes, logger_=logging.getLogger("test"))
+
+    prefill_times: list[float] = []
+    eng.on(
+        EventType.PREFILL_COMPLETE,
+        lambda ev, e: prefill_times.append(ev.time),
+    )
+
+    # 64-token prompt → well under chunk_size=512 → should complete in 1 batch step
+    req = Request("r0", list(range(64)), "hr", expected_output_len=1,
+                  arrival_time=0.0, slo_ttft=9999.0, slo_tbt=9999.0)
+    eng.schedule(Event(time=0.0, type=EventType.REQUEST_ARRIVE, payload={"request": req}))
+    eng.run()
+
+    assert len(prefill_times) == 1, f"Expected exactly 1 PREFILL_COMPLETE, got {len(prefill_times)}"
+    # With no concurrent decoders: step_time = 64*0.1 + 0 (decode_cost=0 when bs=0) = 6.4 ms
+    assert prefill_times[0] == pytest.approx(64 * mc.prefill_cost_per_token_ms)
+
+
+# ---------------------------------------------------------------------------
+# M3.fix2: promoted-request n_chunks and execute-time interleave tests
+# ---------------------------------------------------------------------------
+
+def test_promoted_request_records_n_chunks() -> None:
+    """n_chunks must be recorded for promoted (queued-then-rescheduled) requests.
+
+    capacity=1, two cold 512-token requests.  r0 runs first (4 chunks), completes,
+    promotes r1 (also 4 chunks).  Both must appear in chunked_prefill_steps →
+    avg_chunked_prefill_steps_per_request == 4.0.
+
+    Before the fix, the promoted PREFILL_START lacked 'n_chunks' → collector
+    defaulted to 0, giving avg 2.0 instead of 4.0.
+    """
+    from nano_kvrouter.config import BandwidthConfig, ModelConfig, NodeConfig
+    from nano_kvrouter.engine.mock_node import MockEngineNode
+    from nano_kvrouter.kv_cache.cache_manager import CacheManager
+    from nano_kvrouter.metrics.collector import MetricsCollector
+    from nano_kvrouter.scheduler.round_robin import RoundRobinPolicy
+    from nano_kvrouter.simulator.engine import SimulationEngine
+    from nano_kvrouter.simulator.event import Event, EventType
+    from nano_kvrouter.request import Request
+
+    mc = ModelConfig(
+        prefill_cost_per_token_ms=0.1,
+        decode_base_ms=5.0,
+        marginal_decode_ms=0.5,
+        prefill_chunk_size=128,
+    )
+    nc = NodeConfig(capacity=1, gpu_blocks=200, cpu_blocks=200, disk_blocks=400)
+
+    eng = SimulationEngine()
+    nodes = [MockEngineNode("n0", mc, nc)]
+    cm = CacheManager(["n0"], mc, nc, BandwidthConfig(), clock=eng.now)
+    sched = RoundRobinPolicy()
+
+    _wire_simulator(eng, sched, cm, nodes, logger_=logging.getLogger("test"))
+    metrics = MetricsCollector()
+    metrics.attach(eng, nodes={"n0": nodes[0]})
+
+    # r0 and r1 use disjoint token ranges → no shared prefix → 512 cold tokens each.
+    req_r0 = Request("r0", list(range(512)), "h0",
+                     expected_output_len=1, arrival_time=0.0, slo_ttft=9999.0, slo_tbt=9999.0)
+    req_r1 = Request("r1", list(range(512, 1024)), "h1",
+                     expected_output_len=1, arrival_time=0.0, slo_ttft=9999.0, slo_tbt=9999.0)
+
+    eng.schedule(Event(time=0.0, type=EventType.REQUEST_ARRIVE, payload={"request": req_r0}))
+    eng.schedule(Event(time=0.0, type=EventType.REQUEST_ARRIVE, payload={"request": req_r1}))
+    eng.run()
+
+    s = metrics.summary()
+    assert s["completed"] == 2, f"Both requests should complete, got {s['completed']}"
+    assert s["avg_chunked_prefill_steps_per_request"] == pytest.approx(4.0), (
+        f"avg_chunked_prefill_steps expected 4.0 (both requests: 512/128=4 chunks); "
+        f"got {s['avg_chunked_prefill_steps_per_request']}. "
+        "Promoted request n_chunks may not be injected into PREFILL_START payload."
+    )
+
+
+def test_interleave_counted_at_execute_time() -> None:
+    """Interleave count must use execute-time node state, not stale schedule-time value.
+
+    Scenario (capacity=2):
+    - r0 (output_len=3) and r1 (output_len=1) both enter decode immediately.
+    - r2 (128 cold tokens) is queued because capacity is full.
+    - Tick 1 fires with _prefill_remaining={} → schedule-time interleave=False.
+      r1 completes, promotes r2 → enter_prefill(r2) → _prefill_remaining={"r2": 128}.
+    - Tick 2 execute time: decoding={r0}, _prefill_remaining={"r2": 128} → interleave=True.
+      Old code used stale schedule-time value (False) → not counted.
+      New code computes at execute time → counted.
+    """
+    from nano_kvrouter.config import BandwidthConfig, ModelConfig, NodeConfig
+    from nano_kvrouter.engine.mock_node import MockEngineNode
+    from nano_kvrouter.kv_cache.cache_manager import CacheManager
+    from nano_kvrouter.metrics.collector import MetricsCollector
+    from nano_kvrouter.scheduler.round_robin import RoundRobinPolicy
+    from nano_kvrouter.simulator.engine import SimulationEngine
+    from nano_kvrouter.simulator.event import Event, EventType
+    from nano_kvrouter.request import Request
+
+    mc = ModelConfig(
+        prefill_cost_per_token_ms=0.1,
+        decode_base_ms=5.0,
+        marginal_decode_ms=0.5,
+        prefill_chunk_size=128,
+    )
+    nc = NodeConfig(capacity=2, gpu_blocks=200, cpu_blocks=200, disk_blocks=400)
+
+    eng = SimulationEngine()
+    nodes = [MockEngineNode("n0", mc, nc)]
+    cm = CacheManager(["n0"], mc, nc, BandwidthConfig(), clock=eng.now)
+    sched = RoundRobinPolicy()
+
+    _wire_simulator(eng, sched, cm, nodes, logger_=logging.getLogger("test"))
+    metrics = MetricsCollector()
+    metrics.attach(eng, nodes={"n0": nodes[0]})
+
+    # Pre-warm cache for r0 and r1 so they have 0 uncached tokens → skip prefill pipeline.
+    cm.admit(list(range(32)), "n0")
+    cm.admit(list(range(32, 64)), "n0")
+
+    req_r0 = Request("r0", list(range(32)), "h0",
+                     expected_output_len=3, arrival_time=0.0, slo_ttft=9999.0, slo_tbt=9999.0)
+    req_r1 = Request("r1", list(range(32, 64)), "h1",
+                     expected_output_len=1, arrival_time=0.0, slo_ttft=9999.0, slo_tbt=9999.0)
+    # r2: 128 cold tokens — queued initially (capacity full with r0+r1).
+    req_r2 = Request("r2", list(range(1000, 1128)), "h2",
+                     expected_output_len=1, arrival_time=0.0, slo_ttft=9999.0, slo_tbt=9999.0)
+
+    eng.schedule(Event(time=0.0, type=EventType.REQUEST_ARRIVE, payload={"request": req_r0}))
+    eng.schedule(Event(time=0.0, type=EventType.REQUEST_ARRIVE, payload={"request": req_r1}))
+    eng.schedule(Event(time=0.0, type=EventType.REQUEST_ARRIVE, payload={"request": req_r2}))
+    eng.run()
+
+    s = metrics.summary()
+    assert s["completed"] == 3, f"All three requests should complete, got {s['completed']}"
+    assert s["prefill_decode_interleave_step_count"] > 0, (
+        "interleave_count must be > 0: r0 was decoding when r2 was prefilling (tick 2+). "
+        "Execute-time interleave detection required — schedule-time was stale (False) "
+        "because r2 entered _prefill_remaining only after tick 1 via DECODE_COMPLETE→promote."
     )

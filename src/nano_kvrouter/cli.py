@@ -111,6 +111,17 @@ def _wire_simulator(
     # on_decode_complete can fire PREFILL_START for the promoted request.
     _queued_reqs: dict[str, dict[str, Request]] = {n.node_id: {} for n in nodes}
 
+    def _compute_n_chunks(req: Request, node_id: str, chunk_size: int) -> int:
+        """Return the number of prefill chunks required for *req* on *node_id*.
+
+        Calls cm.lookup for the current cache state, so callers in on_arrive and
+        on_decode_complete both get the right value at their respective times
+        (initial schedule vs. promotion time, when more cache may be warm).
+        """
+        matched = cm.lookup(req, node_id).matched_tokens
+        uncached = max(0, len(req.token_ids) - matched)
+        return (uncached + chunk_size - 1) // chunk_size if uncached > 0 else 0
+
     def _wake_batch_step(
         node: MockEngineNode,
         node_id: str,
@@ -131,8 +142,12 @@ def _wire_simulator(
                   at the current engine time (for wakeups from idle) or
                   ``next_time`` from tick_batch_step (for chaining steps).
         """
-        if node.decoding and not node.is_batch_step_in_flight():
+        if (node.decoding or node._prefill_remaining) and not node.is_batch_step_in_flight():
             t = engine.now() if time is None else time
+            # interleave is NOT pre-injected here: it is computed at execute-time
+            # inside on_decode_batch_step (same pattern as batch_size / M2.fix4).
+            # Pre-injection was stale when DECODE_COMPLETE promotes a request between
+            # schedule time and execute time, adding a new entry to _prefill_remaining.
             engine.schedule(Event(
                 time=t,
                 type=EventType.DECODE_BATCH_STEP,
@@ -166,6 +181,10 @@ def _wire_simulator(
         # Store req so on_decode_complete can fire PREFILL_START if queued.
         _queued_reqs[decision.prefill_node][req.request_id] = req
         if is_running:
+            # Pre-inject n_chunks into the PREFILL_START payload at event-creation
+            # time so MetricsCollector can read it from PREFILL_START regardless of
+            # handler registration order (attach-order independence).
+            chunk_size = node.model_config.prefill_chunk_size
             engine.schedule(Event(
                 time=engine.now(),
                 type=EventType.PREFILL_START,
@@ -173,6 +192,7 @@ def _wire_simulator(
                     "request_id": req.request_id,
                     "node_id": decision.prefill_node,
                     "request": req,
+                    "n_chunks": _compute_n_chunks(req, decision.prefill_node, chunk_size),
                 },
             ))
         # else: queued — PREFILL_START fires from on_decode_complete when promoted
@@ -183,12 +203,20 @@ def _wire_simulator(
         request_id = event.payload["request_id"]
         node = nodes_by_id[node_id]
         matched = cm.lookup(req, node_id).matched_tokens
-        prefill_ms = node.estimate_prefill_time(len(req.token_ids), cached_tokens=matched)
-        engine.schedule(Event(
-            time=engine.now() + prefill_ms,
-            type=EventType.PREFILL_COMPLETE,
-            payload={"request_id": request_id, "node_id": node_id, "request": req},
-        ))
+        uncached = max(0, len(req.token_ids) - matched)
+        # n_chunks already injected into event.payload at schedule time (on_arrive).
+
+        if uncached == 0:
+            # Fully cached: emit PREFILL_COMPLETE immediately without batch-step.
+            engine.schedule(Event(
+                time=engine.now(),
+                type=EventType.PREFILL_COMPLETE,
+                payload={"request_id": request_id, "node_id": node_id, "request": req},
+            ))
+            return
+
+        node.enter_prefill(request_id, uncached)
+        _wake_batch_step(node, node_id, engine)
 
     def on_prefill_complete(event: Event, engine: SimulationEngine) -> None:
         req = event.payload["request"]
@@ -217,22 +245,43 @@ def _wire_simulator(
         # Mark the in-flight step as done so wakeup logic can re-arm if needed.
         node.mark_batch_step_completed()
 
-        if not node.decoding:
+        if not node.decoding and not node._prefill_remaining:
             return
 
-        # Inject execute-time batch_size into payload before tick so MetricsCollector
-        # sees the real stream count regardless of handler registration order.
-        # (In reversed-order attach, collector reads this value from payload; in
-        # normal order it reads directly from node — same pre-tick value either way.)
-        event.payload["batch_size"] = len(node.decoding)
-        next_time, completed_ids = node.tick_batch_step(engine.now())
-        # After tick_batch_step: completed_ids streams are removed from node.decoding
-        # (Critical #1 fix). node.decoding now contains only the remaining streams.
+        # Capture pre-tick state for metrics — both values are injected here at
+        # execute time so MetricsCollector always sees the correct values:
+        #   batch_size  — M2.fix4: falls back to len(node.decoding) in reversed order
+        #   interleave  — M3.fix2: falls back to node state in reversed order (same pattern)
+        # Pre-tick state is identical whether cli or collector runs first, because
+        # tick_batch_step hasn't modified decoding / _prefill_remaining yet.
+        bs = len(node.decoding)
+        event.payload["batch_size"] = bs
+        event.payload["interleave"] = bs > 0 and bool(node._prefill_remaining)
 
-        # Emit per-request TOKEN_GENERATED metrics signals for ALL streams that
-        # participated in this tick: remaining (still in node.decoding) PLUS
-        # completed (removed from node.decoding by tick_batch_step).
-        # step_index=0 → TTFT; step_index>0 → TBT inter-step gap.
+        next_time, completed_ids, prefill_completed_id = node.tick_batch_step(engine.now())
+
+        # 1) Prefill chunk completed this step → emit PREFILL_COMPLETE (lower seq
+        #    than DECODE_BATCH_STEP so the new request joins decoding before the
+        #    next batch step fires at next_time).
+        if prefill_completed_id is not None:
+            req = _queued_reqs[node_id].get(prefill_completed_id)
+            if req is not None:
+                engine.schedule(Event(
+                    time=next_time,
+                    type=EventType.PREFILL_COMPLETE,
+                    payload={
+                        "request_id": prefill_completed_id,
+                        "node_id": node_id,
+                        "request": req,
+                    },
+                ))
+            else:
+                logger_.warning(
+                    "node %s prefill_completed_id %s has no request object",
+                    node_id, prefill_completed_id,
+                )
+
+        # 2) TOKEN_GENERATED for all decode streams that participated.
         step_streams = set(node.decoding) | set(completed_ids)
         for req_id in step_streams:
             step_idx = node._output_tokens[req_id] - 1  # tick already incremented
@@ -242,7 +291,7 @@ def _wire_simulator(
                 payload={"request_id": req_id, "step_index": step_idx},
             ))
 
-        # Schedule DECODE_COMPLETE for finished streams (before next batch step).
+        # 3) DECODE_COMPLETE for finished decode streams.
         for req_id in completed_ids:
             engine.schedule(Event(
                 time=next_time,
@@ -250,14 +299,15 @@ def _wire_simulator(
                 payload={"request_id": req_id, "node_id": node_id},
             ))
 
-        # Schedule next batch step through the single authoritative helper
-        # (Important #2: no direct DECODE_BATCH_STEP schedules outside helper).
-        _wake_batch_step(node, node_id, engine, time=next_time)
+        # 4) Schedule next batch step if there is still work pending.
+        if node.decoding or node._prefill_remaining:
+            _wake_batch_step(node, node_id, engine, time=next_time)
 
     def on_decode_complete(event: Event, engine: SimulationEngine) -> None:
         request_id = event.payload["request_id"]
         node_id = event.payload["node_id"]
         node = nodes_by_id[node_id]
+
         try:
             promoted_id = node.complete(request_id)
         except ValueError:
@@ -279,6 +329,9 @@ def _wire_simulator(
                 )
             else:
                 node.init_promoted(promoted_id, expected_output_len=promoted_req.expected_output_len)
+                # Compute n_chunks at promotion time: cache may be warmer now than at
+                # original arrival, so re-lookup gives an accurate (possibly smaller) value.
+                chunk_size = node.model_config.prefill_chunk_size
                 engine.schedule(Event(
                     time=engine.now(),
                     type=EventType.PREFILL_START,
@@ -286,6 +339,7 @@ def _wire_simulator(
                         "request_id": promoted_id,
                         "node_id": node_id,
                         "request": promoted_req,
+                        "n_chunks": _compute_n_chunks(promoted_req, node_id, chunk_size),
                     },
                 ))
 
@@ -362,6 +416,8 @@ _TABLE_KEYS = [
     "throughput_req_per_s",
     "avg_batch_size",
     "decode_throughput_tokens_per_s",
+    "avg_chunked_prefill_steps_per_request",
+    "prefill_decode_interleave_step_count",
 ]
 
 _SWEEP_KEYS = [

@@ -28,6 +28,7 @@ model:
   prefill_cost_per_token_ms: 0.033
   decode_base_ms: 5.0
   marginal_decode_ms: 0.5
+  prefill_chunk_size: 512
 
 bandwidth:
   gpu_to_gpu: 3.0e11

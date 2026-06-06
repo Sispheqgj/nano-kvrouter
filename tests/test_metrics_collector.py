@@ -98,6 +98,8 @@ def test_initial_summary_is_empty(collector):
     assert s["throughput_req_per_s"] is None
     assert s["avg_batch_size"] is None
     assert s["decode_throughput_tokens_per_s"] is None
+    assert s["avg_chunked_prefill_steps_per_request"] is None
+    assert s["prefill_decode_interleave_step_count"] == 0
 
 
 # ------------------------------------------------------------------
@@ -244,7 +246,7 @@ def test_throughput_from_first_arrive_to_last_complete(engine, collector):
 
 
 # ------------------------------------------------------------------
-# Test 10: attach 注册了全部 7 个 handler（M2: 新增 DECODE_BATCH_STEP）
+# Test 10: attach 注册了全部 8 个 handler（M3: 新增 PREFILL_START）
 # ------------------------------------------------------------------
 
 def test_attach_registers_all_handlers(engine, collector):
@@ -253,6 +255,7 @@ def test_attach_registers_all_handlers(engine, collector):
         EventType.REQUEST_ARRIVE,
         EventType.SCHEDULED,
         EventType.REQUEST_REJECTED,
+        EventType.PREFILL_START,
         EventType.PREFILL_COMPLETE,
         EventType.TOKEN_GENERATED,
         EventType.DECODE_BATCH_STEP,
@@ -489,3 +492,123 @@ def test_batch_size_uses_execute_time(engine):
 
     # Collector must see 2 (execute-time), not 1 (schedule-time) and not None.
     assert collector.summary()["avg_batch_size"] == pytest.approx(2.0)
+
+
+# ------------------------------------------------------------------
+# Test 20: avg_chunked_prefill_steps_per_request (M3)
+# ------------------------------------------------------------------
+
+def test_avg_chunked_prefill_steps_metric(engine, collector):
+    """avg_chunked_prefill_steps_per_request is the mean of n_chunks cached at PREFILL_START."""
+    collector.attach(engine)
+    for req_id in ("a", "b"):
+        engine.schedule(_arrive(_make_request(req_id), t=0.0))
+    # n_chunks pre-injected into PREFILL_START payload (M3 attach-order-independent pattern)
+    engine.schedule(Event(time=0.5, type=EventType.PREFILL_START,
+        payload={"request_id": "a", "n_chunks": 2}))
+    engine.schedule(Event(time=0.5, type=EventType.PREFILL_START,
+        payload={"request_id": "b", "n_chunks": 4}))
+    engine.schedule(Event(time=100.0, type=EventType.DECODE_COMPLETE,
+        payload={"request_id": "a"}))
+    engine.schedule(Event(time=100.0, type=EventType.DECODE_COMPLETE,
+        payload={"request_id": "b"}))
+    engine.run()
+    assert collector.summary()["avg_chunked_prefill_steps_per_request"] == pytest.approx(3.0)
+
+
+# ------------------------------------------------------------------
+# Test 21: prefill_decode_interleave_step_count (M3)
+# ------------------------------------------------------------------
+
+def test_interleave_step_count(engine, collector):
+    """prefill_decode_interleave_step_count counts DECODE_BATCH_STEP with interleave=True."""
+    collector.attach(engine)
+    engine.schedule(_arrive(_make_request("r0"), t=0.0))
+    engine.schedule(Event(time=10.0, type=EventType.DECODE_BATCH_STEP,
+        payload={"node_id": "n0", "batch_size": 2, "interleave": True}))
+    engine.schedule(Event(time=20.0, type=EventType.DECODE_BATCH_STEP,
+        payload={"node_id": "n0", "batch_size": 2, "interleave": True}))
+    engine.schedule(Event(time=30.0, type=EventType.DECODE_BATCH_STEP,
+        payload={"node_id": "n0", "batch_size": 2, "interleave": False}))
+    engine.run()
+    assert collector.summary()["prefill_decode_interleave_step_count"] == 2
+
+
+# ------------------------------------------------------------------
+# Test 22: M3 metrics are attach-order independent
+# ------------------------------------------------------------------
+
+def test_m3_metrics_independent_of_attach_order() -> None:
+    """avg_chunked_prefill_steps and interleave_count must match for normal
+    vs reversed collector/simulator attach order.
+
+    Setup: req_a (0 uncached, enters decode at t=0) + req_b (512 uncached,
+    chunk_size=128 → 4 chunks). While b prefills, a decodes → multiple
+    interleave steps.  Both orders must report identical metrics.
+    """
+    import logging
+    from nano_kvrouter.config import BandwidthConfig, ModelConfig, NodeConfig
+    from nano_kvrouter.engine.mock_node import MockEngineNode
+    from nano_kvrouter.kv_cache.cache_manager import CacheManager
+    from nano_kvrouter.scheduler.round_robin import RoundRobinPolicy
+    from nano_kvrouter.simulator.engine import SimulationEngine
+    from nano_kvrouter.simulator.event import Event, EventType
+    from nano_kvrouter.request import Request
+    from nano_kvrouter.cli import _wire_simulator
+
+    mc = ModelConfig(
+        prefill_cost_per_token_ms=0.1,
+        decode_base_ms=5.0,
+        marginal_decode_ms=0.5,
+        prefill_chunk_size=128,
+    )
+    nc = NodeConfig(capacity=4, gpu_blocks=200, cpu_blocks=400, disk_blocks=800)
+
+    def _run(wire_first: bool) -> dict:
+        eng = SimulationEngine()
+        node = MockEngineNode("n0", mc, nc)
+        cm = CacheManager(["n0"], mc, nc, BandwidthConfig(), clock=eng.now)
+        sched = RoundRobinPolicy()
+        coll = MetricsCollector()
+
+        if wire_first:
+            _wire_simulator(eng, sched, cm, [node], logger_=logging.getLogger("test"))
+            coll.attach(eng, nodes={"n0": node})
+        else:
+            coll.attach(eng, nodes={"n0": node})
+            _wire_simulator(eng, sched, cm, [node], logger_=logging.getLogger("test"))
+
+        # req_a: 0 uncached (cache pre-warmed) → enters decode immediately
+        cm.admit([0] * 32, "n0")
+        req_a = Request("a", [0] * 32, "ha", expected_output_len=4,
+                        arrival_time=0.0, slo_ttft=9999.0, slo_tbt=9999.0)
+        # req_b: 512 cold tokens, chunk_size=128 → 4 prefill chunks
+        req_b = Request("b", list(range(512)), "hb", expected_output_len=2,
+                        arrival_time=0.0, slo_ttft=9999.0, slo_tbt=9999.0)
+
+        eng.schedule(Event(time=0.0, type=EventType.REQUEST_ARRIVE, payload={"request": req_a}))
+        eng.schedule(Event(time=0.0, type=EventType.REQUEST_ARRIVE, payload={"request": req_b}))
+        eng.run()
+        return coll.summary()
+
+    s_normal = _run(wire_first=True)
+    s_reversed = _run(wire_first=False)
+
+    assert s_normal["avg_chunked_prefill_steps_per_request"] is not None, (
+        "avg_chunked_prefill_steps should be non-None (b has 4 chunks)"
+    )
+    assert s_normal["avg_chunked_prefill_steps_per_request"] == pytest.approx(
+        s_reversed["avg_chunked_prefill_steps_per_request"]
+    ), (
+        f"avg_chunks: normal={s_normal['avg_chunked_prefill_steps_per_request']}, "
+        f"reversed={s_reversed['avg_chunked_prefill_steps_per_request']}; "
+        "metric is attach-order dependent (n_chunks not pre-injected?)"
+    )
+    assert s_normal["prefill_decode_interleave_step_count"] > 0, (
+        "interleave_count should be >0 (req_a decoding while req_b prefills)"
+    )
+    assert s_normal["prefill_decode_interleave_step_count"] == s_reversed["prefill_decode_interleave_step_count"], (
+        f"interleave: normal={s_normal['prefill_decode_interleave_step_count']}, "
+        f"reversed={s_reversed['prefill_decode_interleave_step_count']}; "
+        "metric is attach-order dependent (interleave not pre-injected?)"
+    )

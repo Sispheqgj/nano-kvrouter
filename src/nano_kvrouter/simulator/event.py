@@ -38,12 +38,19 @@ __all__ = ["EventType", "Event"]
 class EventType(Enum):
     """All event kinds the simulator currently understands.
 
-    Lifecycle of a normal request (M2 continuous-batching model):
+    Lifecycle of a normal request (M3 chunked-prefill model):
 
     ``REQUEST_ARRIVE`` → ``SCHEDULED`` → ``PREFILL_START`` →
-    ``PREFILL_COMPLETE`` → [joins node decode batch] →
+    [enters ``_prefill_remaining`` queue on the node] →
+    ``DECODE_BATCH_STEP`` × K  (each tick processes one prefill chunk piggybacked
+    with all active decode streams; K = ceil(uncached / chunk_size)) →
+    ``PREFILL_COMPLETE``  (fires when the last chunk finishes; triggers
+    ``cache.admit()`` + ``node.start_decode()``) →
     ``TOKEN_GENERATED`` × N (per-request metrics signal, one per batch tick) →
     ``DECODE_COMPLETE``
+
+    Fast path (uncached == 0): ``PREFILL_COMPLETE`` fires immediately at
+    ``PREFILL_START`` time, skipping the chunked pipeline entirely.
 
     Node-level decode pipeline (one per active node):
     ``DECODE_BATCH_STEP`` → ``DECODE_BATCH_STEP`` → … (until node idle)

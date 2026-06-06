@@ -263,10 +263,10 @@ def test_ttft_reflects_cache_hit(
 
     dec = _policy().schedule(req, nodes, cm_large)
     assert dec.prefill_node == "n0"
-    # n0: 0 running, 0 decoding → first_tick = 5.0 + 1*1.0 = 6.0 ms
-    # uncached = 128 - 64 = 64 tokens × 0.1 ms = 6.4 ms; queue_wait = 0
-    # est_ttft = 6.4 + 0 + 6.0 = 12.4 ms
-    assert dec.estimated_ttft_ms == pytest.approx(64 * 0.1 + MODEL.decode_base_ms + MODEL.marginal_decode_ms)
+    # M3: uncached=64, bs_hint=decoding+1=1; n_chunks=1 (64<512)
+    # step_per_chunk = 512*0.1+5.0+1*1.0 = 57.2; first_tick = 5.0+1.0 = 6.0
+    # est_ttft = 57.2 + 0 + 6.0 = 63.2 ms
+    assert dec.estimated_ttft_ms == pytest.approx(57.2 + 6.0)
 
 
 # ---------------------------------------------------------------------------
@@ -306,28 +306,52 @@ def test_full_hit_node_at_capacity_not_eviction_penalised(
 def test_first_tick_in_score_changes_choice(
     cm_large: CacheManager, nodes: list[MockEngineNode]
 ) -> None:
-    """Without first_tick in run_cost, E2 picks the busy-warm node because its
-    cache benefit lowers prefill cost. With first_tick included, the idle-cold
-    node wins because its first-token latency is much lower.
+    """first_tick uses len(decoding)+1 as bs_hint; more decoding → higher run_cost.
+
+    Both nodes have all 64 tokens cached (prefill_phase=0 for both), so the
+    routing decision is driven entirely by first_tick:
 
     Setup (w_historical=0, w_eviction=0, w_run=1):
-    * busy-warm (n1): 7 running, warm cache (64 tokens)
-      run = prefill(0 uncached) + queue_wait(0) + first_tick(8) = 5+8=13.0
-    * idle-cold (n0): 0 running, cold cache
-      run = prefill(64 cold) + queue_wait(0) + first_tick(1) = 6.4+0+6.0 = 12.4
+    * n0: 0 decoding, fully cached → bs_hint=1, first_tick=5+1*1=6.0, run=6.0
+    * n1: 7 decoding, fully cached → bs_hint=8, first_tick=5+8*1=13.0, run=13.0
 
-    idle-cold (12.4) < busy-warm (13.0) → n0 should win.
+    n0 wins (6.0 < 13.0).  Without first_tick both runs would be 0 (tie →
+    n0 by index), so this specifically validates that first_tick is counted.
     """
+    cm_large.admit(list(range(64)), "n0")   # warm cache on n0
     cm_large.admit(list(range(64)), "n1")   # warm cache on n1
     for i in range(7):
-        nodes[1].admit(f"load{i}")          # 7 running on n1
+        nodes[1].admit(f"load{i}", 10)
+        nodes[1].start_decode(f"load{i}")   # 7 active decode streams on n1
 
     req = _make_request(list(range(64)))
-    # Pure run-cost routing: no historical/eviction penalty
     policy = E2Policy(w_historical=0, w_eviction=0, w_run=1, model_config=MODEL)
     dec = policy.schedule(req, nodes[:2], cm_large)
-    # n0 (idle-cold) has lower total run cost → must be picked
+    # n0 has lower first_tick (1 vs 8 concurrent decoders) → lower run_cost → wins
     assert dec.prefill_node == "n0", (
-        f"Expected idle-cold n0 (lower first_tick), got {dec.prefill_node}; "
-        "first_tick missing from E2 run_cost?"
+        f"Expected n0 (lower first_tick due to 0 decoding), got {dec.prefill_node}; "
+        "first_tick not using decoding count as bs_hint?"
     )
+
+
+# ---------------------------------------------------------------------------
+# 15. M3: est_ttft reflects chunked prefill (n_chunks × step_per_chunk)
+# ---------------------------------------------------------------------------
+
+
+def test_ttft_includes_chunked_prefill(
+    cm_large: CacheManager, nodes: list[MockEngineNode]
+) -> None:
+    """est_ttft scales with number of prefill chunks.
+
+    1024-token cold prompt, idle node (0 decoding), chunk_size=512 → n_chunks=2.
+    bs_hint = 0+1 = 1; step_per_chunk = 512*0.1+5.0+1*1.0 = 57.2
+    prefill_phase = 2×57.2 = 114.4; first_tick = 5.0+1.0 = 6.0
+    est_ttft = 0 + 114.4 + 6.0 = 120.4 ms
+    """
+    req = _make_request(list(range(1024)))
+    dec = _policy().schedule(req, nodes[:1], cm_large)
+    assert not dec.is_rejected
+    chunk = MODEL.prefill_chunk_size  # 512
+    step_per_chunk = chunk * MODEL.prefill_cost_per_token_ms + MODEL.decode_base_ms + 1 * MODEL.marginal_decode_ms
+    assert dec.estimated_ttft_ms == pytest.approx(2 * step_per_chunk + MODEL.decode_base_ms + MODEL.marginal_decode_ms)

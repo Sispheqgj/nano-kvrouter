@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import pytest
 from nano_kvrouter.config import ModelConfig, NodeConfig
 from nano_kvrouter.engine.mock_node import MockEngineNode
@@ -303,9 +304,10 @@ def test_tick_batch_step_basic() -> None:
     node.start_decode("r0")
     node.start_decode("r1")
     node.start_decode("r2")
-    next_time, completed = node.tick_batch_step(0.0)
+    next_time, completed, pf_id = node.tick_batch_step(0.0)
     assert next_time == pytest.approx(5.0 + 3 * 0.5)   # 6.5 ms
     assert completed == []
+    assert pf_id is None
 
 
 def test_tick_batch_step_idle_raises() -> None:
@@ -323,9 +325,10 @@ def test_tick_batch_step_completion() -> None:
     node.admit("r1", expected_output_len=2)
     node.start_decode("r0")
     node.start_decode("r1")
-    _, completed = node.tick_batch_step(0.0)
+    _, completed, pf_id = node.tick_batch_step(0.0)
     assert "r0" in completed
     assert "r1" not in completed
+    assert pf_id is None
 
 
 def test_tick_batch_step_increments_all_streams() -> None:
@@ -351,9 +354,10 @@ def test_tick_batch_step_multiple_completions() -> None:
     node.start_decode("r0")
     node.start_decode("r1")
     node.start_decode("r2")
-    _, completed = node.tick_batch_step(0.0)
+    _, completed, pf_id = node.tick_batch_step(0.0)
     assert set(completed) == {"r0", "r1"}
     assert "r2" not in completed
+    assert pf_id is None
 
 
 def test_tick_batch_step_next_time_reflects_batch_size() -> None:
@@ -371,8 +375,8 @@ def test_tick_batch_step_next_time_reflects_batch_size() -> None:
     node3.start_decode("a1")
     node3.start_decode("a2")
 
-    t1, _ = node1.tick_batch_step(0.0)
-    t3, _ = node3.tick_batch_step(0.0)
+    t1, _, _ = node1.tick_batch_step(0.0)
+    t3, _, _ = node3.tick_batch_step(0.0)
     # batch=1 → step=6ms; batch=3 → step=8ms
     assert t1 == pytest.approx(6.0)
     assert t3 == pytest.approx(8.0)
@@ -529,10 +533,11 @@ def test_tick_batch_step_removes_completed_from_decoding() -> None:
     node.admit("slow", expected_output_len=3)
     node.start_decode("fast")
     node.start_decode("slow")
-    _, completed = node.tick_batch_step(0.0)
+    _, completed, pf_id = node.tick_batch_step(0.0)
     assert "fast" in completed
     assert "fast" not in node.decoding   # removed immediately — Critical #1
     assert "slow" in node.decoding       # still active
+    assert pf_id is None
 
 
 def test_tick_batch_step_second_tick_excludes_completed() -> None:
@@ -544,7 +549,7 @@ def test_tick_batch_step_second_tick_excludes_completed() -> None:
     node.start_decode("fast")
     node.start_decode("slow")
     node.tick_batch_step(0.0)            # fast completes, removed from decoding
-    _, completed2 = node.tick_batch_step(6.0)   # bs=1 now (only slow)
+    _, completed2, _ = node.tick_batch_step(6.0)   # bs=1 now (only slow)
     assert "fast" not in completed2      # fast is NOT re-completed
 
 
@@ -559,5 +564,180 @@ def test_tick_batch_step_completed_ids_are_sorted() -> None:
     for rid in ["z", "a", "m", "b"]:
         node.admit(rid, expected_output_len=1)
         node.start_decode(rid)
-    _, completed = node.tick_batch_step(0.0)
+    _, completed, _ = node.tick_batch_step(0.0)
     assert completed == sorted(completed)
+
+
+# ------------------------------------------------------------------
+# M3: enter_prefill + chunked tick_batch_step
+# ------------------------------------------------------------------
+
+def test_enter_prefill_sets_remaining_tokens() -> None:
+    """enter_prefill stores uncached_tokens in _prefill_remaining under FIFO order."""
+    node = MockEngineNode("n", ModelConfig(), NodeConfig(capacity=4))
+    node.admit("r0", expected_output_len=5)
+    node.enter_prefill("r0", 200)
+    assert node._prefill_remaining["r0"] == 200
+
+
+def test_enter_prefill_raises_if_not_running() -> None:
+    """enter_prefill must raise if the request is not in running_requests."""
+    node = MockEngineNode("n", ModelConfig(), NodeConfig(capacity=2))
+    with pytest.raises(RuntimeError, match="not in running_requests"):
+        node.enter_prefill("not-admitted", 100)
+
+
+def test_tick_batch_step_with_prefill_only() -> None:
+    """Prefill-only step (no decode): step_time = chunk_cost, no decode overhead."""
+    model = ModelConfig(
+        prefill_cost_per_token_ms=0.1,
+        decode_base_ms=5.0,
+        marginal_decode_ms=0.5,
+        prefill_chunk_size=512,
+    )
+    node = MockEngineNode("n", model, NodeConfig(capacity=2))
+    node.admit("r0", expected_output_len=5)
+    node.enter_prefill("r0", 100)  # 100 tokens, fits in 1 chunk of 512
+
+    next_time, completed, pf_id = node.tick_batch_step(0.0)
+    # chunk_cost = 100 * 0.1 = 10.0; decode_cost = 0 (bs=0)
+    assert next_time == pytest.approx(10.0)
+    assert completed == []
+    assert pf_id == "r0"  # all 100 tokens done in one chunk
+    assert "r0" not in node._prefill_remaining
+
+
+def test_tick_batch_step_with_decode_only() -> None:
+    """Decode-only step (no prefill pending): behaves exactly like M2."""
+    model = ModelConfig(decode_base_ms=5.0, marginal_decode_ms=0.5)
+    node = MockEngineNode("n", model, NodeConfig(capacity=2))
+    node.admit("r0", expected_output_len=3)
+    node.start_decode("r0")
+
+    next_time, completed, pf_id = node.tick_batch_step(0.0)
+    assert next_time == pytest.approx(5.0 + 1 * 0.5)
+    assert completed == []
+    assert pf_id is None
+
+
+def test_tick_batch_step_piggyback() -> None:
+    """1 prefill chunk + N decode streams: step_time = chunk_cost + decode_cost."""
+    model = ModelConfig(
+        prefill_cost_per_token_ms=0.1,
+        decode_base_ms=5.0,
+        marginal_decode_ms=0.5,
+        prefill_chunk_size=512,
+    )
+    node = MockEngineNode("n", model, NodeConfig(capacity=4))
+    # 2 decode streams
+    for rid in ["d0", "d1"]:
+        node.admit(rid, expected_output_len=10)
+        node.start_decode(rid)
+    # 1 prefill pipeline entry (64 tokens fits in 1 chunk)
+    node.admit("p0", expected_output_len=5)
+    node.enter_prefill("p0", 64)
+
+    next_time, completed, pf_id = node.tick_batch_step(0.0)
+    # chunk_cost = 64 * 0.1 = 6.4; decode_cost = 5.0 + 2*0.5 = 6.0
+    assert next_time == pytest.approx(6.4 + 6.0)
+    assert pf_id == "p0"
+    assert completed == []
+    assert "d0" in node.decoding and "d1" in node.decoding
+
+
+def test_tick_batch_step_idle_raises_with_m3_condition() -> None:
+    """tick_batch_step must raise when BOTH decoding AND _prefill_remaining are empty."""
+    node = MockEngineNode("n", ModelConfig(), NodeConfig(capacity=4))
+    with pytest.raises(RuntimeError, match="idle"):
+        node.tick_batch_step(0.0)
+
+
+def test_tick_batch_step_prefill_chunk_consumes_remaining() -> None:
+    """Large prompt takes multiple chunks; remaining decreases by chunk_size per step."""
+    model = ModelConfig(
+        prefill_cost_per_token_ms=0.1,
+        decode_base_ms=5.0,
+        marginal_decode_ms=0.5,
+        prefill_chunk_size=100,
+    )
+    node = MockEngineNode("n", model, NodeConfig(capacity=2))
+    node.admit("r0", expected_output_len=5)
+    node.enter_prefill("r0", 250)  # 3 chunks of 100 (last = 50)
+
+    # First chunk: 100 tokens consumed → 150 remaining
+    next_time, _, pf_id = node.tick_batch_step(0.0)
+    assert node._prefill_remaining["r0"] == 150
+    assert pf_id is None  # not done yet
+
+    # Second chunk: 100 tokens consumed → 50 remaining
+    node.tick_batch_step(next_time)
+    assert node._prefill_remaining["r0"] == 50
+
+    # Third chunk: last 50 tokens → done
+    _, _, pf_id3 = node.tick_batch_step(0.0)
+    assert pf_id3 == "r0"
+    assert "r0" not in node._prefill_remaining
+
+
+def test_tick_batch_step_prefill_completion_returns_id() -> None:
+    """prefill_completed_id is the request_id when remaining hits zero this step."""
+    model = ModelConfig(
+        prefill_cost_per_token_ms=0.1,
+        decode_base_ms=5.0,
+        prefill_chunk_size=512,
+    )
+    node = MockEngineNode("n", model, NodeConfig(capacity=2))
+    node.admit("r0", expected_output_len=5)
+    node.enter_prefill("r0", 64)
+
+    _, _, pf_id = node.tick_batch_step(0.0)
+    assert pf_id == "r0"
+
+
+def test_tick_batch_step_two_prefills_fifo() -> None:
+    """Two entries in _prefill_remaining: FIFO — first inserted is processed first."""
+    model = ModelConfig(
+        prefill_cost_per_token_ms=0.1,
+        decode_base_ms=5.0,
+        prefill_chunk_size=512,
+    )
+    node = MockEngineNode("n", model, NodeConfig(capacity=3))
+    node.admit("first", expected_output_len=5)
+    node.admit("second", expected_output_len=5)
+    node.enter_prefill("first", 64)
+    node.enter_prefill("second", 32)
+
+    # First tick: "first" should be processed (FIFO)
+    _, _, pf_id = node.tick_batch_step(0.0)
+    assert pf_id == "first"
+    assert "first" not in node._prefill_remaining
+    assert node._prefill_remaining["second"] == 32
+
+
+def test_estimate_prefill_time_chunked_aware() -> None:
+    """With batch_size_hint, estimate uses n_chunks × step_per_chunk formula."""
+    model = ModelConfig(
+        prefill_cost_per_token_ms=0.1,
+        decode_base_ms=5.0,
+        marginal_decode_ms=0.5,
+        prefill_chunk_size=512,
+    )
+    node = MockEngineNode("n", model, NodeConfig())
+    # 64 uncached tokens → 1 chunk of 512 tokens cost (conservative upper bound)
+    est = node.estimate_prefill_time(64, 0, batch_size_hint=1)
+    expected = 1 * (512 * 0.1 + 5.0 + 1 * 0.5)  # 56.7
+    assert est == pytest.approx(expected)
+
+
+def test_estimate_prefill_time_legacy_unchanged() -> None:
+    """Without batch_size_hint, legacy P1 formula is preserved."""
+    node = MockEngineNode("n", ModelConfig(prefill_cost_per_token_ms=0.1), NodeConfig())
+    assert node.estimate_prefill_time(100, 0) == pytest.approx(10.0)
+    assert node.estimate_prefill_time(100, 0, batch_size_hint=None) == pytest.approx(10.0)
+
+
+def test_estimate_prefill_time_fully_cached_returns_zero() -> None:
+    """When all tokens are cached, both legacy and chunked formulas return 0."""
+    node = MockEngineNode("n", ModelConfig(), NodeConfig())
+    assert node.estimate_prefill_time(100, 100) == pytest.approx(0.0)
+    assert node.estimate_prefill_time(100, 100, batch_size_hint=1) == pytest.approx(0.0)

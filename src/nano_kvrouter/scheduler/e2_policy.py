@@ -146,11 +146,14 @@ class E2Policy:
             hist = n.current_load() * prompt_len * ppt
             shortage = max(0, new_blocks - cache.free_blocks(n.node_id, "gpu"))
             evict = shortage * bs * ppt
-            # first_tick_ms: time until new request gets its first token
-            # (decode_base + (running+1) × marginal). Aligns with Conductor TTFT.
-            first_tick_ms = n.estimate_decode_time(len(n.running_requests) + 1)
+            # M3 chunked-prefill: use decoding+1 for bs_hint (only decoding streams
+            # piggyback with the prefill chunks; running-but-not-decoding ones don't).
+            bs_hint = len(n.decoding) + 1
+            first_tick_ms = n.estimate_decode_time(bs_hint)
             run = (
-                n.estimate_prefill_time(prompt_len, cached_tokens=matched)
+                n.estimate_prefill_time(
+                    prompt_len, cached_tokens=matched, batch_size_hint=bs_hint
+                )
                 + n.queue_wait_time(prompt_len, request.expected_output_len)
                 + first_tick_ms
             )
@@ -159,9 +162,12 @@ class E2Policy:
         chosen = min(nodes, key=_score)
 
         chosen_matched = lookups[chosen.node_id].matched_tokens
-        first_tick_ms = chosen.estimate_decode_time(len(chosen.running_requests) + 1)
+        bs_hint = len(chosen.decoding) + 1
+        first_tick_ms = chosen.estimate_decode_time(bs_hint)
         ttft_ms = (
-            chosen.estimate_prefill_time(prompt_len, cached_tokens=chosen_matched)
+            chosen.estimate_prefill_time(
+                prompt_len, cached_tokens=chosen_matched, batch_size_hint=bs_hint
+            )
             + chosen.queue_wait_time(prompt_len, request.expected_output_len)
             + first_tick_ms
         )

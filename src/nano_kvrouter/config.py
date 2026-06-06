@@ -69,6 +69,13 @@ class ModelConfig(BaseModel):
     prefill_cost_per_token_ms: float = Field(default=0.033, gt=0)
     decode_base_ms: float = Field(default=5.0, gt=0)
     marginal_decode_ms: float = Field(default=0.5, gt=0)
+    prefill_chunk_size: int = Field(
+        default=512,
+        ge=1,
+        description="LIVE in P2-Infra M3+. Tokens processed per prefill "
+                    "chunk per batch step. Smaller = more prefill steps "
+                    "(longer TTFT) but less decode interference (lower ITL).",
+    )
 
 
 class BandwidthConfig(BaseModel):

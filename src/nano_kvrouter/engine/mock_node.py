@@ -55,26 +55,58 @@ class MockEngineNode:
         # Prevents double-scheduling a DECODE_BATCH_STEP event when a new request
         # joins decoding while a step is already in flight.
         self._batch_step_in_flight: bool = False
+        # Chunked prefill pipeline (M3). Maps request_id → remaining uncached tokens.
+        # Insertion order is preserved (Python 3.7+ dict) for FIFO scheduling.
+        self._prefill_remaining: dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Latency estimation
     # ------------------------------------------------------------------
 
-    def estimate_prefill_time(self, prompt_len: int, cached_tokens: int) -> float:
+    def estimate_prefill_time(
+        self,
+        prompt_len: int,
+        cached_tokens: int,
+        batch_size_hint: int | None = None,
+    ) -> float:
         """Estimate prefill latency for a prompt with partial cache hit.
 
         Args:
             prompt_len: Total prompt token count.
             cached_tokens: Tokens already covered by this node's KV
                 cache — these are free.
+            batch_size_hint: If None (legacy), returns the P1 formula:
+                ``uncached * prefill_cost_per_token_ms``.
+                If supplied, returns the M3 chunked-piggyback formula:
+                ``n_chunks * (chunk_size * ppt + decode_base + bs * marginal)``,
+                which is a conservative upper-bound because the last chunk may
+                have fewer than ``chunk_size`` tokens.
 
         Returns:
-            Estimated prefill time in milliseconds. Clamped at 0 so a
-            cache hit longer than the prompt (which can happen during
-            speculative prefix matching) does not produce negative time.
+            Estimated prefill time in milliseconds.
+
+        Note — M3 conservative upper bound:
+            The chunked-aware formula treats every chunk as a full
+            ``chunk_size``, including the final (possibly partial) chunk,
+            and adds ``decode_base + bs * marginal`` even when the node is
+            idle (``bs = 1`` rather than ``0``).  Both choices are
+            deliberately pessimistic so that Conductor's SLO gate is a
+            *guard* (false rejects preferable to false accepts).  The actual
+            per-tick cost in ``cli.tick_batch_step`` uses
+            ``min(remaining, chunk_size)`` for the last chunk and incurs
+            ``0`` decode cost when ``decoding`` is empty.
         """
         uncached = max(0, prompt_len - cached_tokens)
-        return uncached * self.model_config.prefill_cost_per_token_ms
+        if batch_size_hint is None:
+            return uncached * self.model_config.prefill_cost_per_token_ms
+        chunk = self.model_config.prefill_chunk_size
+        n_chunks = (uncached + chunk - 1) // chunk if uncached > 0 else 0
+        step_per_chunk = (
+            chunk * self.model_config.prefill_cost_per_token_ms
+            + self.model_config.decode_base_ms
+            + batch_size_hint * self.model_config.marginal_decode_ms
+        )
+        return n_chunks * step_per_chunk
 
     def estimate_decode_time(self, batch_size: int) -> float:
         """Estimate per-step decode latency at a given batch size.
@@ -301,63 +333,102 @@ class MockEngineNode:
         self._output_tokens[request_id] = 0
         self._expected_output[request_id] = expected_output_len
 
-    def tick_batch_step(self, now: float) -> tuple[float, list[str]]:
-        """Advance one decode batch step for all active decode streams.
+    def enter_prefill(self, request_id: str, uncached_tokens: int) -> None:
+        """Mark a request as entering the chunked prefill pipeline.
 
-        Increments `_output_tokens` by 1 for every request in `decoding`.
-        The batch step time is computed from the current `decoding` size:
-        ``step_time = decode_base_ms + len(decoding) * marginal_decode_ms``.
+        The request is placed in the FIFO ``_prefill_remaining`` queue.
+        Each subsequent :meth:`tick_batch_step` will consume up to
+        ``prefill_chunk_size`` tokens per step until the queue is drained,
+        at which point the step returns ``prefill_completed_id``.
 
-        Engine invariant: each token is an integer event — no fractional
-        tokens. This preserves the contract for future P3+ spec-decoding
-        integration where draft+verify rounds are integer-length chains.
+        Args:
+            request_id: ID that must already be in ``running_requests``.
+            uncached_tokens: Number of tokens that still require prefill
+                computation (i.e. ``prompt_len - matched_tokens``).
+
+        Raises:
+            RuntimeError: If *request_id* is not in ``running_requests``.
+        """
+        if request_id not in self.running_requests:
+            raise RuntimeError(
+                f"node {self.node_id}: enter_prefill called for {request_id!r} "
+                "which is not in running_requests"
+            )
+        self._prefill_remaining[request_id] = uncached_tokens
+        logger.debug(
+            "node %s enter_prefill %s (%d uncached tokens)",
+            self.node_id, request_id, uncached_tokens,
+        )
+
+    def tick_batch_step(self, now: float) -> tuple[float, list[str], str | None]:
+        """Advance one batch step: optional prefill chunk piggybacked with all decode streams.
+
+        Each call processes at most one prefill chunk (FIFO from ``_prefill_remaining``)
+        plus all active decode streams simultaneously (Sarathi-Serve piggyback model).
+
+        Step time formula::
+
+            step_time = chunk_cost + decode_cost
+            where:
+              chunk_cost  = min(remaining, chunk_size) * prefill_cost_per_token_ms
+              decode_cost = decode_base_ms + bs * marginal_decode_ms  (0 when bs == 0)
 
         Args:
             now: Current simulated time in milliseconds.
 
         Returns:
-            ``(next_time, completed_ids)`` where:
+            ``(next_time, completed_decode_ids, prefill_completed_id)`` where:
 
-            - ``next_time`` = now + step_time: the simulated time at which
-              this batch step completes (and the next one may start).
-            - ``completed_ids``: request IDs whose ``_output_tokens`` have
-              reached or exceeded ``_expected_output`` after this tick.
-              These requests should have ``DECODE_COMPLETE`` scheduled at
-              ``next_time`` by the caller.
-
-            **Critical invariant**: completed streams are removed from
-            ``decoding`` before this method returns, so a re-wakeup that
-            fires between the tick and the ``DECODE_COMPLETE`` handler
-            cannot advance the same stream a second time. ``running_requests``
-            is NOT modified here — ``complete()`` is responsible for
-            releasing the capacity slot.
+            - ``next_time`` = now + step_time.
+            - ``completed_decode_ids``: request IDs whose decode finished this tick
+              (removed from ``decoding`` immediately — Critical #1 invariant).
+            - ``prefill_completed_id``: the request_id whose prefill finished
+              this tick (removed from ``_prefill_remaining``), or ``None`` if no
+              prefill chunk was processed or the prefill still has remaining tokens.
 
         Raises:
-            RuntimeError: If ``decoding`` is empty. Callers must only invoke
-                this method when at least one decode stream is active.
+            RuntimeError: If both ``decoding`` and ``_prefill_remaining`` are empty.
         """
-        if not self.decoding:
-            raise RuntimeError(
-                f"tick_batch_step called on idle node {self.node_id} (no active decode streams)"
-            )
-        bs = len(self.decoding)
-        step_time = self.model_config.decode_base_ms + bs * self.model_config.marginal_decode_ms
+        if not self.decoding and not self._prefill_remaining:
+            raise RuntimeError(f"node {self.node_id}: tick on idle node")
 
-        # Iterate in sorted order so completed_ids is deterministic regardless
-        # of set iteration order — important for reproducible test assertions.
+        bs = len(self.decoding)
+
+        # FIFO prefill chunk: process the oldest entry in _prefill_remaining.
+        prefill_id: str | None = None
+        chunk_cost = 0.0
+        if self._prefill_remaining:
+            prefill_id = next(iter(self._prefill_remaining))
+            remaining = self._prefill_remaining[prefill_id]
+            chunk_this_step = min(remaining, self.model_config.prefill_chunk_size)
+            chunk_cost = chunk_this_step * self.model_config.prefill_cost_per_token_ms
+            self._prefill_remaining[prefill_id] -= chunk_this_step
+
+        # Decode step cost (0 when no active decode streams).
+        decode_cost = (
+            self.model_config.decode_base_ms + bs * self.model_config.marginal_decode_ms
+        ) if bs > 0 else 0.0
+
+        step_time = chunk_cost + decode_cost
+
+        # Advance all decode streams by one token.
         completed: list[str] = []
         for req_id in sorted(self.decoding):
             self._output_tokens[req_id] += 1
             if self._output_tokens[req_id] >= self._expected_output[req_id]:
                 completed.append(req_id)
 
-        # Critical #1: immediately remove terminal streams from decoding.
-        # Prevents a subsequent wake from advancing them again before
-        # DECODE_COMPLETE fires and calls complete().
+        # Critical #1: remove completed streams immediately.
         for req_id in completed:
             self.decoding.discard(req_id)
 
-        return (now + step_time, completed)
+        # Check whether the prefill chunk just completed.
+        prefill_completed_id: str | None = None
+        if prefill_id is not None and self._prefill_remaining[prefill_id] == 0:
+            del self._prefill_remaining[prefill_id]
+            prefill_completed_id = prefill_id
+
+        return (now + step_time, completed, prefill_completed_id)
 
     def complete(self, request_id: str) -> str | None:
         """Mark a request as finished and promote the next queued one if room frees up.
@@ -384,10 +455,11 @@ class MockEngineNode:
             # Not running — must be queued (or the caller has a bug).
             self.queue.remove(request_id)
 
-        # Clean up decode tracking.
+        # Clean up all per-request state.
         self._output_tokens.pop(request_id, None)
         self._expected_output.pop(request_id, None)
         self.decoding.discard(request_id)
+        self._prefill_remaining.pop(request_id, None)
 
         logger.debug("node %s completed %s", self.node_id, request_id)
         if self.queue and len(self.running_requests) < self.node_config.capacity:
