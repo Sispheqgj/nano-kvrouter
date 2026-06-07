@@ -184,6 +184,31 @@ class BlockPool:
         self._move(block_id, from_tier, to_tier)
         logger.debug("Demoted %s: %s → %s", block_id, from_tier, to_tier)
 
+    def used(self, tier: str) -> int:
+        """Number of allocated blocks on *tier*.
+
+        Args:
+            tier: One of ``"gpu"``, ``"cpu"``, ``"disk"``.
+
+        Returns:
+            Count of currently allocated block IDs on that tier.
+
+        Raises:
+            ValueError: *tier* is not one of the three known tiers.
+        """
+        return self._require_tier(tier).used
+
+    def tier_breakdown(self) -> dict[str, dict[str, int]]:
+        """Per-tier capacity / used / free snapshot.
+
+        Returns:
+            ``{tier: {"used": int, "free": int, "capacity": int}}``.
+        """
+        return {
+            tier: {"used": s.used, "free": s.free, "capacity": s.capacity}
+            for tier, s in self._tiers.items()
+        }
+
     def stats(self) -> dict[str, dict[str, int]]:
         """Snapshot of per-tier capacity / used / free counts.
 

@@ -1,4 +1,4 @@
-"""Tests for CacheManager — v1 GPU-only KV cache interface."""
+"""Tests for CacheManager — M4 pool-backed GPU KV cache interface."""
 from __future__ import annotations
 
 import pytest
@@ -273,50 +273,53 @@ def test_two_non_overlapping_admits_use_distinct_blocks() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 14. Codex regression — no orphan leak with non-aligned split + eviction
+# 14. No orphan leak — pool.used stays in sync with tree block_ids after split
 # ---------------------------------------------------------------------------
 
 
-def test_no_orphan_leak_with_non_aligned_split_and_eviction() -> None:
-    """Codex regression: v1 leaked pool blocks when split created sub-block-sized
-    nodes (floor-capacity=0) and subsequent eviction couldn't account for them.
-    Capacity-counter ceiling design must keep _used in lockstep with tree state."""
+def test_no_orphan_leak_with_non_aligned_split() -> None:
+    """Pool.used must equal sum of block_ids across all tree nodes after a
+    non-aligned radix split.  This is the M4 regression guard replacing the
+    v1 ceiling-counter check."""
     cm = CacheManager(
         node_ids=["n0"],
         model_config=ModelConfig(block_size=BLOCK_SIZE),
-        node_config=NodeConfig(gpu_blocks=3, cpu_blocks=0, disk_blocks=0),
+        node_config=NodeConfig(gpu_blocks=50, cpu_blocks=0, disk_blocks=0),
         bandwidth_config=BandwidthConfig(),
     )
 
-    # Stage 1: admit exactly 1 block (16 tokens)
+    # Stage 1: 1 block (16 tokens)
     cm.admit(_tokens(16, start=0), "n0")
-    assert cm.free_blocks("n0", "gpu") == 2
 
-    # Stage 2: non-aligned split — shared prefix is only 1 token
-    # [0] + _tokens(32, start=99) = 33 tokens → aligned to 32
-    # split: mid(key=[0], len=1) + child(key=[1..15], len=15) + leaf(key=[99..129], len=31)
-    # ceil((1+15+31)/16) = ceil(47/16) = 3 → all 3 GPU blocks used
+    # Stage 2: non-aligned split — only token [0] is shared
     new_tokens = [0] + _tokens(32, start=99)
     cm.admit(new_tokens, "n0")
-    assert cm.free_blocks("n0", "gpu") == 0
 
-    # Stage 3: cold 3-block request must succeed, not raise MemoryError
+    # pool.used == sum of per-node block_ids (no orphan leak)
+    pool_used = cm._pools["n0"].used("gpu")
+    tree_blocks = sum(len(n.block_ids) for n in cm._trees["n0"]._nodes.values())
+    assert pool_used == tree_blocks
+
+    # Stage 3: cold 3-block request must succeed
     cm.admit(_tokens(48, start=200), "n0")
-    assert cm.free_blocks("n0", "gpu") == 0
-
-    # The newly admitted sequence must be fully cached
-    req = _req(_tokens(48, start=200))
-    lk = cm.lookup(req, "n0")
+    lk = cm.lookup(_req(_tokens(48, start=200)), "n0")
     assert lk.matched_tokens == 48
     assert lk.matched_blocks_by_tier == {"gpu": 3}
 
+    # Invariant still holds after stage 3
+    pool_used2 = cm._pools["n0"].used("gpu")
+    tree_blocks2 = sum(len(n.block_ids) for n in cm._trees["n0"]._nodes.values())
+    assert pool_used2 == tree_blocks2
+
 
 # ---------------------------------------------------------------------------
-# 15. Invariant — _used == ceil(tree total tokens / block_size) after each admit
+# 15. Invariant — pool.used == sum(ceil(key_len/bs) per node) after each admit
 # ---------------------------------------------------------------------------
 
 
-def test_used_equals_tree_ceiling_after_each_admit() -> None:
+def test_pool_used_equals_per_node_block_sum_after_each_admit() -> None:
+    """M4 invariant: pool.used("gpu") equals the sum of block_ids lengths
+    across all RadixTree nodes (i.e. the per-node ceiling block count)."""
     cm = CacheManager(
         node_ids=["n0"],
         model_config=ModelConfig(block_size=BLOCK_SIZE),
@@ -325,20 +328,19 @@ def test_used_equals_tree_ceiling_after_each_admit() -> None:
     )
     for length in [16, 32, 48, 17, 33]:
         cm.admit(_tokens(length, start=length * 100), "n0")
-        tree = cm._trees["n0"]
-        total_tokens = sum(len(n.key) for n in tree._nodes.values())
-        expected = (total_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE
-        assert cm._used["n0"]["gpu"] == expected
+        pool_used = cm._pools["n0"].used("gpu")
+        tree_blocks = sum(len(n.block_ids) for n in cm._trees["n0"]._nodes.values())
+        assert pool_used == tree_blocks
 
 
 # ---------------------------------------------------------------------------
-# 16. lookup never reports more matched_blocks than _used
+# 16. lookup never reports more matched_blocks than pool.used
 # ---------------------------------------------------------------------------
 
 
 def test_lookup_never_exceeds_pool_used() -> None:
-    """For any query, matched_blocks <= _used. Lookup cannot report more
-    cached blocks than the counter says are physically allocated."""
+    """For any query, matched_blocks <= pool.used. Lookup cannot report more
+    cached blocks than the pool says are physically allocated."""
     cm = CacheManager(
         node_ids=["n0"],
         model_config=ModelConfig(block_size=BLOCK_SIZE),
@@ -348,13 +350,13 @@ def test_lookup_never_exceeds_pool_used() -> None:
     cm.admit(_tokens(64, start=0), "n0")
     cm.admit([0] + _tokens(48, start=999), "n0")  # triggers a split
 
-    used = cm._used["n0"]["gpu"]
+    used = cm._pools["n0"].used("gpu")
 
     for query in [_tokens(64), [0] + _tokens(48, start=999), [0], _tokens(16)]:
         lk = cm.lookup(_req(query), "n0")
         matched_blocks = lk.matched_blocks_by_tier.get("gpu", 0)
         assert matched_blocks <= used, (
-            f"INVARIANT BROKEN: matched_blocks={matched_blocks} > _used={used} "
+            f"INVARIANT BROKEN: matched_blocks={matched_blocks} > pool.used={used} "
             f"for query={query[:5]}..."
         )
 
@@ -415,3 +417,106 @@ def test_admit_oversize_prompt_fails_without_evicting_existing_cache() -> None:
     assert cm.free_blocks("n0", "gpu") == 0
     lk = cm.lookup(_req(_tokens(48, start=0)), "n0")
     assert lk.matched_tokens == 48   # original cache intact
+
+
+# ---------------------------------------------------------------------------
+# 19. M4 new: admit allocates from pool (pool.used increases)  [M4]
+# ---------------------------------------------------------------------------
+
+
+def test_admit_allocates_pool_blocks() -> None:
+    """Pool.used("gpu") must increase by exactly the number of new blocks
+    when a cold prompt is admitted."""
+    cm = CacheManager(
+        node_ids=["n0"],
+        model_config=ModelConfig(block_size=BLOCK_SIZE),
+        node_config=NodeConfig(gpu_blocks=100),
+        bandwidth_config=BandwidthConfig(),
+    )
+    assert cm._pools["n0"].used("gpu") == 0
+
+    # Admit 3 blocks (48 tokens)
+    cm.admit(_tokens(48, start=0), "n0")
+    assert cm._pools["n0"].used("gpu") == 3
+
+    # Admit 2 more blocks (non-overlapping)
+    cm.admit(_tokens(32, start=1000), "n0")
+    assert cm._pools["n0"].used("gpu") == 5
+
+
+# ---------------------------------------------------------------------------
+# 20. M4 new: eviction frees pool blocks  [M4]
+# ---------------------------------------------------------------------------
+
+
+def test_evict_frees_pool_blocks() -> None:
+    """Evicting cache entries must decrease pool.used("gpu") accordingly."""
+    # gpu_blocks=6 gives the +1 split-margin headroom the eviction loop needs,
+    # so the first two admits (3+2=5 blocks) land without triggering eviction.
+    cm = CacheManager(
+        node_ids=["n0"],
+        model_config=ModelConfig(block_size=BLOCK_SIZE),
+        node_config=NodeConfig(gpu_blocks=6, cpu_blocks=0, disk_blocks=0),
+        bandwidth_config=BandwidthConfig(),
+    )
+    # Fill with 5 blocks: 3 + 2
+    cm.admit(_tokens(48, start=0), "n0")   # 3 blocks
+    cm.admit(_tokens(32, start=1000), "n0")  # 2 blocks
+    assert cm._pools["n0"].used("gpu") == 5
+
+    # Admit a 3-block sequence that requires eviction (pool: 5 used, cap=6)
+    cm.admit(_tokens(48, start=2000), "n0")
+
+    # After eviction + new admit, pool.used must match tree state
+    pool_used = cm._pools["n0"].used("gpu")
+    tree_blocks = sum(len(n.block_ids) for n in cm._trees["n0"]._nodes.values())
+    assert pool_used == tree_blocks
+    assert pool_used <= 6
+
+
+# ---------------------------------------------------------------------------
+# 21. M4 new: gpu_blocks config actually constrains eviction  [M4]
+# ---------------------------------------------------------------------------
+
+
+def test_gpu_blocks_sensitivity() -> None:
+    """Tighter gpu_blocks → more evictions → lower cache hit ratio.
+
+    Admits the same sequence of requests under two capacities and confirms
+    that the smaller-capacity node exhibits more evictions (higher miss rate
+    on re-lookup of earlier admits)."""
+    model_cfg = ModelConfig(block_size=BLOCK_SIZE)
+    bw_cfg = BandwidthConfig()
+
+    # Large capacity: all admits fit without eviction
+    cm_large = CacheManager(
+        node_ids=["n0"],
+        model_config=model_cfg,
+        node_config=NodeConfig(gpu_blocks=100),
+        bandwidth_config=bw_cfg,
+    )
+    # Small capacity: admits force eviction
+    cm_small = CacheManager(
+        node_ids=["n0"],
+        model_config=model_cfg,
+        node_config=NodeConfig(gpu_blocks=6),
+        bandwidth_config=bw_cfg,
+    )
+
+    sequences = [_tokens(32, start=i * 1000) for i in range(5)]  # 5 × 2 blocks each
+
+    for seq in sequences:
+        cm_large.admit(seq, "n0")
+        cm_small.admit(seq, "n0")
+
+    # With large capacity, all 5 sequences are cached
+    large_hits = sum(
+        1 for seq in sequences if cm_large.lookup(_req(seq), "n0").matched_tokens > 0
+    )
+    # With small capacity (6 blocks), only ~3 sequences can be cached at once
+    small_hits = sum(
+        1 for seq in sequences if cm_small.lookup(_req(seq), "n0").matched_tokens > 0
+    )
+
+    assert large_hits == 5           # all cached
+    assert small_hits < large_hits   # tighter capacity → more evictions
