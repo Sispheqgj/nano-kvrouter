@@ -1,0 +1,45 @@
+cluster:
+  prefill_nodes: 6
+  decode_nodes: 2
+
+node:
+  capacity: 16
+  gpu_blocks: 800
+  cpu_blocks: 5000
+  disk_blocks: 50000
+
+model:
+  block_size: 16
+  kv_bytes_per_token: 8192
+  prefill_cost_per_token_ms: 0.05
+  decode_base_ms: 8.0
+  marginal_decode_ms: 0.8
+  prefill_chunk_size: 512
+
+bandwidth:
+  gpu_to_gpu: 5.0e9
+  gpu_to_cpu: 3.2e10
+  cpu_to_disk: 5.0e9
+
+slo:
+  ttft_target_ms: 800.0
+  tbt_target_ms: 50.0
+
+workload:
+  request_rate: 20.0
+  duration_s: 20.0
+  prefix_sharing_ratio: 0.6
+  avg_prompt_len: 1024
+  avg_output_len: 128
+
+generator:
+  num_buckets: 8
+  vocab_size: 32000
+  seed: 42
+
+scheduler:
+  name: conductor
+  params:
+    alpha: 1.0
+    beta: 1.0
+    gamma: 1.0

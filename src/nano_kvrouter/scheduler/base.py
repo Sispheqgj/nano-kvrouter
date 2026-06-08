@@ -202,7 +202,13 @@ def compute_est_ttft(
     * ``prefill_phase`` uses the chunked-pipeline formula on prefill_node,
       taking ``decode_cache_match.matched_tokens`` as the cache hit (KV
       lives on decode_node side — the prefill_node simulates skipping
-      cached tokens as Mooncake does).
+      cached tokens as Mooncake does).  The batch-size hint is
+      ``len(prefill_node.decoding) + 1`` — the prefill_node's own
+      concurrent decode streams, NOT decode_node's.  In split P/D the
+      prefill_node has an empty ``decoding`` set (it never runs decode
+      streams), so ``prefill_bs = 1``.  In combined deployments
+      ``prefill_node is decode_node`` so both values are equal and
+      behaviour is unchanged.
     * ``queue_wait`` is measured on prefill_node because that is where
       the request is admitted first.
     * ``kv_transfer`` is ``(prompt_len * kv_bytes_per_token) /
@@ -210,7 +216,8 @@ def compute_est_ttft(
       deployments so sensitivity sweeps over ``bandwidth.gpu_to_gpu``
       stay consistent.
     * ``first_decode_tick`` is the first decode step time on decode_node
-      using ``len(decode_node.decoding) + 1`` as the batch size hint.
+      using ``len(decode_node.decoding) + 1`` as the batch size hint
+      (the decode_node's own concurrent streams).
 
     Args:
         prefill_node: Node assigned for the prefill phase.
@@ -229,10 +236,14 @@ def compute_est_ttft(
     """
     prompt_len = len(request.token_ids)
     matched = decode_cache_match.matched_tokens
-    decoding_bs = len(decode_node.decoding) + 1
+    # prefill_bs: concurrent decode streams on the prefill_node itself.
+    # In split P/D this is 0+1=1 (prefill nodes never run decode).
+    # In combined deployment prefill_node is decode_node so equal to decoding_bs.
+    prefill_bs = len(prefill_node.decoding) + 1
+    decoding_bs = len(decode_node.decoding) + 1  # for first_decode_tick only
 
     prefill_phase = prefill_node.estimate_prefill_time(
-        prompt_len, cached_tokens=matched, batch_size_hint=decoding_bs
+        prompt_len, cached_tokens=matched, batch_size_hint=prefill_bs
     )
     queue_wait = prefill_node.queue_wait_time(prompt_len, request.expected_output_len)
     kv_bytes = prompt_len * kv_bytes_per_token

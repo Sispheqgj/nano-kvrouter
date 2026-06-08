@@ -46,9 +46,32 @@ class MooncakeConductor:
           decode scoring in M5a.
         * **Ties**: ``(−score, node_id)`` so ties resolve by node_id
           deterministically.
-        * **transfer_penalty == 0 in M5a**: KV lives on decode side,
-          so γ × transfer_cost = 0. M5b will introduce a cross-pool
-          KV transfer penalty.
+        * **transfer_penalty** (roadmap):
+
+          transfer_penalty:
+              Currently ``0.0`` in M5a — ``CacheManager.lookup`` returns
+              ``transfer_cost_ms=0.0`` because all matched blocks are on GPU
+              HBM (GPU-only tier, no cross-node hit in M5a).
+
+          ``transfer_penalty`` in the score formula is always ``0.0`` in
+          M5a — ``CacheManager.lookup`` returns ``transfer_cost_ms=0.0``
+          because all matched blocks are on GPU HBM (GPU-only tier, no
+          cross-node hit possible in M5a).
+
+          The field is reserved for **M6 multi-tier HiCache**: when a
+          prefix hit resides on a CPU or Disk tier instead of GPU HBM,
+          ``CacheManager.lookup`` will return a non-zero
+          ``transfer_cost_ms`` reflecting the bandwidth-bound cost to
+          load those blocks back into GPU before prefill starts.  The
+          conductor can then trade off "use this distant cache hit" vs
+          "recompute from scratch on a lightly-loaded node".
+
+          **Important**: ``transfer_penalty`` here is the *within-node
+          tier-migration cost* (CPU → GPU or Disk → CPU → GPU).  It is
+          **not** the prefill_node → decode_node KV transfer cost —
+          that one is already baked into ``est_ttft`` via
+          ``compute_est_ttft`` (the ``kv_transfer`` term) and feeds the
+          SLO gate.  Do not add it to the score as well (double count).
     """
 
     def __init__(

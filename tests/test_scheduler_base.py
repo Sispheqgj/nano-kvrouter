@@ -4,11 +4,14 @@ from __future__ import annotations
 import pytest
 
 from nano_kvrouter.request import Request
+from nano_kvrouter.config import BandwidthConfig, ModelConfig, NodeConfig
+from nano_kvrouter.engine.mock_node import MockEngineNode
 from nano_kvrouter.scheduler.base import (
     CacheLookup,
     CacheQuery,
     SchedulingDecision,
     SchedulingPolicy,
+    compute_est_ttft,
 )
 from nano_kvrouter.scheduler._testing import NullCacheQuery
 from nano_kvrouter.scheduler.round_robin import RoundRobinPolicy
@@ -158,3 +161,77 @@ def test_null_cache_query_satisfies_cache_query_protocol(
 def test_round_robin_satisfies_scheduling_policy_protocol() -> None:
     policy = RoundRobinPolicy()
     assert isinstance(policy, SchedulingPolicy)
+
+
+# ---------------------------------------------------------------------------
+# compute_est_ttft: split P/D uses prefill_node.decoding, not decode_node.decoding
+# ---------------------------------------------------------------------------
+
+
+def test_compute_est_ttft_uses_prefill_node_bs() -> None:
+    """compute_est_ttft must use prefill_node.decoding as batch_size_hint for
+    the prefill phase, not decode_node.decoding.
+
+    In split P/D the prefill_node has an empty decoding set (prefill_bs=1),
+    while the decode_node may have many active streams.  Using decode_node's
+    decoding count (old behaviour) would over-estimate prefill_phase.
+
+    Setup:
+        prefill_node: 0 decoding → prefill_bs = 1
+        decode_node:  7 decoding → decoding_bs = 8
+
+    Old (wrong): prefill_phase = 1 × (512×0.1 + 5.0 + 8×0.5) = 60.2 ms
+    New (right): prefill_phase = 1 × (512×0.1 + 5.0 + 1×0.5) = 56.7 ms
+    first_decode_tick = 5.0 + 8×0.5 = 9.0 ms (unchanged — uses decode_node.decoding)
+    est_ttft (new) = 56.7 + 0 + 0 + 9.0 = 65.7 ms
+    est_ttft (old) = 60.2 + 0 + 0 + 9.0 = 69.2 ms
+    """
+    mc = ModelConfig(
+        block_size=16,
+        prefill_cost_per_token_ms=0.1,
+        decode_base_ms=5.0,
+        marginal_decode_ms=0.5,
+    )
+    nc = NodeConfig(capacity=16)
+    bw = BandwidthConfig(gpu_to_gpu=1e30)  # negligible transfer cost
+
+    prefill_node = MockEngineNode("p0", mc, nc)
+    decode_node = MockEngineNode("d0", mc, nc)
+
+    # populate decode_node with 7 active decode streams
+    for i in range(7):
+        decode_node.admit(f"r{i}")
+        decode_node.start_decode(f"r{i}")
+    assert len(decode_node.decoding) == 7
+    assert len(prefill_node.decoding) == 0  # prefill_node has no decode streams
+
+    req = Request(
+        request_id="test",
+        token_ids=list(range(64)),
+        prefix_hash="x",
+        expected_output_len=32,
+        arrival_time=0.0,
+        slo_ttft=9999.0,
+        slo_tbt=9999.0,
+    )
+    no_cache = CacheLookup(matched_tokens=0, matched_blocks_by_tier={}, transfer_cost_ms=0.0)
+
+    est = compute_est_ttft(
+        prefill_node,
+        decode_node,
+        req,
+        no_cache,
+        kv_bytes_per_token=mc.kv_bytes_per_token,
+        bandwidth_bytes_per_s=bw.gpu_to_gpu,
+    )
+
+    import pytest as _pytest
+    # New correct value: prefill_phase uses prefill_bs=1 → 56.7 + 9.0 = 65.7
+    assert est == _pytest.approx(65.7), (
+        f"est_ttft={est:.3f} != 65.7; "
+        "compute_est_ttft may be using decode_node.decoding instead of prefill_node.decoding"
+    )
+    # Also verify it is NOT the old wrong value (60.2 + 9.0 = 69.2)
+    assert abs(est - 69.2) > 0.5, (
+        "est_ttft matches the OLD wrong value 69.2; fix did not take effect"
+    )
