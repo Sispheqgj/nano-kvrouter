@@ -99,7 +99,8 @@ def test_initial_summary_is_empty(collector):
     assert s["avg_batch_size"] is None
     assert s["decode_throughput_tokens_per_s"] is None
     assert s["avg_chunked_prefill_steps_per_request"] is None
-    assert s["prefill_decode_interleave_step_count"] == 0
+    assert s["dual_phase_tick_count"] == 0
+    assert s["kv_transfer_time_avg_ms"] is None
 
 
 # ------------------------------------------------------------------
@@ -257,6 +258,8 @@ def test_attach_registers_all_handlers(engine, collector):
         EventType.REQUEST_REJECTED,
         EventType.PREFILL_START,
         EventType.PREFILL_COMPLETE,
+        EventType.KV_TRANSFER_START,
+        EventType.KV_TRANSFER_COMPLETE,
         EventType.TOKEN_GENERATED,
         EventType.DECODE_BATCH_STEP,
         EventType.DECODE_COMPLETE,
@@ -520,18 +523,50 @@ def test_avg_chunked_prefill_steps_metric(engine, collector):
 # Test 21: prefill_decode_interleave_step_count (M3)
 # ------------------------------------------------------------------
 
-def test_interleave_step_count(engine, collector):
-    """prefill_decode_interleave_step_count counts DECODE_BATCH_STEP with interleave=True."""
+def test_dual_phase_tick_count(engine, collector):
+    """M5a: dual_phase_tick_count fires when active_prefills and active_decodes
+    are both non-empty at DECODE_BATCH_STEP execution time.
+
+    Lifecycle: PREFILL_START → +active_prefills; PREFILL_COMPLETE → -active_prefills.
+    TOKEN_GENERATED step=0 → +active_decodes; DECODE_COMPLETE → -active_decodes.
+    """
     collector.attach(engine)
+    # r0: enters prefill at t=5, completes prefill at t=50, starts decoding at t=55.
     engine.schedule(_arrive(_make_request("r0"), t=0.0))
-    engine.schedule(Event(time=10.0, type=EventType.DECODE_BATCH_STEP,
-        payload={"node_id": "n0", "batch_size": 2, "interleave": True}))
-    engine.schedule(Event(time=20.0, type=EventType.DECODE_BATCH_STEP,
-        payload={"node_id": "n0", "batch_size": 2, "interleave": True}))
+    engine.schedule(Event(time=5.0, type=EventType.PREFILL_START,
+        payload={"request_id": "r0", "n_chunks": 1}))
+    # r1: arrives later, in decode by t=20.
+    engine.schedule(_arrive(_make_request("r1"), t=10.0))
+    engine.schedule(_decode_step("r1", t=20.0, step=0))   # r1 in active_decodes
+    # Now both sets non-empty (r0 in prefill, r1 in decode).
+    engine.schedule(Event(time=25.0, type=EventType.DECODE_BATCH_STEP,
+        payload={"node_id": "n0", "batch_size": 1}))     # dual-phase ✓
     engine.schedule(Event(time=30.0, type=EventType.DECODE_BATCH_STEP,
-        payload={"node_id": "n0", "batch_size": 2, "interleave": False}))
+        payload={"node_id": "n0", "batch_size": 1}))     # dual-phase ✓
+    # r0 finishes prefill — active_prefills empty.
+    engine.schedule(Event(time=35.0, type=EventType.PREFILL_COMPLETE,
+        payload={"request_id": "r0"}))
+    engine.schedule(Event(time=40.0, type=EventType.DECODE_BATCH_STEP,
+        payload={"node_id": "n0", "batch_size": 1}))     # decode-only (no count)
     engine.run()
-    assert collector.summary()["prefill_decode_interleave_step_count"] == 2
+    assert collector.summary()["dual_phase_tick_count"] == 2
+
+
+def test_kv_transfer_time_avg_ms(engine, collector):
+    """M5a kv_transfer_time_avg_ms = mean of cost_ms on KV_TRANSFER_COMPLETE events."""
+    collector.attach(engine)
+    # KV_TRANSFER_START must precede KV_TRANSFER_COMPLETE (stale guard).
+    for tid, cost in [("r0-xfer-0", 2.0), ("r1-xfer-0", 4.0), ("r2-xfer-0", 6.0)]:
+        engine.schedule(Event(time=5.0, type=EventType.KV_TRANSFER_START,
+            payload={"transfer_id": tid, "cost_ms": cost}))
+    engine.schedule(Event(time=10.0, type=EventType.KV_TRANSFER_COMPLETE,
+        payload={"request_id": "r0", "transfer_id": "r0-xfer-0", "cost_ms": 2.0}))
+    engine.schedule(Event(time=20.0, type=EventType.KV_TRANSFER_COMPLETE,
+        payload={"request_id": "r1", "transfer_id": "r1-xfer-0", "cost_ms": 4.0}))
+    engine.schedule(Event(time=30.0, type=EventType.KV_TRANSFER_COMPLETE,
+        payload={"request_id": "r2", "transfer_id": "r2-xfer-0", "cost_ms": 6.0}))
+    engine.run()
+    assert collector.summary()["kv_transfer_time_avg_ms"] == pytest.approx(4.0)
 
 
 # ------------------------------------------------------------------
@@ -539,12 +574,11 @@ def test_interleave_step_count(engine, collector):
 # ------------------------------------------------------------------
 
 def test_m3_metrics_independent_of_attach_order() -> None:
-    """avg_chunked_prefill_steps and interleave_count must match for normal
-    vs reversed collector/simulator attach order.
+    """M5a: avg_chunked_prefill_steps and dual_phase_tick_count must match
+    for normal vs reversed collector/simulator attach order.
 
-    Setup: req_a (0 uncached, enters decode at t=0) + req_b (512 uncached,
-    chunk_size=128 → 4 chunks). While b prefills, a decodes → multiple
-    interleave steps.  Both orders must report identical metrics.
+    Setup uses combined-deployment (same node for prefill+decode pools) so
+    req_a decodes while req_b prefills, triggering dual-phase ticks.
     """
     import logging
     from nano_kvrouter.config import BandwidthConfig, ModelConfig, NodeConfig
@@ -563,20 +597,25 @@ def test_m3_metrics_independent_of_attach_order() -> None:
         prefill_chunk_size=128,
     )
     nc = NodeConfig(capacity=4, gpu_blocks=200, cpu_blocks=400, disk_blocks=800)
+    bw = BandwidthConfig()
 
     def _run(wire_first: bool) -> dict:
         eng = SimulationEngine()
         node = MockEngineNode("n0", mc, nc)
-        cm = CacheManager(["n0"], mc, nc, BandwidthConfig(), clock=eng.now)
-        sched = RoundRobinPolicy()
+        cm = CacheManager(["n0"], mc, nc, bw, clock=eng.now)
+        sched = RoundRobinPolicy(model_config=mc, bandwidth_config=bw)
         coll = MetricsCollector()
 
         if wire_first:
-            _wire_simulator(eng, sched, cm, [node], logger_=logging.getLogger("test"))
+            _wire_simulator(eng, sched, cm, [node], [node],
+                            logger_=logging.getLogger("test"),
+                            model_cfg=mc, bandwidth_cfg=bw)
             coll.attach(eng, nodes={"n0": node})
         else:
             coll.attach(eng, nodes={"n0": node})
-            _wire_simulator(eng, sched, cm, [node], logger_=logging.getLogger("test"))
+            _wire_simulator(eng, sched, cm, [node], [node],
+                            logger_=logging.getLogger("test"),
+                            model_cfg=mc, bandwidth_cfg=bw)
 
         # req_a: 0 uncached (cache pre-warmed) → enters decode immediately
         cm.admit([0] * 32, "n0")
@@ -594,21 +633,76 @@ def test_m3_metrics_independent_of_attach_order() -> None:
     s_normal = _run(wire_first=True)
     s_reversed = _run(wire_first=False)
 
-    assert s_normal["avg_chunked_prefill_steps_per_request"] is not None, (
-        "avg_chunked_prefill_steps should be non-None (b has 4 chunks)"
-    )
+    assert s_normal["avg_chunked_prefill_steps_per_request"] is not None
     assert s_normal["avg_chunked_prefill_steps_per_request"] == pytest.approx(
         s_reversed["avg_chunked_prefill_steps_per_request"]
     ), (
         f"avg_chunks: normal={s_normal['avg_chunked_prefill_steps_per_request']}, "
-        f"reversed={s_reversed['avg_chunked_prefill_steps_per_request']}; "
-        "metric is attach-order dependent (n_chunks not pre-injected?)"
+        f"reversed={s_reversed['avg_chunked_prefill_steps_per_request']}"
     )
-    assert s_normal["prefill_decode_interleave_step_count"] > 0, (
-        "interleave_count should be >0 (req_a decoding while req_b prefills)"
+    assert s_normal["dual_phase_tick_count"] > 0, (
+        "dual_phase_tick_count should be > 0 (req_a decoding while req_b prefills)"
     )
-    assert s_normal["prefill_decode_interleave_step_count"] == s_reversed["prefill_decode_interleave_step_count"], (
-        f"interleave: normal={s_normal['prefill_decode_interleave_step_count']}, "
-        f"reversed={s_reversed['prefill_decode_interleave_step_count']}; "
-        "metric is attach-order dependent (interleave not pre-injected?)"
+    assert s_normal["dual_phase_tick_count"] == s_reversed["dual_phase_tick_count"], (
+        f"dual_phase: normal={s_normal['dual_phase_tick_count']}, "
+        f"reversed={s_reversed['dual_phase_tick_count']}"
     )
+
+
+# ------------------------------------------------------------------
+# Test 23: Stale KV_TRANSFER_COMPLETE is dropped (M5a.fix Important #1)
+# ------------------------------------------------------------------
+
+def test_stale_kv_transfer_complete_not_counted(engine, collector):
+    """Stale KV_TRANSFER_COMPLETE (unseen transfer_id) is not counted."""
+    collector.attach(engine)
+    # Inject a stale KV_TRANSFER_COMPLETE with no preceding START.
+    engine.schedule(Event(
+        time=100.0,
+        type=EventType.KV_TRANSFER_COMPLETE,
+        payload={
+            "transfer_id": "never-seen-id",
+            "request_id": "r0",
+            "cost_ms": 123.0,
+        },
+    ))
+    engine.run()
+    summary = collector.summary()
+    # stale event must be dropped — cost must not be counted
+    assert summary.get("kv_transfer_time_avg_ms") in (None, 0.0), (
+        f"stale transfer should not be counted, got {summary.get('kv_transfer_time_avg_ms')}"
+    )
+
+
+# ------------------------------------------------------------------
+# Test 24: B1 reject cleans _request_n_chunks + _active_prefills (M5a.fix Important #2)
+# ------------------------------------------------------------------
+
+def test_b1_reject_cleans_internal_state(engine, collector):
+    """B1 reject path (PREFILL_START then REQUEST_REJECTED) cleans lifecycle state."""
+    collector.attach(engine)
+    # Simulate B1: PREFILL_START fires then REQUEST_REJECTED before decode.
+    engine.schedule(Event(time=0.0, type=EventType.PREFILL_START,
+                         payload={"request_id": "r0", "n_chunks": 2}))
+    engine.schedule(Event(time=1.0, type=EventType.REQUEST_REJECTED,
+                         payload={"request_id": "r0", "reason": "decode_capacity"}))
+    engine.run()
+    assert "r0" not in collector._request_n_chunks
+    assert "r0" not in collector._active_prefills
+
+
+# ------------------------------------------------------------------
+# Test 25: B2 mid-prefill reject cleans _active_prefills (M5a.fix Important #2)
+# ------------------------------------------------------------------
+
+def test_b2_mid_prefill_reject_cleans_active_prefills(engine, collector):
+    """B2 mid-prefill reject cleans _active_prefills so dual_phase is not inflated."""
+    collector.attach(engine)
+    # PREFILL_START adds r0 to _active_prefills.
+    engine.schedule(Event(time=0.0, type=EventType.PREFILL_START,
+                         payload={"request_id": "r0", "n_chunks": 4}))
+    # Mid-prefill REQUEST_REJECTED (B2).
+    engine.schedule(Event(time=10.0, type=EventType.REQUEST_REJECTED,
+                         payload={"request_id": "r0", "reason": "mid_prefill_slo"}))
+    engine.run()
+    assert "r0" not in collector._active_prefills

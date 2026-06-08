@@ -1,30 +1,36 @@
 """E2 (exploit-explore) scheduling policy — Preble ICLR'25 §4.
 
-Routes requests by minimising a three-term joint cost over all nodes:
+Routes requests by minimising a three-term joint cost over decode-pool
+candidates:
 
-    e2_score(node, request) =
-        w_historical × historical_load_proxy(node)
-      + w_eviction   × eviction_cost(node, request)
-      + w_run        × run_cost(node, request)
+    e2_score(decode_node, request) =
+        w_historical × historical_load_proxy(decode_node)
+      + w_eviction   × eviction_cost(decode_node, request)
+      + w_run        × run_cost(prefill_node, decode_node, request)
 
 where every term is expressed in milliseconds so the weights are
 dimensionally consistent and directly comparable.
 
-v1 simplifications (documented in DESIGN.md §3.4):
-    * historical_load is proxied by current_load() — no rolling window.
-    * eviction_cost is expressed as "equivalent re-prefill time" for the
-      blocks that would need to be evicted.
-    * No SLO early-rejection — that is the Conductor's responsibility.
+M5a split P/D: cache lives on the decode pool, so e2_score is computed
+over decode_nodes. Prefill_node is selected independently by lowest
+``current_load()`` because the prefill side has no cache state in M5a
+(M5b will introduce transfer-aware prefill selection).
 """
 from __future__ import annotations
 
 import logging
 from typing import Sequence
 
-from nano_kvrouter.config import ModelConfig
+from nano_kvrouter.config import BandwidthConfig, ModelConfig
 from nano_kvrouter.engine.mock_node import MockEngineNode
 from nano_kvrouter.request import Request
-from nano_kvrouter.scheduler.base import CacheQuery, SchedulingDecision
+from nano_kvrouter.scheduler.base import (
+    CacheLookup,
+    CacheQuery,
+    SchedulingDecision,
+    compute_est_tbt,
+    compute_est_ttft,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,34 +40,24 @@ __all__ = ["E2Policy"]
 class E2Policy:
     """Preble-style exploit-explore scheduler (ICLR'25 §4).
 
-    Selects the node that minimises a three-term weighted cost:
+    Selects the decode_node that minimises a three-term weighted cost:
 
-    * **historical_load** (w_historical): proxy for past utilisation.
-      ``current_load() × prompt_len × prefill_cost_per_token_ms`` — a
-      load-proportional penalty that discourages routing to busy nodes.
+    * **historical_load** (w_historical):
+      ``current_load() × prompt_len × prefill_cost_per_token_ms``
+    * **eviction_cost** (w_eviction): equivalent re-prefill time for
+      blocks that would need to be evicted on the decode_node.
+    * **run_cost** (w_run): ``compute_est_ttft(...)`` — total predicted
+      time from arrival to first token (Mooncake style, includes KV
+      transfer cost).
 
-    * **eviction_cost** (w_eviction): penalty when the node's GPU cache
-      is too full to absorb the new prompt without eviction. Expressed
-      as equivalent re-prefill time for the evicted tokens so it is
-      dimensionally compatible with run_cost.
-
-    * **run_cost** (w_run): actual cost of running the request.
-      ``estimate_prefill_time(prompt_len, cached_tokens) +
-      queue_wait_time(prompt_len, expected_output_len)`` — lower when there is a cache hit and a short
-      queue.
-
-    Ties (equal score) are broken by stable index order in the ``nodes``
-    sequence (Python's ``min()`` is stable).
+    Ties broken by ``(score, node_id)`` so cross-run reproducibility holds.
 
     Design notes:
-        * Cold-start behaviour: when the cache is empty everywhere,
-          historical and eviction terms are 0, and run_cost is identical
-          across nodes, so the first node in the sequence is picked. No
-          explicit cold-start fallback is needed; this also avoids
-          masking the policy's true scoring logic.
-        * ``prefill_node == decode_node`` always (combined deployment).
-        * No SLO rejection — E2Policy is a pure routing policy; admission
-          control belongs in MooncakeConductor.
+        * Cold-start behaviour: with cold caches and equal load the
+          minimum is tie-broken by node_id → first node lexicographic.
+        * Prefill_node is chosen separately by lowest load.
+        * No SLO rejection — admission control belongs in
+          MooncakeConductor.
     """
 
     def __init__(
@@ -71,24 +67,8 @@ class E2Policy:
         w_run: float = 1.0,
         *,
         model_config: ModelConfig | None = None,
+        bandwidth_config: BandwidthConfig | None = None,
     ) -> None:
-        """Initialise E2Policy with optional weight tuning.
-
-        Args:
-            w_historical: Weight on the historical load proxy term.
-                Higher values bias routing away from busy nodes.
-            w_eviction: Weight on the eviction cost term.
-                Higher values bias routing toward nodes with free cache.
-            w_run: Weight on the run cost (prefill + queue) term.
-                Higher values bias toward cache-warm, short-queue nodes.
-            model_config: Source of ``block_size`` and
-                ``prefill_cost_per_token_ms`` for historical and eviction
-                calculations. Defaults to ``ModelConfig()`` (16-token
-                blocks, default prefill cost) when ``None``.
-
-        Raises:
-            ValueError: If any weight is negative.
-        """
         for name, val in [
             ("w_historical", w_historical),
             ("w_eviction", w_eviction),
@@ -101,29 +81,16 @@ class E2Policy:
         self._w_e = w_eviction
         self._w_r = w_run
         self._model_cfg: ModelConfig = model_config if model_config is not None else ModelConfig()
+        self._bw_cfg = bandwidth_config if bandwidth_config is not None else BandwidthConfig()
 
     def schedule(
         self,
         request: Request,
-        nodes: Sequence[MockEngineNode],
+        prefill_nodes: Sequence[MockEngineNode],
+        decode_nodes: Sequence[MockEngineNode],
         cache: CacheQuery,
     ) -> SchedulingDecision:
-        """Pick the node with the lowest E2 cost for *request*.
-
-        Args:
-            request: The incoming request.
-            nodes: Live cluster nodes in stable order. Ties in E2 score
-                are broken by position in this sequence (first wins).
-                An empty sequence causes an early rejection.
-            cache: Read-only handle used for prefix-hit details
-                (``lookup_all``) and free-block counts (``free_blocks``).
-
-        Returns:
-            :class:`~nano_kvrouter.scheduler.base.SchedulingDecision` with
-            ``prefill_node == decode_node``. Rejected with
-            ``reject_reason="no_nodes_available"`` when *nodes* is empty.
-        """
-        if not nodes:
+        if not prefill_nodes or not decode_nodes:
             return SchedulingDecision(
                 prefill_node=None,
                 decode_node=None,
@@ -138,53 +105,52 @@ class E2Policy:
         ppt = self._model_cfg.prefill_cost_per_token_ms
         total_blocks = prompt_len // bs
 
-        def _score(n: MockEngineNode) -> float:
-            matched = lookups[n.node_id].matched_tokens
-            # Only blocks NOT already cached require new allocation (and potential
-            # eviction). A fully-cached node needs 0 new blocks even if free==0.
+        # prefill_node: load-only (M5a; cache lives on decode).
+        prefill = min(prefill_nodes, key=lambda n: (n.current_load(), n.node_id))
+
+        def _score(decode: MockEngineNode) -> tuple[float, str]:
+            match = lookups.get(decode.node_id, CacheLookup(0, {}, 0.0))
+            matched = match.matched_tokens
             new_blocks = max(0, total_blocks - matched // bs)
-            hist = n.current_load() * prompt_len * ppt
-            shortage = max(0, new_blocks - cache.free_blocks(n.node_id, "gpu"))
+            hist = decode.current_load() * prompt_len * ppt
+            shortage = max(0, new_blocks - cache.free_blocks(decode.node_id, "gpu"))
             evict = shortage * bs * ppt
-            # M3 chunked-prefill: use decoding+1 for bs_hint (only decoding streams
-            # piggyback with the prefill chunks; running-but-not-decoding ones don't).
-            bs_hint = len(n.decoding) + 1
-            first_tick_ms = n.estimate_decode_time(bs_hint)
-            run = (
-                n.estimate_prefill_time(
-                    prompt_len, cached_tokens=matched, batch_size_hint=bs_hint
-                )
-                + n.queue_wait_time(prompt_len, request.expected_output_len)
-                + first_tick_ms
+            run = compute_est_ttft(
+                prefill,
+                decode,
+                request,
+                match,
+                kv_bytes_per_token=self._model_cfg.kv_bytes_per_token,
+                bandwidth_bytes_per_s=self._bw_cfg.gpu_to_gpu,
             )
-            return self._w_h * hist + self._w_e * evict + self._w_r * run
+            score = self._w_h * hist + self._w_e * evict + self._w_r * run
+            return (score, decode.node_id)
 
-        chosen = min(nodes, key=_score)
+        decode = min(decode_nodes, key=_score)
+        decode_match = lookups.get(decode.node_id, CacheLookup(0, {}, 0.0))
 
-        chosen_matched = lookups[chosen.node_id].matched_tokens
-        bs_hint = len(chosen.decoding) + 1
-        first_tick_ms = chosen.estimate_decode_time(bs_hint)
-        ttft_ms = (
-            chosen.estimate_prefill_time(
-                prompt_len, cached_tokens=chosen_matched, batch_size_hint=bs_hint
-            )
-            + chosen.queue_wait_time(prompt_len, request.expected_output_len)
-            + first_tick_ms
+        ttft_ms = compute_est_ttft(
+            prefill,
+            decode,
+            request,
+            decode_match,
+            kv_bytes_per_token=self._model_cfg.kv_bytes_per_token,
+            bandwidth_bytes_per_s=self._bw_cfg.gpu_to_gpu,
         )
-        tbt_ms = first_tick_ms
+        tbt_ms = compute_est_tbt(decode)
 
         logger.debug(
-            "E2Policy: request %s → node %s (score=%.3f, matched=%d/%d)",
+            "E2Policy: request %s → prefill=%s decode=%s (matched=%d/%d)",
             request.request_id,
-            chosen.node_id,
-            _score(chosen),
-            chosen_matched,
+            prefill.node_id,
+            decode.node_id,
+            decode_match.matched_tokens,
             prompt_len,
         )
 
         return SchedulingDecision(
-            prefill_node=chosen.node_id,
-            decode_node=chosen.node_id,
+            prefill_node=prefill.node_id,
+            decode_node=decode.node_id,
             estimated_ttft_ms=ttft_ms,
             estimated_tbt_ms=tbt_ms,
         )

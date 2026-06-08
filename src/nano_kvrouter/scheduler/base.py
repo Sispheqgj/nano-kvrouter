@@ -19,6 +19,13 @@ Design notes
   ``lookup`` is enough for greedy strategies that probe one candidate
   at a time; ``lookup_all`` lets Conductor-style strategies score every
   node in one cheap call without re-running prefix matching N times.
+* M5a split P/D: :meth:`SchedulingPolicy.schedule` now accepts separate
+  ``prefill_nodes`` and ``decode_nodes`` pools so a single scheduler can
+  route the prefill phase to one pool and the decode phase to another.
+  In combined deployments the caller passes the same list as both args
+  and the scheduler is free to return ``prefill_node == decode_node``
+  (RoundRobin / LeastLoaded do; cache-aware policies may still split
+  because cache state lives on the decode pool).
 """
 from __future__ import annotations
 
@@ -33,6 +40,8 @@ __all__ = [
     "CacheQuery",
     "SchedulingDecision",
     "SchedulingPolicy",
+    "compute_est_ttft",
+    "compute_est_tbt",
 ]
 
 
@@ -76,6 +85,9 @@ class CacheQuery(Protocol):
     Use :meth:`lookup` when the scheduler already has a specific
     candidate node in mind. Use :meth:`lookup_all` when the scheduler
     wants to scan every node (PrefixGreedy / E2Policy / MooncakeConductor).
+
+    M5a: only decode_pool nodes are tracked. Prefill_pool nodes are not
+    registered (KV cache lives on the decode side only, Mooncake §3).
     """
 
     def lookup(self, request: Request, node_id: str) -> CacheLookup:
@@ -130,15 +142,15 @@ class SchedulingDecision:
 
     A non-rejected decision MUST have both ``prefill_node`` and
     ``decode_node`` set. They are equal in combined deployments and
-    differ under P/D split (Mooncake).
+    differ under M5a split P/D (Mooncake-style).
 
     Attributes:
         prefill_node: Node ID assigned for prefill. ``None`` means the
             request was rejected before prefill started (early rejection).
         decode_node: Node ID assigned for decode. Required when
-            ``prefill_node`` is set; pass the same value for combined
-            deployments. Should be ``None`` when ``prefill_node`` is
-            ``None``.
+            ``prefill_node`` is set; may equal or differ from
+            ``prefill_node``. Should be ``None`` when ``prefill_node``
+            is ``None``.
         estimated_ttft_ms: Predicted Time-To-First-Token (ms). Used by
             :class:`MetricsCollector` for SLO accounting.
         estimated_tbt_ms: Predicted Time-Between-Tokens (ms), one
@@ -160,6 +172,91 @@ class SchedulingDecision:
         return self.prefill_node is None
 
 
+# ----------------------------------------------------------------------
+# Shared cost helpers — used by every scheduler so the formula is
+# defined exactly once.  In combined deployments callers pass the same
+# MockEngineNode object as both ``prefill_node`` and ``decode_node`` and
+# the KV-transfer term collapses to a self-transfer that is still
+# computed by the formula (small but non-zero); intentional so that
+# bandwidth.gpu_to_gpu sensitivity sweeps work in either mode.
+# ----------------------------------------------------------------------
+
+
+def compute_est_ttft(
+    prefill_node: MockEngineNode,
+    decode_node: MockEngineNode,
+    request: Request,
+    decode_cache_match: CacheLookup,
+    *,
+    kv_bytes_per_token: int,
+    bandwidth_bytes_per_s: float,
+) -> float:
+    """Estimated TTFT (ms) for one request under split P/D.
+
+    Formula (Mooncake §3 + Sarathi chunked-prefill):
+
+        est_ttft = prefill_phase + queue_wait + kv_transfer + first_decode_tick
+
+    where:
+
+    * ``prefill_phase`` uses the chunked-pipeline formula on prefill_node,
+      taking ``decode_cache_match.matched_tokens`` as the cache hit (KV
+      lives on decode_node side — the prefill_node simulates skipping
+      cached tokens as Mooncake does).
+    * ``queue_wait`` is measured on prefill_node because that is where
+      the request is admitted first.
+    * ``kv_transfer`` is ``(prompt_len * kv_bytes_per_token) /
+      bandwidth_bytes_per_s * 1000`` — always computed even in combined
+      deployments so sensitivity sweeps over ``bandwidth.gpu_to_gpu``
+      stay consistent.
+    * ``first_decode_tick`` is the first decode step time on decode_node
+      using ``len(decode_node.decoding) + 1`` as the batch size hint.
+
+    Args:
+        prefill_node: Node assigned for the prefill phase.
+        decode_node: Node assigned for the decode phase.
+        request: Incoming request; only ``token_ids`` and
+            ``expected_output_len`` are read.
+        decode_cache_match: CacheLookup for ``decode_node`` — used both
+            for the prefill phase cache-hit term (we assume the prefill
+            side can skip cached tokens) and to know that KV is already
+            present on decode side.
+        kv_bytes_per_token: From ``model.kv_bytes_per_token``.
+        bandwidth_bytes_per_s: From ``bandwidth.gpu_to_gpu``.
+
+    Returns:
+        Estimated TTFT in milliseconds.
+    """
+    prompt_len = len(request.token_ids)
+    matched = decode_cache_match.matched_tokens
+    decoding_bs = len(decode_node.decoding) + 1
+
+    prefill_phase = prefill_node.estimate_prefill_time(
+        prompt_len, cached_tokens=matched, batch_size_hint=decoding_bs
+    )
+    queue_wait = prefill_node.queue_wait_time(prompt_len, request.expected_output_len)
+    kv_bytes = prompt_len * kv_bytes_per_token
+    # bandwidth_bytes_per_s is validated > 0 by Pydantic at config load.
+    kv_transfer = (kv_bytes / bandwidth_bytes_per_s) * 1000.0
+    first_decode_tick = decode_node.estimate_decode_time(decoding_bs)
+    return prefill_phase + queue_wait + kv_transfer + first_decode_tick
+
+
+def compute_est_tbt(decode_node: MockEngineNode) -> float:
+    """Estimated TBT (ms) for one decode step on ``decode_node``.
+
+    TBT depends only on the decode side: ``decode_base + bs * marginal``
+    where ``bs = len(decoding) + 1`` (the new request joins the batch).
+
+    Args:
+        decode_node: Node assigned for decode.
+
+    Returns:
+        One decode-step time in milliseconds.
+    """
+    return decode_node.estimate_decode_time(len(decode_node.decoding) + 1)
+
+
 @runtime_checkable
 class SchedulingPolicy(Protocol):
     """Pluggable scheduling strategy.
@@ -176,18 +273,23 @@ class SchedulingPolicy(Protocol):
     def schedule(
         self,
         request: Request,
-        nodes: Sequence[MockEngineNode],
+        prefill_nodes: Sequence[MockEngineNode],
+        decode_nodes: Sequence[MockEngineNode],
         cache: CacheQuery,
     ) -> SchedulingDecision:
-        """Decide where ``request`` should run.
+        """Decide where ``request`` should run under split P/D.
 
         Args:
             request: The incoming request.
-            nodes: Live cluster nodes. Provided in stable order so
+            prefill_nodes: Live prefill-pool nodes in stable order so
                 deterministic strategies (e.g. RoundRobin) can index
                 into it without sorting.
+            decode_nodes: Live decode-pool nodes in stable order. KV
+                cache and ``cache.lookup`` only know about decode-pool
+                nodes; cache-aware policies must therefore evaluate
+                ``matched_tokens`` against ``decode_nodes`` (not prefill).
             cache: Read-only handle for per-node prefix-hit details
-                and free-block counts.
+                and free-block counts. Tracks decode-pool nodes only.
 
         Returns:
             A :class:`SchedulingDecision`. To reject, return one with

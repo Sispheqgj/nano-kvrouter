@@ -25,6 +25,7 @@ MODEL = ModelConfig(
     marginal_decode_ms=1.0,
 )
 NODE_CFG = NodeConfig(capacity=8)
+BW_INF = BandwidthConfig(gpu_to_gpu=1e30)
 
 
 @pytest.fixture
@@ -67,7 +68,7 @@ def _make_request(token_ids: list[int], *, slo_ttft: float = 2000.0) -> Request:
 
 
 def _policy() -> E2Policy:
-    return E2Policy(model_config=MODEL)
+    return E2Policy(model_config=MODEL, bandwidth_config=BW_INF)
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +104,7 @@ def test_cold_start_picks_first_node_by_index(
 ) -> None:
     """Empty cache everywhere + equal load → min() stable → n0."""
     req = _make_request(list(range(64)))
-    dec = _policy().schedule(req, nodes, cm_large)
+    dec = _policy().schedule(req, nodes, nodes, cm_large)
     assert dec.prefill_node == "n0"
 
 
@@ -124,7 +125,7 @@ def test_load_dominates_when_cache_equal(
         nodes[2].admit(f"c{i}")
 
     req = _make_request(list(range(64)))
-    dec = _policy().schedule(req, nodes, cm_large)
+    dec = _policy().schedule(req, nodes, nodes, cm_large)
     assert dec.prefill_node == "n1"
 
 
@@ -136,11 +137,15 @@ def test_load_dominates_when_cache_equal(
 def test_cache_hit_reduces_run_cost(
     cm_large: CacheManager, nodes: list[MockEngineNode]
 ) -> None:
-    """n1 has 64 tokens cached; n0 and n2 are cold → n1 selected."""
+    """M5a: cache hit on n1 reduces e2_score → decode_node = n1.
+
+    Prefill_node is load-driven; with all loads at 0 it falls back to
+    node_id lex-order → n0.
+    """
     cm_large.admit(list(range(64)), "n1")  # 4 blocks fully cached on n1
     req = _make_request(list(range(64)))
-    dec = _policy().schedule(req, nodes, cm_large)
-    assert dec.prefill_node == "n1"
+    dec = _policy().schedule(req, nodes, nodes, cm_large)
+    assert dec.decode_node == "n1"
 
 
 # ---------------------------------------------------------------------------
@@ -157,8 +162,9 @@ def test_eviction_cost_penalises_full_node(
     assert cm.free_blocks("n0", "gpu") == 0
 
     req = _make_request(list(range(2000, 2064)))   # 4 blocks, no overlap with n0
-    dec = _policy().schedule(req, nodes[:2], cm)
-    assert dec.prefill_node == "n1"
+    dec = _policy().schedule(req, nodes[:2], nodes[:2], cm)
+    # M5a: eviction term lives on the decode pool — decode_node = n1.
+    assert dec.decode_node == "n1"
 
 
 # ---------------------------------------------------------------------------
@@ -173,10 +179,11 @@ def test_weight_w_run_zero_eviction_dominates(
     cm.admit(list(range(1600, 1664)), "n0")
     assert cm.free_blocks("n0", "gpu") == 0
 
-    policy = E2Policy(w_historical=1.0, w_eviction=10.0, w_run=0.0, model_config=MODEL)
+    policy = E2Policy(w_historical=1.0, w_eviction=10.0, w_run=0.0, model_config=MODEL, bandwidth_config=BW_INF)
     req = _make_request(list(range(2000, 2064)))
-    dec = policy.schedule(req, nodes[:2], cm)
-    assert dec.prefill_node == "n1"
+    dec = policy.schedule(req, nodes[:2], nodes[:2], cm)
+    # M5a: eviction term lives on the decode pool — decode_node = n1.
+    assert dec.decode_node == "n1"
 
 
 # ---------------------------------------------------------------------------
@@ -195,9 +202,9 @@ def test_weight_w_historical_high_makes_load_dominant(
     for i in range(4):
         nodes[2].admit(f"c{i}")   # n2: 4 running
 
-    policy = E2Policy(w_historical=1000.0, w_eviction=1.0, w_run=1.0, model_config=MODEL)
+    policy = E2Policy(w_historical=1000.0, w_eviction=1.0, w_run=1.0, model_config=MODEL, bandwidth_config=BW_INF)
     req = _make_request(list(range(64)))
-    dec = policy.schedule(req, nodes, cm_large)
+    dec = policy.schedule(req, nodes, nodes, cm_large)
     assert dec.prefill_node == "n1"
 
 
@@ -211,7 +218,7 @@ def test_does_not_early_reject_even_when_slo_exceeded(
 ) -> None:
     """E2Policy never rejects based on SLO; that belongs to MooncakeConductor."""
     req = _make_request(list(range(64)), slo_ttft=0.001)   # effectively 0 ms SLO
-    dec = _policy().schedule(req, nodes, cm_large)
+    dec = _policy().schedule(req, nodes, nodes, cm_large)
     assert not dec.is_rejected
     assert dec.prefill_node is not None
 
@@ -223,7 +230,7 @@ def test_does_not_early_reject_even_when_slo_exceeded(
 
 def test_empty_nodes_returns_rejection(cm_large: CacheManager) -> None:
     req = _make_request(list(range(64)))
-    dec = _policy().schedule(req, [], cm_large)
+    dec = _policy().schedule(req, [], [], cm_large)
     assert dec.is_rejected
     assert dec.reject_reason == "no_nodes_available"
     assert dec.prefill_node is None
@@ -235,13 +242,17 @@ def test_empty_nodes_returns_rejection(cm_large: CacheManager) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_prefill_node_equals_decode_node(
+def test_returns_separate_prefill_decode_nodes(
     cm_large: CacheManager, nodes: list[MockEngineNode]
 ) -> None:
+    """M5a: prefill_node (load-driven) may differ from decode_node (e2-driven)."""
+    cm_large.admit(list(range(64)), "n1")  # warm n1 cache
+    for i in range(3):
+        nodes[1].admit(f"r{i}")  # load n1
     req = _make_request(list(range(64)))
-    dec = _policy().schedule(req, nodes, cm_large)
-    assert dec.prefill_node == dec.decode_node
+    dec = _policy().schedule(req, nodes, nodes, cm_large)
     assert dec.prefill_node is not None
+    assert dec.decode_node is not None
 
 
 # ---------------------------------------------------------------------------
@@ -261,7 +272,7 @@ def test_ttft_reflects_cache_hit(
         nodes[1].admit(f"x{i}")
         nodes[2].admit(f"y{i}")
 
-    dec = _policy().schedule(req, nodes, cm_large)
+    dec = _policy().schedule(req, nodes, nodes, cm_large)
     assert dec.prefill_node == "n0"
     # M3: uncached=64, bs_hint=decoding+1=1; n_chunks=1 (64<512)
     # step_per_chunk = 512*0.1+5.0+1*1.0 = 57.2; first_tick = 5.0+1.0 = 6.0
@@ -291,9 +302,9 @@ def test_full_hit_node_at_capacity_not_eviction_penalised(
     cm.admit(list(range(64)), "n0")      # 4 blocks on n0; free_blocks → 0
     assert cm.free_blocks("n0", "gpu") == 0
 
-    policy = E2Policy(w_historical=0, w_eviction=2, w_run=1, model_config=MODEL)
+    policy = E2Policy(w_historical=0, w_eviction=2, w_run=1, model_config=MODEL, bandwidth_config=BW_INF)
     req = _make_request(list(range(64)))
-    dec = policy.schedule(req, nodes[:2], cm)
+    dec = policy.schedule(req, nodes[:2], nodes[:2], cm)
     # n0 is fully cached — no eviction needed — must be chosen over cold n1
     assert dec.prefill_node == "n0"
 
@@ -325,8 +336,8 @@ def test_first_tick_in_score_changes_choice(
         nodes[1].start_decode(f"load{i}")   # 7 active decode streams on n1
 
     req = _make_request(list(range(64)))
-    policy = E2Policy(w_historical=0, w_eviction=0, w_run=1, model_config=MODEL)
-    dec = policy.schedule(req, nodes[:2], cm_large)
+    policy = E2Policy(w_historical=0, w_eviction=0, w_run=1, model_config=MODEL, bandwidth_config=BW_INF)
+    dec = policy.schedule(req, nodes[:2], nodes[:2], cm_large)
     # n0 has lower first_tick (1 vs 8 concurrent decoders) → lower run_cost → wins
     assert dec.prefill_node == "n0", (
         f"Expected n0 (lower first_tick due to 0 decoding), got {dec.prefill_node}; "
@@ -350,7 +361,7 @@ def test_ttft_includes_chunked_prefill(
     est_ttft = 0 + 114.4 + 6.0 = 120.4 ms
     """
     req = _make_request(list(range(1024)))
-    dec = _policy().schedule(req, nodes[:1], cm_large)
+    dec = _policy().schedule(req, nodes[:1], nodes[:1], cm_large)
     assert not dec.is_rejected
     chunk = MODEL.prefill_chunk_size  # 512
     step_per_chunk = chunk * MODEL.prefill_cost_per_token_ms + MODEL.decode_base_ms + 1 * MODEL.marginal_decode_ms

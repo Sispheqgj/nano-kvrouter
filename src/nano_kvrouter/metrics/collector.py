@@ -22,16 +22,31 @@ class MetricsCollector:
         TTFT = TOKEN_GENERATED[step_index=0].time - ARRIVE.time
         TBT  = avg(TOKEN_GENERATED[i+1].time - TOKEN_GENERATED[i].time) for i >= 0
 
-    PREFILL_COMPLETE no longer participates in TTFT/TBT — its handler is
-    retained as a no-op extension point for future prefill-stage metrics.
+    PREFILL_COMPLETE no longer participates in TTFT/TBT — it now marks the
+    end of the prefill phase for the M5a ``dual_phase_tick_count`` counter.
+
+    M5a metrics
+    -----------
+    * ``kv_transfer_time_avg_ms``: mean of the ``cost_ms`` carried by every
+      ``KV_TRANSFER_COMPLETE`` event. Drives ``bandwidth.gpu_to_gpu`` /
+      ``model.kv_bytes_per_token`` sensitivity analysis.
+    * ``dual_phase_tick_count``: number of ``DECODE_BATCH_STEP`` events
+      that fired while at least one request anywhere in the cluster was in
+      the prefill phase AND at least one was in the decode phase. Replaces
+      the M3 ``prefill_decode_interleave_step_count`` (which was per-tick
+      same-node and went to 0 under always-split P/D).
 
     Event payload contract:
         REQUEST_ARRIVE:    {"request": Request}
         SCHEDULED:         {"request_id": str, "decision": SchedulingDecision,
                             "matched_tokens": int}
         REQUEST_REJECTED:  {"request_id": str, "reason": str}
-        PREFILL_COMPLETE:  {"request_id": str}                        # no-op
-        TOKEN_GENERATED:   {"request_id": str, "step_index": int}     # REQUIRED
+        PREFILL_START:     {"request_id": str, "n_chunks": int}
+        PREFILL_COMPLETE:  {"request_id": str}
+        KV_TRANSFER_START: {"transfer_id": str, "cost_ms": float, ...}  # debug only
+        KV_TRANSFER_COMPLETE: {"transfer_id": str, "cost_ms": float, ...}
+        TOKEN_GENERATED:   {"request_id": str, "step_index": int}
+        DECODE_BATCH_STEP: {"node_id": str, "batch_size": int}
         DECODE_COMPLETE:   {"request_id": str}
     """
 
@@ -54,12 +69,23 @@ class MetricsCollector:
         self._nodes: dict[str, MockEngineNode] = {}
         # M3 chunked-prefill metrics
         self._chunked_prefill_steps: list[int] = []   # n_chunks per completed request
-        self._interleave_step_count: int = 0           # batch steps with both prefill+decode
-        # Per-request n_chunks cache: populated by _on_prefill_start (reads from
-        # PREFILL_START payload injected at event-creation time in on_arrive),
-        # consumed by _on_decode_complete.  Attach-order independent because
-        # n_chunks is in the payload before any handler runs.
         self._request_n_chunks: dict[str, int] = {}
+
+        # M5a metrics
+        # KV transfer cost samples (one per KV_TRANSFER_COMPLETE event).
+        self._kv_transfer_cost_samples: list[float] = []
+        # transfer_ids seen via KV_TRANSFER_START; guards against stale
+        # KV_TRANSFER_COMPLETE events that arrive after cli drops the transfer.
+        self._seen_transfer_ids: set[str] = set()
+        # Lifecycle counters for cluster-wide dual-phase detection. A
+        # request enters _active_prefills at PREFILL_START and leaves at
+        # PREFILL_COMPLETE; it enters _active_decodes at first
+        # TOKEN_GENERATED (step_index=0) and leaves at DECODE_COMPLETE.
+        # ``dual_phase_tick_count`` is incremented on every
+        # DECODE_BATCH_STEP fired while both sets are non-empty.
+        self._active_prefills: set[str] = set()
+        self._active_decodes: set[str] = set()
+        self._dual_phase_tick_count: int = 0
 
     # ------------------------------------------------------------------
     # Public API
@@ -76,8 +102,7 @@ class MetricsCollector:
             engine: The simulation engine to subscribe to.
             nodes: Optional node registry used as a fallback in
                 ``_on_decode_batch_step`` when the event payload carries no
-                ``batch_size`` (i.e. when the collector handler is registered
-                before the simulator handler — reversed attach order).
+                ``batch_size`` (reversed attach order).
         """
         if nodes is not None:
             self._nodes = dict(nodes)
@@ -86,6 +111,8 @@ class MetricsCollector:
         engine.on(EventType.REQUEST_REJECTED, self._on_rejected)
         engine.on(EventType.PREFILL_START, self._on_prefill_start)
         engine.on(EventType.PREFILL_COMPLETE, self._on_prefill_complete)
+        engine.on(EventType.KV_TRANSFER_START, self._on_kv_transfer_start)
+        engine.on(EventType.KV_TRANSFER_COMPLETE, self._on_kv_transfer_complete)
         engine.on(EventType.TOKEN_GENERATED, self._on_decode_step)
         engine.on(EventType.DECODE_BATCH_STEP, self._on_decode_batch_step)
         engine.on(EventType.DECODE_COMPLETE, self._on_decode_complete)
@@ -116,7 +143,12 @@ class MetricsCollector:
                 statistics.mean(self._chunked_prefill_steps)
                 if self._chunked_prefill_steps else None
             ),
-            "prefill_decode_interleave_step_count": self._interleave_step_count,
+            # M5a metrics
+            "kv_transfer_time_avg_ms": (
+                statistics.mean(self._kv_transfer_cost_samples)
+                if self._kv_transfer_cost_samples else None
+            ),
+            "dual_phase_tick_count": self._dual_phase_tick_count,
         }
 
     # ------------------------------------------------------------------
@@ -140,6 +172,7 @@ class MetricsCollector:
             "slo_tbt": req.slo_tbt,
             "matched_tokens": None,
             "prefill_node": None,
+            "decode_node": None,
             "ttft": None,
         }
 
@@ -155,6 +188,7 @@ class MetricsCollector:
         decision = event.payload.get("decision")
         if decision is not None:
             rec["prefill_node"] = getattr(decision, "prefill_node", None)
+            rec["decode_node"] = getattr(decision, "decode_node", None)
 
     def _on_rejected(self, event: Event, engine: SimulationEngine) -> None:
         request_id = event.payload.get("request_id")
@@ -162,29 +196,52 @@ class MetricsCollector:
             logger.warning("REQUEST_REJECTED payload missing 'request_id', skipping")
             return
         self._rejected_count += 1
+        # Clean up lifecycle state set by PREFILL_START (B2 mid-prefill reject
+        # path). No-ops for B1 rejects that fire before PREFILL_START.
+        self._request_n_chunks.pop(request_id, None)
+        self._active_prefills.discard(request_id)
 
     def _on_prefill_start(self, event: Event, engine: SimulationEngine) -> None:
-        """Cache per-request n_chunks from the PREFILL_START payload.
+        """Cache n_chunks + enter the active-prefills set (M5a lifecycle counter).
 
-        n_chunks is injected into the event at creation time (in cli.on_arrive),
-        so this handler reads the correct value regardless of whether it runs
-        before or after the cli PREFILL_START handler (attach-order independent).
+        The n_chunks field is injected by cli at event-creation time so this
+        handler reads the correct value regardless of attach order.
         """
         request_id = event.payload.get("request_id")
         if request_id is None:
             return
         n_chunks = event.payload.get("n_chunks", 0)
         self._request_n_chunks[request_id] = int(n_chunks)
+        self._active_prefills.add(request_id)
 
     def _on_prefill_complete(self, event: Event, engine: SimulationEngine) -> None:
-        """No-op in v2 — TTFT is measured at first TOKEN_GENERATED, not at
-        prefill completion. Handler retained for future prefill-stage metrics
-        (e.g. prefill duration histogram) without forcing an attach() change.
-        """
+        """Exit the active-prefills set (M5a lifecycle counter)."""
+        request_id = event.payload.get("request_id")
+        if request_id is None:
+            return
+        self._active_prefills.discard(request_id)
+
+    def _on_kv_transfer_start(self, event: Event, engine: SimulationEngine) -> None:
+        """Track transfer_id so KV_TRANSFER_COMPLETE can detect stale events."""
+        tid = event.payload.get("transfer_id")
+        if tid is not None:
+            self._seen_transfer_ids.add(tid)
         logger.debug(
-            "prefill_complete: request_id=%s (no-op in v2)",
-            event.payload.get("request_id"),
+            "KV_TRANSFER_START transfer_id=%s cost=%.3fms",
+            tid,
+            event.payload.get("cost_ms", 0.0),
         )
+
+    def _on_kv_transfer_complete(self, event: Event, engine: SimulationEngine) -> None:
+        """Sample one KV transfer cost — drives kv_transfer_time_avg_ms."""
+        tid = event.payload.get("transfer_id")
+        if tid is None or tid not in self._seen_transfer_ids:
+            return  # stale / unknown, silently drop
+        self._seen_transfer_ids.discard(tid)
+        cost_ms = event.payload.get("cost_ms")
+        if cost_ms is None:
+            return
+        self._kv_transfer_cost_samples.append(float(cost_ms))
 
     def _on_decode_step(self, event: Event, engine: SimulationEngine) -> None:
         request_id = event.payload.get("request_id")
@@ -204,22 +261,19 @@ class MetricsCollector:
 
         if step_index == 0:
             if rec.get("ttft") is not None:
-                # Duplicate step 0 — entire branch skipped (TTFT not double-counted,
-                # TBT anchor not reset, prevents post-duplicate TBT distortion).
                 logger.debug("duplicate step_index=0 for request_id=%s, skipping", request_id)
                 return
             ttft = event.time - rec["arrival_time"]
             rec["ttft"] = ttft
             self._ttft_per_request.append(ttft)
-            # Seed TBT reference; subsequent steps compute (current - last).
             self._last_decode_step_time[request_id] = event.time
             self._tbt_samples.setdefault(request_id, [])
+            self._active_decodes.add(request_id)
             return
 
         # step_index >= 1: TBT = gap since previous step.
         last = self._last_decode_step_time.get(request_id)
         if last is None:
-            # step_index >= 1 arrived before step 0 — defensive fallback.
             logger.warning(
                 "TOKEN_GENERATED request_id=%s step_index=%d arrived before step 0; "
                 "TBT skipped",
@@ -234,24 +288,17 @@ class MetricsCollector:
         self._last_decode_step_time[request_id] = event.time
 
     def _on_decode_batch_step(self, event: Event, engine: SimulationEngine) -> None:
-        """Accumulate batch-level decode metrics from DECODE_BATCH_STEP events.
+        """Accumulate batch_size + cluster dual-phase counter (M5a).
 
-        Both ``batch_size`` and ``interleave`` use the same payload-with-fallback
-        pattern (M2.fix4 / M3.fix2) for attach-order independence:
+        ``batch_size`` uses the payload-with-fallback pattern (M2.fix4) for
+        attach-order independence.
 
-        ``batch_size``: the pre-tick decode stream count injected by the cli handler
-        at execute time. Fallback: ``len(node.decoding)`` (same pre-tick value).
-
-        ``interleave``: True when a prefill chunk was piggybacked with at least one
-        decode stream this step. Injected by the cli handler at execute time
-        (``bs > 0 and bool(node._prefill_remaining)``). Fallback: same expression
-        read directly from node (pre-tick state is the same regardless of handler
-        order, because tick_batch_step hasn't run yet in the reversed-order case).
-
-        Pre-injection at schedule time (old approach) was unreliable because
-        DECODE_COMPLETE can promote a request between schedule and execute time,
-        adding a new entry to ``_prefill_remaining`` that the schedule-time
-        ``will_interleave`` did not see.
+        ``dual_phase_tick_count`` is incremented whenever this tick fires
+        while there is at least one request in the prefill phase AND at
+        least one in the decode phase anywhere in the cluster. Replaces
+        the M3 per-tick same-node ``interleave`` semantic (which went to
+        zero under always-split P/D since a prefill_node never has decode
+        and a decode_node never has prefill).
         """
         node_id = event.payload.get("node_id")
         node = self._nodes.get(node_id) if node_id else None
@@ -264,13 +311,8 @@ class MetricsCollector:
         self._batch_size_samples.append(int(batch_size))
         self._total_decode_tokens += int(batch_size)
 
-        # Interleave: read from payload (injected at execute time by cli handler);
-        # if absent (reversed attach order), derive from node pre-tick state.
-        interleave = event.payload.get("interleave")
-        if interleave is None and node is not None:
-            interleave = len(node.decoding) > 0 and bool(node._prefill_remaining)
-        if interleave:
-            self._interleave_step_count += 1
+        if self._active_prefills and self._active_decodes:
+            self._dual_phase_tick_count += 1
 
     def _on_decode_complete(self, event: Event, engine: SimulationEngine) -> None:
         request_id = event.payload.get("request_id")
@@ -285,12 +327,12 @@ class MetricsCollector:
 
         self._e2e_per_request.append(event.time - rec["arrival_time"])
 
-        # Read n_chunks from the internal cache populated by _on_prefill_start,
-        # not from event.payload (which may be absent in reversed-attach scenarios).
         n_chunks = self._request_n_chunks.pop(request_id, None)
         if n_chunks is not None:
             self._chunked_prefill_steps.append(n_chunks)
 
+        # Exit the active-decodes set (M5a lifecycle counter).
+        self._active_decodes.discard(request_id)
 
     # ------------------------------------------------------------------
     # Private stat helpers

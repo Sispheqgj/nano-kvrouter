@@ -13,22 +13,16 @@ logger = logging.getLogger(__name__)
 class ClusterConfig(BaseModel):
     """Cluster topology: how many prefill / decode mock nodes to spin up.
 
-    NOTE (v1): ``decode_nodes`` is currently DEAD. ``cli.py`` builds only
-    ``prefill_nodes``-many ``MockEngineNode`` instances and every scheduler
-    hard-codes ``decode_node == prefill_node``. Real P/D separation lands
-    in P2-Infra M5.
+    M5a (LIVE): ``cli.py`` builds two separate ``MockEngineNode`` pools
+    (``p{i}`` prefill / ``d{i}`` decode) and the scheduler returns
+    independent ``prefill_node`` / ``decode_node`` IDs. KV cache lives
+    only on the decode pool.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     prefill_nodes: int = Field(default=4, ge=1)
-    decode_nodes: int = Field(
-        default=4,
-        ge=1,
-        description="DEAD until P2-Infra M5. cli.py currently builds only "
-                    "prefill_nodes-many MockEngineNodes and all schedulers "
-                    "force decode_node == prefill_node.",
-    )
+    decode_nodes: int = Field(default=4, ge=1)
 
 
 class NodeConfig(BaseModel):
@@ -62,9 +56,9 @@ class ModelConfig(BaseModel):
     kv_bytes_per_token: int = Field(
         default=512,
         ge=1,
-        description="DEAD until P2-Infra M5. Will drive KV transfer time "
+        description="LIVE in P2-Infra M5a. Drives KV transfer time "
                     "(prompt_len * kv_bytes_per_token / bandwidth.gpu_to_gpu) "
-                    "once P/D separation lands.",
+                    "for the post-prefill KV migration in split P/D.",
     )
     prefill_cost_per_token_ms: float = Field(default=0.033, gt=0)
     decode_base_ms: float = Field(default=5.0, gt=0)
@@ -81,11 +75,10 @@ class ModelConfig(BaseModel):
 class BandwidthConfig(BaseModel):
     """Inter-tier transfer bandwidths in bytes/second.
 
-    NOTE (v1): ALL THREE fields are currently DEAD. No scheduler or engine
-    code reads them. They will be activated in:
-      - P2-Infra M5: ``gpu_to_gpu`` for P/D KV transfer cost
-      - P2-Infra M6: ``gpu_to_cpu`` / ``cpu_to_disk`` for HiCache tier
-        promotion / demotion latency
+    Activation status:
+      - M5a (LIVE): ``gpu_to_gpu`` drives KV transfer cost for P/D split.
+      - P2-Infra M6 (DEAD): ``gpu_to_cpu`` / ``cpu_to_disk`` for HiCache tier
+        promotion / demotion latency.
 
     Defaults approximate A100-class hardware: NVLink GPU↔GPU, PCIe Gen4
     GPU↔CPU, NVMe CPU↔Disk.
@@ -95,7 +88,8 @@ class BandwidthConfig(BaseModel):
 
     gpu_to_gpu: float = Field(
         default=300e9, gt=0,
-        description="DEAD until P2-Infra M5. Will set KV transfer cost for P/D disaggregation.",
+        description="LIVE in M5a. KV transfer cost for split P/D = "
+                    "(prompt_len * kv_bytes_per_token / gpu_to_gpu) * 1000 ms.",
     )
     gpu_to_cpu: float = Field(
         default=32e9, gt=0,

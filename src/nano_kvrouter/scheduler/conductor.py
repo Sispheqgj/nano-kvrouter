@@ -1,18 +1,32 @@
 """Mooncake Conductor scheduler (FAST'25 Best Paper §4).
 
-Three-objective scoring + SLO early rejection.  Routes each request to the
-node that maximises a composite score, then immediately rejects the request
-if even the best node cannot satisfy the SLO targets.
+M5a split P/D: three-objective scoring over the decode pool +
+SLO early rejection. Prefill_node is selected independently by lowest
+``current_load()`` because the prefill side has no cache state in M5a.
+
+    score(decode_node) = α × cache_benefit(decode_node)
+                       − β × load_penalty(decode_node)
+                       − γ × transfer_penalty(decode_node)
+
+In M5a ``transfer_penalty`` is still always ``0.0`` (the CacheLookup
+field is unused on decode side because KV is already there). M5b will
+attach a KV-transfer penalty term keyed on ``bandwidth.gpu_to_gpu``.
 """
 from __future__ import annotations
 
 import logging
 from typing import Sequence
 
-from nano_kvrouter.config import ModelConfig
+from nano_kvrouter.config import BandwidthConfig, ModelConfig
 from nano_kvrouter.engine.mock_node import MockEngineNode
 from nano_kvrouter.request import Request
-from nano_kvrouter.scheduler.base import CacheQuery, SchedulingDecision
+from nano_kvrouter.scheduler.base import (
+    CacheLookup,
+    CacheQuery,
+    SchedulingDecision,
+    compute_est_tbt,
+    compute_est_ttft,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -20,44 +34,21 @@ __all__ = ["MooncakeConductor"]
 
 
 class MooncakeConductor:
-    """Mooncake Conductor scheduler (Mooncake FAST'25 Best Paper, §4).
+    """Mooncake Conductor scheduler (FAST'25 Best Paper §4) — split P/D.
 
-    Selects the node that maximises a three-objective score, then applies
-    SLO early rejection based on the selected node's predicted TTFT / TBT:
-
-        score(node) = α × cache_benefit(node)
-                    − β × load_penalty(node)
-                    − γ × transfer_penalty(node)
-
-    where:
-
-    * ``cache_benefit(n) = matched_tokens × prefill_cost_per_token_ms``
-      — reusable computation; larger is better.
-    * ``load_penalty(n)  = current_load() × prompt_len × prefill_cost_per_token_ms
-                           + queue_wait_time(prompt_len, expected_output_len)``
-      — scheduling pressure from existing traffic; smaller is better.
-    * ``transfer_penalty(n) = CacheLookup.transfer_cost_ms``
-      — cost of migrating KV blocks across tiers / nodes to this node.
-      **Always 0.0 in v1 (GPU-only).**  The γ parameter is retained for
-      forward compatibility when multi-tier v2 is introduced.
-
-    **SLO early rejection (design choice 6A)**:
-
-    1. Choose ``chosen = max(nodes, key=score)`` — the globally best node.
-    2. Compute ``est_ttft`` and ``est_tbt`` for *that* node.
-    3. If either prediction exceeds the request's SLO, reject immediately.
-       No fallback to another node is attempted (design choice 6A) — the
-       request is rejected even if an alternative node could serve it.
-
-    Rejection carries ``estimated_ttft_ms`` / ``estimated_tbt_ms`` set to
-    the actual predicted values (not 0) so ``MetricsCollector`` can record
-    the *reason* for rejection and track SLO violation magnitudes.
+    Selects the decode_node that maximises a three-objective score and
+    applies SLO early rejection based on the chosen-node prediction.
 
     Design notes:
-        * ``prefill_node == decode_node`` (combined deployment, no P/D split).
-        * ``transfer_penalty`` is always 0 in v1; γ does not affect routing.
-        * Ties in score broken by position in the *nodes* sequence (Python's
-          ``max()`` returns the first element with the maximum value).
+        * **SLO 6A**: rejection is based on the single max-score
+          decode_node; no fallback to alternates.
+        * **Prefill_node**: lowest ``current_load()`` — independent of
+          decode scoring in M5a.
+        * **Ties**: ``(−score, node_id)`` so ties resolve by node_id
+          deterministically.
+        * **transfer_penalty == 0 in M5a**: KV lives on decode side,
+          so γ × transfer_cost = 0. M5b will introduce a cross-pool
+          KV transfer penalty.
     """
 
     def __init__(
@@ -67,25 +58,8 @@ class MooncakeConductor:
         gamma: float = 1.0,
         *,
         model_config: ModelConfig | None = None,
+        bandwidth_config: BandwidthConfig | None = None,
     ) -> None:
-        """Create a MooncakeConductor.
-
-        Args:
-            alpha: Weight on the cache_benefit term. Higher values give
-                stronger preference to nodes with warm prefix cache.
-            beta: Weight on the load_penalty term. Higher values give
-                stronger preference to lightly loaded nodes.
-            gamma: Weight on the transfer_penalty term. In v1 GPU-only
-                mode this term is always 0 because
-                ``CacheLookup.transfer_cost_ms`` is 0; the parameter is
-                kept for forward compatibility with multi-tier v2.
-            model_config: Source of ``prefill_cost_per_token_ms`` for the
-                cache_benefit and load_penalty terms.  Defaults to
-                ``ModelConfig()`` (default constants) when ``None``.
-
-        Raises:
-            ValueError: If any weight (alpha, beta, gamma) is negative.
-        """
         if alpha < 0 or beta < 0 or gamma < 0:
             raise ValueError(
                 f"Weights must be non-negative; got alpha={alpha}, beta={beta}, gamma={gamma}"
@@ -94,31 +68,16 @@ class MooncakeConductor:
         self._beta = beta
         self._gamma = gamma
         self._model_cfg = model_config if model_config is not None else ModelConfig()
+        self._bw_cfg = bandwidth_config if bandwidth_config is not None else BandwidthConfig()
 
     def schedule(
         self,
         request: Request,
-        nodes: Sequence[MockEngineNode],
+        prefill_nodes: Sequence[MockEngineNode],
+        decode_nodes: Sequence[MockEngineNode],
         cache: CacheQuery,
     ) -> SchedulingDecision:
-        """Select the highest-scoring node, then apply SLO early rejection.
-
-        Args:
-            request: The incoming request. ``slo_ttft`` and ``slo_tbt`` are
-                used for the post-selection rejection check.
-            nodes: Live cluster nodes in stable order. Empty sequence →
-                immediate rejection with ``"no_nodes_available"``.
-            cache: Read-only handle for per-node prefix-hit details and
-                transfer costs.
-
-        Returns:
-            :class:`~nano_kvrouter.scheduler.base.SchedulingDecision` with
-            ``prefill_node == decode_node`` on acceptance.  On rejection,
-            ``prefill_node`` and ``decode_node`` are ``None`` but
-            ``estimated_ttft_ms`` / ``estimated_tbt_ms`` carry the
-            predicted values for diagnostic accounting.
-        """
-        if not nodes:
+        if not prefill_nodes or not decode_nodes:
             return SchedulingDecision(
                 prefill_node=None,
                 decode_node=None,
@@ -131,40 +90,40 @@ class MooncakeConductor:
         prompt_len = len(request.token_ids)
         ppt = self._model_cfg.prefill_cost_per_token_ms
 
-        def score(n: MockEngineNode) -> float:
-            matched = lookups[n.node_id].matched_tokens
+        # prefill_node: load-only (M5a; cache lives on decode).
+        prefill = min(prefill_nodes, key=lambda n: (n.current_load(), n.node_id))
+
+        def score_key(decode: MockEngineNode) -> tuple[float, str]:
+            match = lookups.get(decode.node_id, CacheLookup(0, {}, 0.0))
+            matched = match.matched_tokens
             cache_benefit = matched * ppt
-            load_penalty = n.current_load() * prompt_len * ppt + n.queue_wait_time(prompt_len, request.expected_output_len)
-            transfer_penalty = lookups[n.node_id].transfer_cost_ms
-            return (
+            load_penalty = (
+                decode.current_load() * prompt_len * ppt
+                + decode.queue_wait_time(prompt_len, request.expected_output_len)
+            )
+            transfer_penalty = match.transfer_cost_ms  # 0 in M5a
+            score = (
                 self._alpha * cache_benefit
                 - self._beta * load_penalty
                 - self._gamma * transfer_penalty
             )
+            # min on (-score, node_id) so higher score wins; ties resolve by node_id.
+            return (-score, decode.node_id)
 
-        # max() is stable: ties → first node in the sequence (by index).
-        chosen = max(nodes, key=score)
+        decode = min(decode_nodes, key=score_key)
+        decode_match = lookups.get(decode.node_id, CacheLookup(0, {}, 0.0))
 
-        chosen_matched = lookups[chosen.node_id].matched_tokens
-        # M3 chunked-prefill TTFT formula:
-        #   est_ttft = queue_wait + n_chunks * step_per_chunk + first_decode_tick
-        # bs_hint uses decoding (not running) because only actively-decoding streams
-        # contribute to piggyback step cost during this request's prefill phase.
-        bs_hint = len(chosen.decoding) + 1
-        prefill_phase_ms = chosen.estimate_prefill_time(
-            prompt_len, cached_tokens=chosen_matched, batch_size_hint=bs_hint
+        est_ttft = compute_est_ttft(
+            prefill,
+            decode,
+            request,
+            decode_match,
+            kv_bytes_per_token=self._model_cfg.kv_bytes_per_token,
+            bandwidth_bytes_per_s=self._bw_cfg.gpu_to_gpu,
         )
-        first_tick_ms = chosen.estimate_decode_time(bs_hint)
-        est_ttft = (
-            chosen.queue_wait_time(prompt_len, request.expected_output_len)
-            + prefill_phase_ms
-            + first_tick_ms
-        )
-        # TBT uses running+1 (all running requests will eventually decode together).
-        est_tbt = chosen.estimate_decode_time(len(chosen.running_requests) + 1)
+        est_tbt = compute_est_tbt(decode)
 
-        # SLO early rejection (design 6A): based on the best node only —
-        # no fallback to other nodes even if they could serve the request.
+        # SLO early rejection (design 6A) — based on the chosen decode pair.
         if est_ttft > request.slo_ttft:
             logger.debug(
                 "Conductor: reject %s ttft=%.1f > slo=%.1f",
@@ -191,17 +150,17 @@ class MooncakeConductor:
             )
 
         logger.debug(
-            "Conductor: request %s → node %s (score=%.3f, matched=%d/%d)",
+            "Conductor: request %s → prefill=%s decode=%s (matched=%d/%d)",
             request.request_id,
-            chosen.node_id,
-            score(chosen),
-            chosen_matched,
+            prefill.node_id,
+            decode.node_id,
+            decode_match.matched_tokens,
             prompt_len,
         )
 
         return SchedulingDecision(
-            prefill_node=chosen.node_id,
-            decode_node=chosen.node_id,
+            prefill_node=prefill.node_id,
+            decode_node=decode.node_id,
             estimated_ttft_ms=est_ttft,
             estimated_tbt_ms=est_tbt,
         )

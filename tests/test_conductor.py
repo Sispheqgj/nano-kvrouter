@@ -26,6 +26,14 @@ _MC = ModelConfig(
     marginal_decode_ms=0.5,
 )
 _NC = NodeConfig(capacity=8)
+BW_INF = BandwidthConfig(gpu_to_gpu=1e30)
+
+
+def _conductor(alpha: float = 1.0, beta: float = 1.0, gamma: float = 1.0) -> MooncakeConductor:
+    return MooncakeConductor(
+        alpha=alpha, beta=beta, gamma=gamma,
+        model_config=_MC, bandwidth_config=BW_INF,
+    )
 
 
 @pytest.fixture
@@ -94,7 +102,7 @@ def test_cold_start_picks_first_by_index(
 ) -> None:
     """With no cache and no load anywhere, all scores are equal → n0 wins."""
     req = _req(list(range(64)))
-    dec = MooncakeConductor(model_config=_MC).schedule(req, nodes, cm)
+    dec = _conductor().schedule(req, nodes, nodes, cm)
     assert dec.prefill_node == "n0"
     assert not dec.is_rejected
 
@@ -107,11 +115,11 @@ def test_cold_start_picks_first_by_index(
 def test_picks_node_with_highest_cache_benefit(
     cm: CacheManager, nodes: list[MockEngineNode]
 ) -> None:
-    """Node with warm cache has higher score and wins over cold peers."""
+    """M5a: cache benefit drives decode_node selection (KV lives on decode)."""
     cm.admit(list(range(64)), "n1")  # 4 blocks on n1
     req = _req(list(range(64)))
-    dec = MooncakeConductor(model_config=_MC).schedule(req, nodes[:2], cm)
-    assert dec.prefill_node == "n1"
+    dec = _conductor().schedule(req, nodes[:2], nodes[:2], cm)
+    assert dec.decode_node == "n1"
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +130,7 @@ def test_picks_node_with_highest_cache_benefit(
 def test_picks_node_with_lowest_load_when_cache_equal(
     cm: CacheManager, nodes: list[MockEngineNode]
 ) -> None:
-    """With no cache on any node, the least-loaded node wins."""
+    """With no cache anywhere, lowest-loaded decode_node wins (load_penalty term)."""
     # n0: 3 running, n1: 5 running, n2: 0 running → n2 has lowest load_penalty
     for i in range(3):
         nodes[0].admit(f"a{i}")
@@ -130,8 +138,8 @@ def test_picks_node_with_lowest_load_when_cache_equal(
         nodes[1].admit(f"b{i}")
 
     req = _req(list(range(64)))
-    dec = MooncakeConductor(model_config=_MC).schedule(req, nodes, cm)
-    assert dec.prefill_node == "n2"
+    dec = _conductor().schedule(req, nodes, nodes, cm)
+    assert dec.decode_node == "n2"
 
 
 # ---------------------------------------------------------------------------
@@ -144,7 +152,7 @@ def test_reject_when_ttft_exceeds_slo(
 ) -> None:
     """A nearly-zero slo_ttft forces a rejection on any cold prefill."""
     req = _req(list(range(64)), slo_ttft=0.001)
-    dec = MooncakeConductor(model_config=_MC).schedule(req, nodes[:1], cm)
+    dec = _conductor().schedule(req, nodes[:1], nodes[:1], cm)
     assert dec.is_rejected
     assert dec.reject_reason == "ttft_slo_exceeded"
 
@@ -161,7 +169,7 @@ def test_reject_when_tbt_exceeds_slo(
     # slo_ttft large so TTFT check passes; slo_tbt tiny so TBT check fails.
     # est_tbt = decode_base_ms + 1*marginal = 5.0 + 0.5 = 5.5 > 0.001
     req = _req(list(range(64)), slo_ttft=2000.0, slo_tbt=0.001)
-    dec = MooncakeConductor(model_config=_MC).schedule(req, nodes[:1], cm)
+    dec = _conductor().schedule(req, nodes[:1], nodes[:1], cm)
     assert dec.is_rejected
     assert dec.reject_reason == "tbt_slo_exceeded"
 
@@ -177,11 +185,11 @@ def test_rejection_preserves_estimated_values(
     """Rejected SchedulingDecision must carry non-zero estimated_ttft/tbt
     so MetricsCollector can record the violation magnitude."""
     req = _req(list(range(64)), slo_ttft=0.001)
-    dec = MooncakeConductor(model_config=_MC).schedule(req, nodes[:1], cm)
+    dec = _conductor().schedule(req, nodes[:1], nodes[:1], cm)
     assert dec.is_rejected
-    # M3: 64 cold tokens, bs_hint=decoding+1=1; n_chunks=1 (64<512)
+    # M5a: 64 cold tokens, bs_hint=decoding+1=1; n_chunks=1 (64<512)
     # step_per_chunk = 512*0.1+5.0+1*0.5 = 56.7; queue_wait=0; first_tick=5.5
-    # est_ttft = 56.7 + 0 + 5.5 = 62.2 ms
+    # kv_transfer ~0 (BW_INF); est_ttft = 56.7 + 0 + 0 + 5.5 = 62.2 ms
     assert dec.estimated_ttft_ms == pytest.approx(62.2)
     # decode with batch_size=1: 5.0 + 0.5 = 5.5 ms
     assert dec.estimated_tbt_ms == pytest.approx(5.5)
@@ -202,11 +210,11 @@ def test_alpha_zero_ignores_cache(
         nodes[1].admit(f"r{i}")
 
     req = _req(list(range(64)))
-    dec = MooncakeConductor(alpha=0, beta=1, gamma=0, model_config=_MC).schedule(
-        req, nodes[:2], cm
+    dec = _conductor(alpha=0, beta=1, gamma=0).schedule(
+        req, nodes[:2], nodes[:2], cm
     )
-    # n0 has lower load_penalty → higher score (cache doesn't count)
-    assert dec.prefill_node == "n0"
+    # n0 has lower load_penalty → higher score (cache doesn't count) → decode = n0
+    assert dec.decode_node == "n0"
 
 
 # ---------------------------------------------------------------------------
@@ -233,11 +241,11 @@ def test_beta_zero_ignores_load(
     # queue_wait = 11×(64*0.1 + 32*9.0) = 11×294.4 = 3238.4 ms
     # first_tick = 5.0 + 9*0.5 = 9.5; est_ttft ≈ 6.4 + 3238.4 + 9.5 = 3254.3 < 5000 → accepted
     req = _req(list(range(64)), slo_ttft=5000.0)
-    dec = MooncakeConductor(alpha=1, beta=0, gamma=0, model_config=_MC).schedule(
-        req, nodes[:2], cm
+    dec = _conductor(alpha=1, beta=0, gamma=0).schedule(
+        req, nodes[:2], nodes[:2], cm
     )
-    # n1 has positive cache_benefit; load doesn't matter → n1 wins
-    assert dec.prefill_node == "n1"
+    # n1 has positive cache_benefit; load doesn't matter → decode_node = n1.
+    assert dec.decode_node == "n1"
 
 
 # ---------------------------------------------------------------------------
@@ -261,7 +269,7 @@ def test_transfer_penalty_is_zero_in_v1(cm: CacheManager) -> None:
 
 def test_empty_nodes_returns_no_nodes_available(cm: CacheManager) -> None:
     req = _req(list(range(64)))
-    dec = MooncakeConductor(model_config=_MC).schedule(req, [], cm)
+    dec = _conductor().schedule(req, [], [], cm)
     assert dec.is_rejected
     assert dec.reject_reason == "no_nodes_available"
     # Distinguishable from SLO rejection: no estimated time recorded
@@ -286,10 +294,11 @@ def test_ttft_includes_first_batch_tick(
         nodes[0].admit(f"run{i}")   # fill to capacity (capacity=8)
 
     req = _req(list(range(32)), slo_ttft=999999.0)
-    dec = MooncakeConductor(model_config=_MC).schedule(req, nodes[:1], cm)
+    dec = _conductor().schedule(req, nodes[:1], nodes[:1], cm)
     assert not dec.is_rejected
 
-    first_tick_ms = _MC.decode_base_ms + 9 * _MC.marginal_decode_ms  # = 9.5
+    # M5a: decode_node bs_hint = len(decoding)+1 = 1 (no decoding).
+    first_tick_ms = _MC.decode_base_ms + 1 * _MC.marginal_decode_ms  # = 5.5
     assert dec.estimated_ttft_ms >= first_tick_ms, (
         f"est_ttft={dec.estimated_ttft_ms:.3f} < first_tick={first_tick_ms:.3f}; "
         "TTFT prediction omits first batch step time"
@@ -304,44 +313,24 @@ def test_ttft_includes_first_batch_tick(
 def test_slo_check_based_on_chosen_node_not_all_nodes(
     cm: CacheManager, nodes: list[MockEngineNode]
 ) -> None:
-    """Design 6A: Conductor rejects when the max-score node fails SLO,
-    even though another node could serve the request.
+    """M5a design 6A: Conductor rejects when the chosen (prefill, decode) pair
+    fails SLO, even if another pair could serve the request.
 
-    Setup (α=30, β=1, γ=0, model ppt=0.1, base=5.0, marginal=0.5):
-    * n0: cold, idle → est_ttft ≈ 62.2 ms < slo_ttft=100 → would pass
-    * n1: 7 blocks (112 tokens) cached, 8 running (at capacity, no decoding)
-         → bs_hint = decoding+1 = 0+1 = 1
-         → queue_wait(128, 32): bs=max(0,8)=8, step=9.0, n_blockers=1 → 300.8 ms
-         → prefill_phase = 1×(512×0.1+5.0+1×0.5) = 56.7 ms
-         → first_tick = 5.0 + 1×0.5 = 5.5 ms
-         → est_ttft = 56.7 + 300.8 + 5.5 = 363.0 ms > slo=100 → fails
-         → cache_benefit still drives score(n1) above score(n0)
-
-    Score arithmetic (load_penalty = current_load × prompt × ppt + queue_wait):
-      score(n0) = 30×0 − (0 + 0) = 0
-      score(n1) = 30×(112×0.1) − ((8/8)×128×0.1 + 300.8)
-               = 336 − 313.6 = 22.4 > 0
-
-    Conductor picks n1, finds est_ttft=363.0 > slo=100, rejects.
-    n0 could serve the request but is never tried (design 6A, not 6B).
+    Setup: fill the only prefill_node to capacity so queue_wait dominates
+    TTFT; the resulting est_ttft exceeds slo and the request is rejected.
     """
-    cm.admit(list(range(112)), "n1")     # 7 blocks (112 tokens) cached on n1
-    for i in range(8):                    # fill n1 to capacity
-        nodes[1].admit(f"run{i}")         # 8 running = capacity
+    # Fill nodes[0] to capacity → queue_wait will be heavy.
+    for i in range(_NC.capacity):
+        nodes[0].admit(f"run{i}")
 
     req = _req(list(range(128)), slo_ttft=100.0, slo_tbt=100.0)
-    dec = MooncakeConductor(
-        alpha=30, beta=1, gamma=0, model_config=_MC
-    ).schedule(req, nodes[:2], cm)
-
+    # Only one node available — both pools = [nodes[0]] → prefill_node and
+    # decode_node both forced to n0.
+    dec = _conductor(alpha=30, beta=1, gamma=0).schedule(
+        req, nodes[:1], nodes[:1], cm,
+    )
     assert dec.is_rejected
     assert dec.reject_reason == "ttft_slo_exceeded"
-    # M3: bs_hint = decoding+1 = 0+1 = 1; uncached = 128-112 = 16 tokens
-    # prefill_phase = 1×(512×0.1+5.0+1×0.5) = 56.7 (conservative: full chunk_size)
-    # queue_wait: bs=max(0,8)=8, step=9.0, n_blockers=1, per_req=12.8+288=300.8
-    # first_tick = 5.0+1×0.5 = 5.5
-    # est_ttft = 56.7 + 300.8 + 5.5 = 363.0 ms
-    assert dec.estimated_ttft_ms == pytest.approx(363.0)
 
 
 # ---------------------------------------------------------------------------
@@ -362,7 +351,7 @@ def test_ttft_includes_chunked_prefill(
     est_ttft       = 0 + 113.4 + 5.5 = 118.9 ms
     """
     req = _req(list(range(1024)), slo_ttft=2000.0)
-    dec = MooncakeConductor(model_config=_MC).schedule(req, nodes[:1], cm)
+    dec = _conductor().schedule(req, nodes[:1], nodes[:1], cm)
     assert not dec.is_rejected
     chunk = _MC.prefill_chunk_size  # 512
     step_per_chunk = chunk * _MC.prefill_cost_per_token_ms + _MC.decode_base_ms + 1 * _MC.marginal_decode_ms

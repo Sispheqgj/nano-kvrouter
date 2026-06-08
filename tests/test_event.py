@@ -13,13 +13,15 @@ from nano_kvrouter.simulator.event import Event, EventType
 # ---------------------------------------------------------------------------
 
 
-def test_event_type_has_m2_set() -> None:
-    """M2 event set: 8 types — DECODE_BATCH_STEP added for batch decode pipeline."""
+def test_event_type_has_m5a_set() -> None:
+    """M5a event set: 10 types — adds KV_TRANSFER_START/COMPLETE for split P/D."""
     assert {e.name for e in EventType} == {
         "REQUEST_ARRIVE",
         "SCHEDULED",
         "PREFILL_START",
         "PREFILL_COMPLETE",
+        "KV_TRANSFER_START",
+        "KV_TRANSFER_COMPLETE",
         "TOKEN_GENERATED",
         "DECODE_BATCH_STEP",
         "DECODE_COMPLETE",

@@ -13,9 +13,10 @@ nodes, and metrics collectors at startup.
 
 Design notes
 ------------
-* **Event set (8 types).** Cross-tier / cross-node transfers
-  and rebalance ticks will be added when the corresponding features
-  land (Llumnix migration, Mooncake transfer-aware scoring).
+* **Event set (10 types, M5a).** P/D split adds two new types —
+  ``KV_TRANSFER_START`` and ``KV_TRANSFER_COMPLETE`` — that bracket the
+  Mooncake-style KV transfer from prefill_node to decode_node after prefill
+  finishes. Cross-tier transfers and rebalance ticks remain future work.
 * **dict payload, not per-event dataclasses.** Handlers reach into
   ``ev.payload["request_id"]`` etc. We trade type-safety for the
   ability to evolve a payload shape without breaking the Event class.
@@ -38,35 +39,39 @@ __all__ = ["EventType", "Event"]
 class EventType(Enum):
     """All event kinds the simulator currently understands.
 
-    Lifecycle of a normal request (M3 chunked-prefill model):
+    Lifecycle of a normal request (M5a split P/D + chunked prefill):
 
-    ``REQUEST_ARRIVE`` → ``SCHEDULED`` → ``PREFILL_START`` →
-    [enters ``_prefill_remaining`` queue on the node] →
-    ``DECODE_BATCH_STEP`` × K  (each tick processes one prefill chunk piggybacked
-    with all active decode streams; K = ceil(uncached / chunk_size)) →
-    ``PREFILL_COMPLETE``  (fires when the last chunk finishes; triggers
-    ``cache.admit()`` + ``node.start_decode()``) →
+    ``REQUEST_ARRIVE`` → ``SCHEDULED`` → ``PREFILL_START`` (on prefill_node) →
+    [enters ``_prefill_remaining`` queue on prefill_node] →
+    ``DECODE_BATCH_STEP`` × K  (each tick processes one prefill chunk;
+    K = ceil(uncached / chunk_size)) →
+    ``PREFILL_COMPLETE`` (fires when the last chunk finishes on prefill_node;
+    releases the prefill_node slot but does NOT admit KV cache) →
+    ``KV_TRANSFER_START`` (Mooncake-style one-shot transfer from prefill_node
+    to decode_node, cost = prompt_len * kv_bytes / bandwidth) →
+    ``KV_TRANSFER_COMPLETE`` (admits KV into decode_node's cache + admits
+    request into decode_node + starts batch decode) →
+    ``DECODE_BATCH_STEP`` × N (on decode_node) →
     ``TOKEN_GENERATED`` × N (per-request metrics signal, one per batch tick) →
     ``DECODE_COMPLETE``
 
     Fast path (uncached == 0): ``PREFILL_COMPLETE`` fires immediately at
-    ``PREFILL_START`` time, skipping the chunked pipeline entirely.
-
-    Node-level decode pipeline (one per active node):
-    ``DECODE_BATCH_STEP`` → ``DECODE_BATCH_STEP`` → … (until node idle)
+    ``PREFILL_START`` time, skipping the chunked pipeline; KV transfer still
+    runs (Mooncake always transfers post-prefill in split deployment).
 
     Rejected requests skip everything after ``SCHEDULED`` and emit
-    ``REQUEST_REJECTED`` instead.
-
-    Future additions (not in scope for the current milestone):
-    ``KV_TRANSFER_COMPLETE`` (Llumnix migration), ``REBALANCE_TICK``
-    (periodic rebalance trigger).
+    ``REQUEST_REJECTED`` instead. A request may also be rejected after
+    ``KV_TRANSFER_COMPLETE`` if the decode_node has no capacity at admit
+    time (M5a decode-side back-pressure) — decode-full rejection happens
+    BEFORE cm.admit so no release is needed; ``REQUEST_REJECTED`` fires.
     """
 
     REQUEST_ARRIVE = "request_arrive"
     SCHEDULED = "scheduled"
     PREFILL_START = "prefill_start"
     PREFILL_COMPLETE = "prefill_complete"
+    KV_TRANSFER_START = "kv_transfer_start"
+    KV_TRANSFER_COMPLETE = "kv_transfer_complete"
     TOKEN_GENERATED = "token_generated"  # per-request metrics signal; renamed from DECODE_STEP
     DECODE_BATCH_STEP = "decode_batch_step"
     DECODE_COMPLETE = "decode_complete"
