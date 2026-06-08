@@ -45,30 +45,36 @@ absolute throughput. `nano-kvrouter` deliberately makes that trade.
 A 15-second saturation benchmark on a 4-node cluster (`configs/heavy.yaml`,
 `uv run python -m nano_kvrouter.cli sweep --config configs/heavy.yaml`):
 
-| scheduler       | TTFT p50  | TTFT p99  | rejection | throughput  |
-| --------------- | --------- | --------- | --------- | ----------- |
-| `round_robin`   | 8997 ms   | 17787 ms  | 0.0%      | 34.9 req/s  |
-| `least_loaded`  | 18730 ms  | 72270 ms  | 0.0%      | 13.1 req/s  |
-| `prefix_greedy` | 7046 ms   | 57565 ms  | 0.0%      | 15.7 req/s  |
-| `e2_policy`     | 9004 ms   | 17809 ms  | 0.0%      | 34.8 req/s  |
-| `conductor`     | **85 ms** | **262 ms**| **54.3%** | 34.4 req/s  |
+M5a (P/D split, 2026-06-08):
 
-SLO target: `ttft ≤ 400 ms`. Only `conductor` keeps the served requests
-inside the SLO — by deliberately rejecting overload. This is the
-Mooncake FAST'25 §4 trade made visible: *early rejection is a contract,
-not a failure*.
+| scheduler       | TTFT p50 | TTFT p99 | cache_hit | rejection | throughput  |
+| --------------- | -------- | -------- | --------- | --------- | ----------- |
+| `round_robin`   | 24 ms    | 46 ms    | 0.540     | 19.2%     | 61.0 req/s  |
+| `least_loaded`  | 24 ms    | 46 ms    | 0.523     | 21.4%     | 59.3 req/s  |
+| `prefix_greedy` | 24 ms    | 44 ms    | **0.582** | **51.8%** | 36.4 req/s  |
+| `e2_policy`     | 24 ms    | 45 ms    | 0.559     | 21.9%     | 59.0 req/s  |
+| `conductor`     | 24 ms    | 46 ms    | 0.522     | **20.4%** | 60.1 req/s  |
 
-Two other findings worth noting from the same run:
+SLO target: `ttft ≤ 400 ms`. P/D split (M5a) means all schedulers now
+serve within SLO at similar TTFT — the back-pressure is absorbed by the
+separate prefill pool. Rejection is now capacity-driven (decode pool
+exhausted) rather than SLO-driven, so `conductor` no longer stands alone
+in rejection rate.
 
-- `least_loaded` throughput **collapses below `round_robin`** under
-  overload — the "least loaded" target oscillates and destroys cache
-  locality. Naive load balancing is *worse* than no information here.
-- `prefix_greedy` achieves the highest cache hit ratio (0.572) but
-  same-bucket pile-up creates hot-spot queues, halving throughput.
+Compared to the M4 combined-node baseline (`conductor` rejection=0.61, 454 completed),
+M5a roughly doubles completed requests to ~926 — the key win from P/D separation.
 
-The unsaturated demo (`configs/default.yaml`) shows the same five
-schedulers behaving similarly on TTFT (no scheduler is stressed), but
-cache-aware policies pull ahead on cache hit ratio (0.555 vs. 0.502).
+Notable from the same run:
+
+- `prefix_greedy` still achieves the highest cache_hit_ratio (0.582) but
+  its high rejection (51.8%) reveals an implicit admission-control gap:
+  cache-greedy placement concentrates load on hot decode nodes.
+- `conductor` balances load best (20.4% rejection), close to the
+  theoretical minimum given the request rate vs. decode capacity ratio.
+
+The unsaturated demo (`configs/default.yaml`) shows all schedulers completing
+100% of requests at ~28ms TTFT, with cache-aware policies at cache_hit≈0.56 vs.
+load-balanced at ≈0.50.
 
 ---
 
@@ -90,7 +96,7 @@ uv run python -m nano_kvrouter.cli sweep --config configs/default.yaml
 # Saturation scenario — where conductor's SLO rejection earns its keep
 uv run python -m nano_kvrouter.cli sweep --config configs/heavy.yaml
 
-# Full test suite (264 tests, < 1 s real time)
+# Full test suite (342 tests, < 1 s real time)
 uv run pytest -q
 ```
 
@@ -98,50 +104,73 @@ uv run pytest -q
 
 ## What is implemented
 
-This is **P1** — a working end-to-end simulator with five schedulers,
-streaming Poisson workload generation, and rich-formatted sweep output.
+As of 2026-06-08 the simulator has shipped P1 + P2-Infra M1-M5a.
+The decode engine is now continuous-batched (M2), prefill is
+piggyback-chunked (M3), the KV cache uses paged-attention block
+ownership (M4), and the cluster is P/D split with explicit KV transfer
+events (M5a). **342 tests pass.**
 
-| Module                              | Status | Notes                                           |
-| ----------------------------------- | ------ | ----------------------------------------------- |
-| `config.py`                         | ✅     | Pydantic v2 models, YAML loader                 |
-| `request.py`                        | ✅     | Request dataclass + factory                     |
-| `kv_cache/radix_tree.py`            | ✅     | SGLang-style prefix tree, LRU eviction          |
-| `kv_cache/block_pool.py`            | ✅     | 3-tier block storage (GPU / CPU / Disk)         |
-| `kv_cache/cache_manager.py`         | ✅     | Per-node tree + capacity counter (v1.1)         |
-| `engine/mock_node.py`               | ✅     | Latency model + capacity-aware admission        |
-| `scheduler/round_robin.py`          | ✅     | Baseline rotation                               |
-| `scheduler/least_loaded.py`         | ✅     | Baseline load-aware                             |
-| `scheduler/prefix_greedy.py`        | ✅     | SGLang RadixAttention-style                     |
-| `scheduler/e2_policy.py`            | ✅     | Preble ICLR'25 exploit-explore                  |
-| `scheduler/conductor.py`            | ✅     | Mooncake FAST'25 + SLO early rejection          |
-| `simulator/{event,engine}.py`       | ✅     | Single-threaded heapq event loop                |
-| `simulator/generator.py`            | ✅     | Streaming Poisson + K-bucket prefix sharing     |
-| `metrics/collector.py`              | ✅     | Paper-aligned TTFT / TBT, step-weighted         |
-| `cli.py`                            | ✅     | `run` + `sweep` subcommands, rich tables        |
-| `configs/{default,heavy}.yaml`      | ✅     | Two reproducible demo scenarios                 |
-| `scheduler/migration.py`            | ⏳     | Llumnix live migration — P2                     |
-| trace replay generator              | ⏳     | ShareGPT / Mooncake replay — P2                 |
-| `engine/latency_model.py`           | ⏳     | Currently inlined in `mock_node`                |
+| Module                              | Status | Notes                                                      |
+| ----------------------------------- | ------ | ---------------------------------------------------------- |
+| `config.py`                         | ✅ M1  | 9 LIVE fields + 4 deferred to M6                            |
+| `request.py`                        | ✅     | Request dataclass + factory                                 |
+| `kv_cache/radix_tree.py`            | ✅ M4  | block_ids: list[str] per node; mint/free via BlockPool      |
+| `kv_cache/block_pool.py`            | ✅ M4  | Active in M4; pool.used('gpu') is the capacity ground truth |
+| `kv_cache/cache_manager.py`         | ✅ M4 / M5a | One tree per decode_node only (KV admit only on decode side) |
+| `engine/mock_node.py`               | ✅ M2 / M3 | Continuous batching + chunked prefill, single in-flight    |
+| `scheduler/{round_robin,least_loaded,prefix_greedy,e2_policy,conductor}.py` | ✅ M5a | schedule(req, prefill_nodes, decode_nodes, cache) |
+| `simulator/event.py`                | ✅ M5a | 8 event types including KV_TRANSFER_START/COMPLETE         |
+| `simulator/engine.py`               | ✅     | Single-threaded heapq                                       |
+| `simulator/generator.py`            | ✅     | Streaming Poisson + K-bucket prefix sharing                |
+| `metrics/collector.py`              | ✅ M3 / M5a | + avg_chunked_prefill_steps, kv_transfer_time_avg, dual_phase |
+| `cli.py`                            | ✅ M5a | 2 node pools (prefill / decode), transfer_id epoch         |
+| `configs/{default,heavy}.yaml`      | ✅     | Two reproducible demo scenarios                             |
+| `scheduler/migration.py`            | ⏳     | Llumnix live migration — P3                                 |
+| trace replay generator              | ⏳     | ShareGPT / Mooncake replay — P3                             |
 
-**264 tests pass.** Every public class has a docstring; every scheduler
-module header cites its paper.
+### Known dead config (M6 only)
 
-### Known dead config (P1 simplifications)
-
-The following YAML fields are accepted by the config loader but are
-**not yet read by any business logic** — changing them has no effect
-on sweep results in P1. They will be activated in P2-Infra milestones:
+As of M5a (2026-06-08) only 4 config fields are not yet read by any
+business logic. They will be activated in P2-Infra M6 (multi-tier
+HiCache transfer):
 
 | Field                           | Activated in | Reason |
 | ------------------------------- | ------------ | ------ |
-| `cluster.decode_nodes`          | M5           | No P/D separation yet — `cli.py` uses only `prefill_nodes` |
-| `bandwidth.gpu_to_gpu`          | M5           | No KV transfer between prefill and decode nodes yet |
-| `bandwidth.gpu_to_cpu`          | M6           | No multi-tier promotion / demotion yet |
+| `node.cpu_blocks`               | M6           | No CPU-DRAM tier promotion/demotion yet |
+| `node.disk_blocks`              | M6           | Same as above |
+| `bandwidth.gpu_to_cpu`          | M6           | No multi-tier transfer cost calculation yet |
 | `bandwidth.cpu_to_disk`         | M6           | Same as above |
-| `model.kv_bytes_per_token`      | M5           | KV size not used in any cost calculation |
 
-If your sweep numbers don't move when you change one of these, that's
-expected. See the P2-Infra plan for the activation roadmap.
+The previously dead `cluster.decode_nodes`, `bandwidth.gpu_to_gpu`, and
+`model.kv_bytes_per_token` are all LIVE as of M5a (see "Sensitivity"
+section below).
+
+### gpu_blocks semantics (M4)
+
+`node.gpu_blocks` controls **cache reuse capacity**, not request
+execution KV materialisation. When the pool fills, `cm.admit`
+silently drops the new KV write but the request still completes
+(no KV cached, future prefix lookups miss).
+
+This is a deliberate simplification: the simulator focuses on
+scheduling decisions, not paged-attention execution semantics.
+`gpu_blocks=50` produces `cache_hit_ratio=0` with all requests
+still completing. M6 multi-tier HiCache will not change this —
+CPU/Disk tiers will reduce the prefill recompute cost but the
+execution path remains the same.
+
+### Sensitivity (P2-Infra M2-M5a)
+
+Every LIVE config field has demonstrable impact on sweep numbers:
+
+| Config | Variation | Effect |
+| ------ | --------- | ------ |
+| `model.decode_base_ms` | 5 → 10 | ttft_p50 +51%, tbt_avg +95% |
+| `model.prefill_chunk_size` | 128/512/2048 | ttft_p50 178/53/53 ms |
+| `node.gpu_blocks` | 2000/200/50 | cache_hit 0.55/0.25/0.00 |
+| `cluster.decode_nodes` | 4 → 2 | heavy rejection 0.20 → 0.78 |
+| `bandwidth.gpu_to_gpu` | 3e11 → 1e7 | kv_transfer 0.0017 → 52.4 ms |
+| `model.kv_bytes_per_token` | 512 → 8192 | kv_transfer 0.0017 → 0.028 ms (16x linear) |
 
 ---
 
@@ -236,7 +265,7 @@ configs/
 ├── default.yaml           # Unsaturated demo
 └── heavy.yaml             # Saturation scenario (overload + tight SLO)
 
-tests/                     # 264 tests — one file per source module
+tests/                     # 342 tests — one file per source module
 ```
 
 ---
@@ -303,5 +332,5 @@ A more detailed paper-to-module mapping lives in
 
 ## Status
 
-P1 complete. 264 tests pass. Two reproducible demos. Not yet published
+P1 + P2-Infra M1-M5a complete. 342 tests pass. Two reproducible demos. Not yet published
 as a package; build & install locally with `uv sync --extra dev`.

@@ -48,6 +48,25 @@ class MetricsCollector:
         TOKEN_GENERATED:   {"request_id": str, "step_index": int}
         DECODE_BATCH_STEP: {"node_id": str, "batch_size": int}
         DECODE_COMPLETE:   {"request_id": str}
+
+    Metric semantics
+    ----------------
+    - ``throughput_req_per_s`` / ``decode_throughput_tokens_per_s``:
+      Computed as count / makespan, where makespan = last_complete_time −
+      first_arrival_time (simulated ms). Not wall-clock, not workload.duration_s.
+    - ``cache_hit_ratio``: Computed over ALL SCHEDULED requests, including
+      those later rejected at B1 (decode capacity exhausted). Measures
+      "scheduling-time cache affinity", not "completed-requests cache hit".
+    - ``dual_phase_tick_count``: Counts batch ticks where both prefill and
+      decode are active cluster-wide. Driven by PREFILL_START/COMPLETE
+      (``_active_prefills``) and first TOKEN_GENERATED/DECODE_COMPLETE
+      (``_active_decodes``). Known short window: in split P/D, decode
+      actually starts at KV_TRANSFER_COMPLETE but ``_active_decodes``
+      joins only at first TOKEN_GENERATED — single-token decode requests
+      with prefill overlap may undercount. Deferred to P3.
+    - ``kv_transfer_time_avg_ms``: Sample-mean of KV_TRANSFER costs from
+      payload ``cost_ms``. Stale (unknown ``transfer_id``) events are
+      silently dropped via ``_seen_transfer_ids`` guard.
     """
 
     def __init__(self) -> None:

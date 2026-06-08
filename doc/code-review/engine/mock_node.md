@@ -108,15 +108,23 @@ iteration_cost = f(prefill_chunk_tokens + decode_batch_tokens)
 
 所以 Sarathi 不是简单修改 prefill cost 公式，而是改变了 prefill 和 decode 的调度耦合方式。
 
+## 实施状态 (2026-06-08)
+
+- **M2 continuous batching**: 已实现。`tick_batch_step` 整数 token 推进，
+  `_batch_step_in_flight` guard 防 lost wakeup/duplicate completion。
+- **M3 chunked prefill**: 已实现。`_prefill_remaining` FIFO 队列，
+  每步 piggyback 一个 chunk，`prefill_chunk_size` 在 `ModelConfig` 中配置。
+- **M5a P/D split**: `admit()` 分别管 prefill_node slot 和 decode_node slot，
+  `complete()` 在各自侧 release。KV transfer event 由 cli.py 在
+  `PREFILL_COMPLETE` 后调度。
+
 ## 当前问题与差距
 
 | 问题 | 影响 | 证据 | 优先级 |
 |------|------|------|--------|
-| Prefill 被建模成一次性原子阶段 | 无法模拟长 prompt 阻塞 decode 的 generation stall | `estimate_prefill_time()` 直接返回总 prefill time | 高 |
-| Prefill 和 decode 完全独立估算 | 无法表达二者共享 GPU token budget | `estimate_prefill_time()` 和 `estimate_decode_time()` 没有共同状态 | 高 |
-| 缺少 chunked prefill 抽象 | 不能对照 Sarathi-Serve 的核心机制做实验 | 没有 `chunk_size`、`token_budget`、chunk event | 高 |
-| 没有暴露 KV cache 占用/剩余容量 | 调度器无法判断某个节点还能不能容纳新的 prefix，也无法做 capacity-aware cache placement | `MockEngineNode` 只暴露 running/queue load，没有 cache block usage 或 remaining prefix capacity | 高 |
-| `complete()` 是同步状态更新 | 真正接入事件循环后，请求完成应该由 `DECODE_COMPLETE` 事件驱动，否则节点状态和 metrics 时间线容易混在一起 | `complete()` 立即 remove/promote，没有显式事件触发边界 | 高 |
+| ~~Prefill 被建模成一次性原子阶段~~ | ~~无法模拟长 prompt 阻塞 decode 的 generation stall~~ | ~~`estimate_prefill_time()` 直接返回总 prefill time~~ | ~~高~~ → **M3 已解决** |
+| ~~缺少 chunked prefill 抽象~~ | ~~不能对照 Sarathi-Serve 的核心机制做实验~~ | ~~没有 `chunk_size`、`token_budget`、chunk event~~ | ~~高~~ → **M3 已解决** |
+| 没有暴露 KV cache 占用/剩余容量 | 调度器无法判断某个节点还能不能容纳新的 prefix，也无法做 capacity-aware cache placement | `MockEngineNode` 只暴露 running/queue load | 高 |
 | `queue_wait_time()` 过于乐观 | 不适合用于严格 SLO admission 判断 | 只使用 `queue_depth * decode_base_ms` | 中 |
 | latency 公式和节点状态耦合在一个类里 | 后续增加 transfer、stall、chunk 逻辑时文件会变重 | `MockEngineNode` 同时维护状态和公式 | 中 |
 
@@ -125,12 +133,8 @@ iteration_cost = f(prefill_chunk_tokens + decode_batch_tokens)
 | PR | 改动范围 | 验证方式 |
 |----|----------|----------|
 | PR-1：新增 `LatencyModel` | 新建 `src/nano_kvrouter/engine/latency_model.py`，把 prefill/decode/transfer 估算从 `MockEngineNode` 抽出 | 迁移现有 `tests/test_mock_node.py` 中 latency 断言，并新增 `tests/test_latency_model.py` |
-| PR-2：引入 chunked prefill 配置 | 在 `ModelConfig` 增加 `prefill_chunk_size`、`token_budget` 等字段 | 配置测试 + latency model 单测，确认长 prompt 被切成多个 chunk |
-| PR-3：让 simulator 支持 prefill chunk event | 修改 `PREFILL_START -> PREFILL_COMPLETE` 的原子流程，支持多轮 chunk | 小规模 simulation 测试，确认 TTFT 语义不变 |
-| PR-4：建模 generation stall | 让 decode TBT 受同一 iteration 中 prefill chunk 占用影响 | 构造“短 decode 被长 prefill 阻塞”的测试场景 |
-| PR-5：输出 Sarathi 对照实验 | 增加一个可复现实验配置，对比 naive prefill 和 chunked prefill | CSV/JSON 指标，观察 TTFT/TBT 差异 |
-| PR-6：暴露节点 KV cache 容量信号 | 给节点或 cache manager 提供可查询的 cache usage / remaining capacity，供 scheduler 做 prefix placement 决策 | scheduler 单测：当一个节点 prefix 命中高但容量不足时，不应继续选择它 |
-| PR-7：让 completion 完全事件驱动 | 将节点完成和 promote 逻辑收敛到 simulator 的 `DECODE_COMPLETE` 处理路径 | simulation 单测：完成事件触发后节点状态、metrics、队列 promote 顺序一致 |
+| PR-2：暴露节点 KV cache 容量信号 | 给节点或 cache manager 提供可查询的 cache usage / remaining capacity，供 scheduler 做 prefix placement 决策 | scheduler 单测：当一个节点 prefix 命中高但容量不足时，不应继续选择它 |
+| PR-3：让 completion 完全事件驱动 | 将节点完成和 promote 逻辑收敛到 simulator 的 `DECODE_COMPLETE` 处理路径 | simulation 单测：完成事件触发后节点状态、metrics、队列 promote 顺序一致 |
 
 ## 学习笔记
 

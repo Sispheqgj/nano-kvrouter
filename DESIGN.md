@@ -122,24 +122,34 @@ prefix_to_blocks: Dict[str, List[int]]  # prefix_hash -> block_ids
 ### 3.3 Mock Engine Node（延迟模型）
 
 ```python
-def estimate_prefill_time(num_tokens, cached_tokens) -> float:
-    # 缓存命中的 token 不需要重算
-    return (num_tokens - cached_tokens) * PREFILL_COST_PER_TOKEN_MS
+# M2/M3: prefill cost is split into chunks of size prefill_chunk_size;
+# each chunk piggybacks with active decode in the same batch step.
+# step_time = chunk_tokens * prefill_cost_per_token + decode_base + bs * marginal
+def estimate_prefill_chunk_time(chunk_tokens, decode_batch_size) -> float:
+    return chunk_tokens * PREFILL_COST_PER_TOKEN_MS + BASE_DECODE_MS + decode_batch_size * MARGINAL_DECODE_MS
 
-def estimate_decode_time(batch_size, seq_len) -> float:
+def estimate_decode_time(batch_size) -> float:
     # TBT 随 batch 增大线性增长
     return BASE_DECODE_MS + batch_size * MARGINAL_DECODE_MS
 
-def estimate_transfer_time(num_blocks, src_tier, dst_tier) -> float:
-    bandwidth = TIER_BANDWIDTH[(src_tier, dst_tier)]  # bytes/s
-    return num_blocks * BLOCK_SIZE_BYTES / bandwidth * 1000  # ms
+def estimate_transfer_time(prompt_len) -> float:
+    # M5a: KV transfer cost from prefill_node to decode_node
+    return prompt_len * KV_BYTES_PER_TOKEN / BANDWIDTH_GPU_TO_GPU * 1000  # ms
 ```
 
 **延迟参数参考值**（可在 config 中调整）：
-- `PREFILL_COST_PER_TOKEN_MS = 0.033`（~30K tokens/s，A100 量级）
-- `BASE_DECODE_MS = 5.0`
-- `MARGINAL_DECODE_MS = 0.5`（每增加一个并发请求）
-- GPU↔GPU (RDMA): 300 GB/s；GPU↔CPU (PCIe): 32 GB/s；CPU↔Disk (NVMe): 5 GB/s
+- `prefill_cost_per_token_ms = 0.033`（~30K tokens/s，A100 量级）
+- `decode_base_ms = 5.0`
+- `marginal_decode_ms = 0.5`（每增加一个并发请求）
+- GPU↔GPU (NVLink/RDMA): `bandwidth.gpu_to_gpu` bytes/s（默认 3×10¹¹）
+- GPU↔CPU (PCIe): `bandwidth.gpu_to_cpu` — M6 激活
+- CPU↔Disk (NVMe): `bandwidth.cpu_to_disk` — M6 激活
+
+**P/D Split (M5a)**:
+- Cluster 有独立的 `prefill_nodes` 和 `decode_nodes` 两个池
+- prefill_node 只做 chunked prefill；decode_node 只做 continuous batching
+- KV transfer event flow: `PREFILL_COMPLETE` → `KV_TRANSFER_START` → `KV_TRANSFER_COMPLETE` → decode admit
+- Transfer cost = `prompt_len × kv_bytes_per_token / bandwidth.gpu_to_gpu`
 
 ### 3.4 Global Scheduler — 可插拔策略接口
 
@@ -288,21 +298,23 @@ cluster:
   decode_nodes: 4
 
 node:
-  gpu_hbm_blocks: 2000          # 模拟 80GB HBM
-  cpu_dram_blocks: 10000
-  disk_blocks: 100000
+  capacity: 8
+  gpu_blocks: 2000              # 模拟 80GB HBM (M4 paged attention)
+  cpu_blocks: 10000             # deferred to M6
+  disk_blocks: 100000           # deferred to M6
 
 model:
   block_size: 16                # tokens per block
   kv_bytes_per_token: 512       # 7B 模型量级
   prefill_cost_per_token_ms: 0.033
-  base_decode_ms: 5.0
+  decode_base_ms: 5.0
   marginal_decode_ms: 0.5
+  prefill_chunk_size: 512       # M3 chunked prefill
 
 bandwidth:
-  gpu_to_gpu_gbps: 300
-  gpu_to_cpu_gbps: 32
-  cpu_to_disk_gbps: 5
+  gpu_to_gpu: 300_000_000_000   # bytes/sec (NVLink/RDMA)
+  gpu_to_cpu: 32_000_000_000    # bytes/sec (PCIe) — M6
+  cpu_to_disk: 5_000_000_000    # bytes/sec (NVMe) — M6
 
 slo:
   ttft_target_ms: 2000
