@@ -1,30 +1,38 @@
-"""Unified KV-cache interface over RadixTree + BlockPool (M4: pool-backed capacity).
+"""KV-cache interface over RadixTree + BlockPool (M6: multi-tier demotion chain).
 
-CacheManager is the single entry point schedulers use to query prefix-hit
-details and the entry point the simulation engine uses to materialise new
-KV cache entries after prefill completes.
+M6 adds three capabilities on top of the M4 GPU-only baseline:
 
-Architecture (M4 pool-backed, GPU-only)
-----------------------------------------
-* One :class:`~nano_kvrouter.kv_cache.radix_tree.RadixTree` per node, wired
-  to a per-node :class:`~nano_kvrouter.kv_cache.block_pool.BlockPool` via
-  callbacks so every block allocation/free goes through the pool.
-* ``RadixNode.block_ids`` has length ``ceil(len(key) / block_size)`` — the
-  pool is the ground truth for how many physical GPU blocks are in use.
-* ``pool.used("gpu")`` replaces the former ``_tree_ceiling_blocks`` derived
-  counter: it directly reflects pool state without re-computing over tree nodes.
-* ``free_blocks()`` is derived from ``pool._tiers["gpu"].free``, keeping
-  lookup and capacity signals always consistent.
-* ``transfer_cost_ms`` is always ``0.0`` in v1 — no CPU/Disk tier management.
-* Tier promotion / demotion and cross-node transfer cost are deferred to P3.
+1. **Demotion chain (GPU → CPU → Disk → free)**: When the GPU tier is full,
+   ``admit`` demotes LRU leaf nodes to slower tiers rather than evicting them
+   from the tree.  Tree nodes are preserved so future ``lookup`` calls can
+   still find the prefix (with a non-zero ``transfer_cost_ms`` for non-GPU
+   blocks).  Zombie nodes (all blocks freed) are cleaned up automatically
+   via ``tree.demote_lru``'s tier_of probe.
 
-Capacity eviction (admit):
-    The eviction loop ensures
-    ``pool.used("gpu") + worst_case_new_blocks <= capacity``
-    before calling ``tree.insert()``.  "worst_case" includes a +1 margin
-    for the mid-node that a radix-tree split can create; this prevents a
-    MemoryError surfacing inside the tree's mint callback when a split
-    occurs near the capacity limit.
+2. **Tier-aware lookup**: ``lookup`` / ``lookup_all`` call
+   ``tree.match_prefix_path`` to get the full block list on the matched
+   path, then ``pool.tiers_of`` to get per-block tier labels, then compute
+   ``transfer_cost_ms`` from the per-tier bandwidth config.
+
+3. **Dead config fields now live**: ``cpu_blocks``, ``disk_blocks``,
+   ``bandwidth.gpu_to_cpu``, and ``bandwidth.cpu_to_disk`` are all read and
+   used.  The only remaining dead field is anything scheduled for M7+.
+
+``transfer_cost_ms`` semantics (per block, additive across blocks; serial
+hops within one block — disk blocks pay both legs):
+    - GPU hit:  0 ms (already in HBM)
+    - CPU hit:  block_bytes / bandwidth.gpu_to_cpu   (CPU → GPU DMA)
+    - Disk hit: block_bytes * (1/cpu_to_disk + 1/gpu_to_cpu)
+                                                     (Disk → CPU → GPU,
+                                                      both hops in series)
+
+M6.fix2 — Important #2: previously the disk cost only counted the
+``cpu_to_disk`` leg, undercounting the load. Both legs must be paid
+because the block must traverse Disk → CPU → GPU before prefill can
+re-use it.
+
+The scheduler (``compute_est_ttft``) adds this ``transfer_cost_ms`` to the
+TTFT estimate so cache-tier routing decisions are reflected in SLO gating.
 """
 from __future__ import annotations
 
@@ -40,6 +48,45 @@ from nano_kvrouter.scheduler.base import CacheLookup
 logger = logging.getLogger(__name__)
 
 __all__ = ["CacheManager"]
+
+
+def _demote_block(pool: BlockPool, tree: RadixTree, bid: str) -> None:
+    """Cascade one block down the tier hierarchy until it finds a free slot.
+
+    GPU → CPU → Disk → free (no-op if block already freed / None).
+
+    M6.fix2 (Important #1): whenever a block is *truly* freed (no
+    downstream tier with capacity), call ``tree.purge_block_ids`` so the
+    tree drops the zombie leaf node. Without this the tree would still
+    advertise the prefix in ``match_prefix`` even though the pool has
+    forgotten the blocks, tripping the fast-path bug Critical #1.
+
+    Args:
+        pool: The node's BlockPool.
+        tree: The node's RadixTree (used for zombie GC).
+        bid: Block ID to demote.
+    """
+    current = pool.tier_of(bid)
+    if current is None:
+        return
+    s = pool.stats()
+    if current == "gpu":
+        if s["cpu"]["free"] > 0:
+            pool.move(bid, "gpu", "cpu")
+        elif s["disk"]["free"] > 0:
+            pool.move(bid, "gpu", "disk")
+        else:
+            pool.free([bid])
+            tree.purge_block_ids([bid], pool.tier_of)
+    elif current == "cpu":
+        if pool.stats()["disk"]["free"] > 0:
+            pool.move(bid, "cpu", "disk")
+        else:
+            pool.free([bid])
+            tree.purge_block_ids([bid], pool.tier_of)
+    elif current == "disk":
+        pool.free([bid])
+        tree.purge_block_ids([bid], pool.tier_of)
 
 
 class CacheManager:
@@ -70,15 +117,17 @@ class CacheManager:
         Args:
             node_ids: Stable sequence of node identifiers. Order is not
                 significant; IDs must be unique.
-            model_config: Source of ``block_size`` used for alignment.
+            model_config: Source of ``block_size`` and ``kv_bytes_per_token``
+                used for block alignment and transfer-cost calculation.
             node_config: Source of ``gpu_blocks`` / ``cpu_blocks`` /
                 ``disk_blocks`` for capacity limits.
-            bandwidth_config: Stored for future P3 transfer-cost calculations;
-                not used in v1.
+            bandwidth_config: Source of ``gpu_to_cpu`` and ``cpu_to_disk``
+                for transfer-cost calculation (M6 live).
             clock: Optional simulated-time callable forwarded to each node's
                 :class:`RadixTree`. Defaults to ``time.time`` when ``None``.
         """
         self._block_size: int = model_config.block_size
+        self._model_cfg = model_config
         self._capacity: dict[str, dict[str, int]] = {
             nid: {
                 "gpu": node_config.gpu_blocks,
@@ -110,12 +159,12 @@ class CacheManager:
     def lookup(self, request: Request, node_id: str) -> CacheLookup:
         """Return prefix-hit details for *request* on *node_id*.
 
-        Matched token count is aligned DOWN to the nearest ``block_size``
-        boundary: a partial trailing block cannot be reused because the
-        simulator stores one KV block per ``block_size`` tokens.
+        M6 tier-aware: uses ``match_prefix_path`` to collect all block_ids
+        on the matched path, then ``pool.tiers_of`` to get per-block tier
+        labels, then computes ``transfer_cost_ms`` from bandwidth config.
 
-        ``transfer_cost_ms`` is always ``0.0`` in v1 (GPU-only; no
-        cross-tier or cross-node transfer accounting).
+        Matched token count is aligned DOWN to the nearest ``block_size``
+        boundary (same as M4).
 
         Args:
             request: The request whose prompt is matched against the tree.
@@ -123,8 +172,8 @@ class CacheManager:
 
         Returns:
             :class:`~nano_kvrouter.scheduler.base.CacheLookup` with
-            ``matched_blocks_by_tier`` containing only the ``"gpu"`` key
-            (omitted when zero) and ``transfer_cost_ms == 0.0``.
+            ``matched_blocks_by_tier`` broken down by tier and a non-zero
+            ``transfer_cost_ms`` when CPU or Disk blocks are matched.
 
         Raises:
             KeyError: If *node_id* is unknown.
@@ -132,14 +181,72 @@ class CacheManager:
         if node_id not in self._trees:
             raise KeyError(node_id)
 
-        matched_raw, _ = self._trees[node_id].match_prefix(request.token_ids)
-        matched_blocks = matched_raw // self._block_size
-        matched_tokens = matched_blocks * self._block_size
+        tree = self._trees[node_id]
+        pool = self._pools[node_id]
+        bs = self._block_size
+
+        matched_raw, path_block_ids = tree.match_prefix_path(request.token_ids)
+        matched_blocks = matched_raw // bs
+        matched_tokens = matched_blocks * bs
+
+        if matched_blocks == 0:
+            return CacheLookup(
+                matched_tokens=0,
+                matched_blocks_by_tier={},
+                transfer_cost_ms=0.0,
+            )
+
+        # Take only the leading blocks that correspond to matched_tokens.
+        relevant_bids = path_block_ids[:matched_blocks]
+
+        # Tier distribution (only live blocks — freed ones don't count).
+        tiers = pool.tiers_of(relevant_bids)
+        tier_counts: dict[str, int] = {}
+        for bid in relevant_bids:
+            t = tiers.get(bid)
+            if t is None:
+                continue  # freed (zombie block)
+            tier_counts[t] = tier_counts.get(t, 0) + 1
+
+        # Only count live (non-zombie) blocks toward matched_tokens.
+        live_block_count = sum(tier_counts.values())
+        matched_tokens = live_block_count * bs
+
+        if live_block_count == 0:
+            return CacheLookup(
+                matched_tokens=0,
+                matched_blocks_by_tier={},
+                transfer_cost_ms=0.0,
+            )
+
+        # Transfer cost: bytes to load matched non-GPU blocks into GPU HBM.
+        kv_bytes_per_block = bs * self._model_cfg.kv_bytes_per_token
+        cpu_n = tier_counts.get("cpu", 0)
+        disk_n = tier_counts.get("disk", 0)
+
+        cpu_load_ms = (
+            cpu_n * kv_bytes_per_block / self._bw_cfg.gpu_to_cpu * 1000.0
+            if cpu_n > 0 else 0.0
+        )
+        # Disk hit pays both serial hops: Disk→CPU (1/cpu_to_disk) and
+        # CPU→GPU (1/gpu_to_cpu). Conservative extrapolation from Mooncake's
+        # storage hierarchy (FAST'25 §3 describes prefix-cache loading from
+        # DRAM→GPU; SSD-resident prefix hit cost is not directly defined in the
+        # paper). Formula: disk_blocks * block_bytes * (1/cpu_to_disk +
+        # 1/gpu_to_cpu) * 1000. M6 v1 simulator extrapolation, not paper verbatim.
+        disk_load_ms = (
+            disk_n
+            * kv_bytes_per_block
+            * (1.0 / self._bw_cfg.cpu_to_disk + 1.0 / self._bw_cfg.gpu_to_cpu)
+            * 1000.0
+            if disk_n > 0 else 0.0
+        )
+        transfer_cost_ms = cpu_load_ms + disk_load_ms
 
         return CacheLookup(
             matched_tokens=matched_tokens,
-            matched_blocks_by_tier={"gpu": matched_blocks} if matched_blocks > 0 else {},
-            transfer_cost_ms=0.0,
+            matched_blocks_by_tier=tier_counts,
+            transfer_cost_ms=transfer_cost_ms,
         )
 
     def lookup_all(self, request: Request) -> dict[str, CacheLookup]:
@@ -149,7 +256,7 @@ class CacheManager:
             request: The request to look up.
 
         Returns:
-            Mapping ``node_id → CacheLookup`` for every node. Nodes with
+            Mapping ``node_id -> CacheLookup`` for every node. Nodes with
             zero matched tokens are still present (``matched_tokens=0``).
         """
         return {nid: self.lookup(request, nid) for nid in self._trees}
@@ -157,9 +264,7 @@ class CacheManager:
     def free_blocks(self, node_id: str, tier: str) -> int:
         """How many free blocks *node_id* has on *tier*.
 
-        Reads directly from the pool, which is the ground truth.  Always
-        consistent with :meth:`lookup` because both derive from the same
-        tree/pool state.
+        Reads directly from the pool, which is the ground truth.
 
         Args:
             node_id: Node to inspect.
@@ -186,18 +291,13 @@ class CacheManager:
     def admit(self, token_ids: list[int], node_id: str) -> None:
         """Materialise the KV cache for *token_ids* on *node_id*.
 
-        Called by the simulation engine's ``PREFILL_COMPLETE`` handler once
-        a prefill is done. Inserts the block-aligned prefix into the
-        RadixTree (which allocates blocks from the pool via the ``mint``
-        callback) and evicts LRU entries first when capacity is exhausted.
-
-        Physical block accounting uses per-node ceiling semantics:
-        each RadixNode's ``block_ids`` has length
-        ``ceil(len(node.key) / block_size)``.  ``pool.used("gpu")`` is the
-        authoritative capacity counter.
-
-        Only full ``block_size``-aligned blocks are stored; a trailing
-        partial block is discarded.
+        M6 eviction policy (demotion chain):
+            When the GPU tier is full, the LRU leaf node's blocks are
+            demoted tier-by-tier (GPU→CPU→Disk→free) instead of being
+            evicted from the tree.  The tree node is preserved so future
+            ``lookup`` calls can still match the prefix (with transfer
+            cost).  Zombie nodes (all blocks freed) are cleaned up by
+            ``tree.demote_lru``'s built-in zombie probe.
 
         Args:
             token_ids: Full prompt token sequence.
@@ -205,15 +305,8 @@ class CacheManager:
 
         Raises:
             KeyError: If *node_id* is unknown.
-            MemoryError: If (a) the GPU tier is full and all remaining blocks
-                are pinned (``ref_count > 0``), making eviction impossible; or
-                (b) the prompt requires more blocks than the node's total GPU
-                capacity.
-
-        Notes:
-            If the aligned prompt is already fully present in the tree (a
-            scheduler re-routes to a node that already cached this prefix),
-            admit is a no-op — no eviction, no allocation.
+            MemoryError: If the GPU tier is full and no evictable / demotion
+                candidates remain (all blocks pinned).
         """
         if node_id not in self._trees:
             raise KeyError(node_id)
@@ -228,53 +321,68 @@ class CacheManager:
             return
         aligned_tokens = token_ids[: total_blocks * bs]
 
-        # Fast path: if every block of the aligned prompt is already cached,
-        # admit is a no-op — no allocation needed even if pool is full.
-        matched_raw, _ = tree.match_prefix(aligned_tokens)
+        # Fast path: already fully cached → no-op.
+        # M6.fix2 (Critical #1): cannot trust tree.match_prefix alone — after
+        # GPU→CPU→Disk→free chain, tree nodes may be zombies (block_ids point
+        # at freed pool slots). Take the path block IDs, ask the pool which
+        # are still alive, and only no-op when EVERY relevant block is alive.
+        # Otherwise we must purge the zombie sub-tree before evict+insert
+        # because tree.insert would otherwise reuse / split the zombie nodes
+        # and produce stale block_ids.
+        matched_raw, path_block_ids = tree.match_prefix_path(aligned_tokens)
         already_blocks = matched_raw // bs
         if already_blocks >= total_blocks:
-            logger.debug(
-                "admit: node %s already has %d/%d blocks cached, no-op",
-                node_id, already_blocks, total_blocks,
+            relevant_bids = path_block_ids[:total_blocks]
+            live_tiers = pool.tiers_of(relevant_bids)
+            if len(live_tiers) == total_blocks:
+                logger.debug(
+                    "admit: node %s already has %d/%d blocks cached (all live), no-op",
+                    node_id, already_blocks, total_blocks,
+                )
+                return
+            # Partial or full zombie detected: purge the stale path so that
+            # tree.insert re-creates it with fresh GPU blocks. Also frees any
+            # alive CPU/Disk blocks to reclaim their tier capacity (avoids leak).
+            # purge_block_ids intentionally skips mixed-state nodes; use
+            # purge_path_with_any_dead which handles them correctly.
+            purged = tree.purge_path_with_any_dead(
+                aligned_tokens,
+                tier_of=pool.tier_of,
+                free_blocks=lambda bids: pool.free(bids),
             )
-            return
+            logger.debug(
+                "admit: node %s partial/full zombie on path; purged %d nodes",
+                node_id, purged,
+            )
 
         capacity_gpu = self._capacity[node_id]["gpu"]
 
-        # Pre-check: a prompt requiring more blocks than total capacity can
-        # never fit. Fail fast without evicting existing cache.
         if total_blocks > capacity_gpu:
             raise MemoryError(
                 f"node {node_id!r}: prompt requires {total_blocks} blocks, "
                 f"exceeds total GPU capacity {capacity_gpu}"
             )
 
-        # worst_case_new: total blocks needed + 1 margin for the mid-node that a
-        # radix-tree split can create, clamped to capacity_gpu.  When the prompt
-        # fills the pool exactly (total_blocks == capacity_gpu) we set
-        # worst_case_new = capacity_gpu so the loop evicts until the pool is
-        # completely empty — at that point no existing edge can cause a split.
         worst_case_new = min(total_blocks + 1, capacity_gpu)
 
         while pool.used("gpu") + worst_case_new > capacity_gpu:
-            evicted = tree.evict_lru(1)
-            if not evicted:
+            # Try tree-preserving demotion first.
+            demoted = tree.demote_lru(1, tier_of=pool.tier_of)
+            if not demoted:
                 raise MemoryError(
-                    f"node {node_id!r} GPU pool full and no evictable cache; "
+                    f"node {node_id!r} GPU pool full and no demotion candidates; "
                     f"need {worst_case_new}, "
                     f"free {capacity_gpu - pool.used('gpu')}"
                 )
-            for bid_list in evicted:
-                pool.free(bid_list)
+            for bid_list in demoted:
+                for bid in bid_list:
+                    _demote_block(pool, tree, bid)
 
         pre = pool.used("gpu")
         tree.insert(aligned_tokens)
         post = pool.used("gpu")
 
         logger.debug(
-            "admit: node %s pool blocks %d→%d (total_blocks=%d)",
-            node_id,
-            pre,
-            post,
-            total_blocks,
+            "admit: node %s pool blocks %d->%d (total_blocks=%d)",
+            node_id, pre, post, total_blocks,
         )

@@ -207,14 +207,15 @@ def _wire_simulator(
             return
 
         # Cache lookup on decode_node (where KV cache lives).
-        matched = cm.lookup(req, decision.decode_node).matched_tokens
+        decode_lookup = cm.lookup(req, decision.decode_node)
         engine.schedule(Event(
             time=engine.now(),
             type=EventType.SCHEDULED,
             payload={
                 "request_id": req.request_id,
                 "decision": decision,
-                "matched_tokens": matched,
+                "matched_tokens": decode_lookup.matched_tokens,
+                "matched_blocks_by_tier": decode_lookup.matched_blocks_by_tier,
             },
         ))
 
@@ -547,6 +548,8 @@ _TABLE_KEYS = [
     "e2e_avg_ms",
     "slo_ttft_hit_rate",
     "cache_hit_ratio",
+    "cache_hit_by_tier_blocks",
+    "cache_hit_by_tier_ratio",
     "throughput_req_per_s",
     "avg_batch_size",
     "decode_throughput_tokens_per_s",
@@ -573,6 +576,8 @@ def _fmt(v: Any) -> str:
         return "—"
     if isinstance(v, float):
         return f"{v:.3f}" if abs(v) < 100 else f"{v:.1f}"
+    if isinstance(v, dict):
+        return "  ".join(f"{k}:{_fmt(val)}" for k, val in v.items())
     return str(v)
 
 

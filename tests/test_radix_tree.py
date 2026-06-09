@@ -399,3 +399,302 @@ def test_split_non_aligned_no_overflow_no_extra_mint():
     # Invariant: total block_ids == n_old (no change in pool usage)
     total = sum(len(n.block_ids) for n in tree._nodes.values())
     assert total == 2
+
+
+# ---------------------------------------------------------------------------
+# M6: match_prefix_path
+# ---------------------------------------------------------------------------
+
+
+def test_match_prefix_path_single_node():
+    """Shallow path: single inserted sequence returns its block_ids as path."""
+    counter = [0]
+
+    def my_mint(n: int) -> list[str]:
+        ids = [f"b{counter[0] + i}" for i in range(n)]
+        counter[0] += n
+        return ids
+
+    tree = RadixTree(block_size=4, mint=my_mint)
+    tree.insert([1, 2, 3, 4])  # 1 block: "b0"
+
+    matched, path_ids = tree.match_prefix_path([1, 2, 3, 4])
+    assert matched == 4
+    assert path_ids == ["b0"]
+
+
+def test_match_prefix_path_deep_chain():
+    """Multi-level path: path_ids is flat concatenation of all nodes' block_ids."""
+    counter = [0]
+
+    def my_mint(n: int) -> list[str]:
+        ids = [f"b{counter[0] + i}" for i in range(n)]
+        counter[0] += n
+        return ids
+
+    tree = RadixTree(block_size=4, mint=my_mint)
+    tree.insert([1, 2, 3, 4])             # node A: "b0"
+    tree.insert([1, 2, 3, 4, 5, 6, 7, 8])  # node B extends A: "b1"
+
+    matched, path_ids = tree.match_prefix_path([1, 2, 3, 4, 5, 6, 7, 8])
+    assert matched == 8
+    assert len(path_ids) == 2
+    assert "b0" in path_ids and "b1" in path_ids
+
+
+def test_match_prefix_path_no_match_returns_empty():
+    """No match: returns (0, [])."""
+    tree = RadixTree(block_size=4)
+    tree.insert([1, 2, 3, 4])
+
+    matched, path_ids = tree.match_prefix_path([9, 8, 7])
+    assert matched == 0
+    assert path_ids == []
+
+
+def test_match_prefix_path_partial_path_stops_at_last_full_node():
+    """Query extends beyond cached depth: returns up to the deepest full node."""
+    counter = [0]
+
+    def my_mint(n: int) -> list[str]:
+        ids = [f"b{counter[0] + i}" for i in range(n)]
+        counter[0] += n
+        return ids
+
+    tree = RadixTree(block_size=4, mint=my_mint)
+    tree.insert([1, 2, 3, 4])  # "b0"
+
+    # Query is longer than what's cached; should still match the full node.
+    matched, path_ids = tree.match_prefix_path([1, 2, 3, 4, 99, 100])
+    assert matched == 4
+    assert path_ids == ["b0"]
+
+
+# ---------------------------------------------------------------------------
+# M6: demote_lru
+# ---------------------------------------------------------------------------
+
+
+def test_demote_lru_returns_block_ids_without_removing_node():
+    """demote_lru returns the LRU leaf's block_ids but keeps the node in tree."""
+    counter = [0]
+
+    def my_mint(n: int) -> list[str]:
+        ids = [f"b{counter[0] + i}" for i in range(n)]
+        counter[0] += n
+        return ids
+
+    tree = RadixTree(block_size=4, mint=my_mint)
+    tree.insert([1, 2, 3, 4])  # "b0"
+
+    result = tree.demote_lru(1)
+    assert result == [["b0"]]
+    # Node is still reachable via match_prefix.
+    matched, _ = tree.match_prefix([1, 2, 3, 4])
+    assert matched == 4
+
+
+def test_demote_lru_zombie_cleanup_with_tier_of():
+    """demote_lru with tier_of evicts zombie nodes and returns live ones."""
+    counter = [0]
+
+    def my_mint(n: int) -> list[str]:
+        ids = [f"b{counter[0] + i}" for i in range(n)]
+        counter[0] += n
+        return ids
+
+    tree = RadixTree(block_size=4, mint=my_mint)
+    tree.insert([1, 2, 3, 4])   # "b0" — will become zombie
+    tree.insert([9, 8, 7, 6])   # "b1" — live
+
+    # Simulate b0 freed (zombie)
+    freed = {"b0"}
+
+    def tier_of(bid: str) -> str | None:
+        return None if bid in freed else "gpu"
+
+    result = tree.demote_lru(1, tier_of=tier_of)
+    # Only the live node ("b1") is returned; zombie is silently evicted.
+    assert len(result) == 1
+    assert result[0] == ["b1"]
+    # Zombie "b0" node should have been cleaned from tree.
+    assert "b0" not in tree._nodes
+
+
+def test_demote_lru_returns_empty_when_no_candidates():
+    """demote_lru returns [] when all leaves are pinned (ref_count > 0)."""
+    counter = [0]
+
+    def my_mint(n: int) -> list[str]:
+        ids = [f"b{counter[0] + i}" for i in range(n)]
+        counter[0] += n
+        return ids
+
+    tree = RadixTree(block_size=4, mint=my_mint)
+    tree.insert([1, 2, 3, 4])  # "b0"
+    node = tree._nodes["b0"]
+    node.ref_count = 1  # pin it
+
+    result = tree.demote_lru(1)
+    assert result == []
+
+
+# ---------------------------------------------------------------------------
+# M6.fix2 Important #1: tree.purge_block_ids GC
+# ---------------------------------------------------------------------------
+
+def test_purge_block_ids_removes_zombie_nodes():
+    """purge_block_ids drops a leaf whose every block_id has been freed."""
+    counter = [0]
+
+    def my_mint(n: int) -> list[str]:
+        ids = [f"b{counter[0] + i}" for i in range(n)]
+        counter[0] += n
+        return ids
+
+    tree = RadixTree(block_size=4, mint=my_mint)
+    tree.insert([1, 2, 3, 4])   # "b0"
+    tree.insert([5, 6, 7, 8])   # "b1"
+    assert "b0" in tree._nodes
+    assert "b1" in tree._nodes
+
+    freed = {"b0"}
+
+    def tier_of(bid: str) -> str | None:
+        return None if bid in freed else "gpu"
+
+    purged = tree.purge_block_ids(["b0"], tier_of)
+    assert purged == 1
+    assert "b0" not in tree._nodes
+    assert "b1" in tree._nodes
+    # Future lookup of the purged prefix must fail.
+    matched, _ = tree.match_prefix([1, 2, 3, 4])
+    assert matched == 0
+
+
+def test_purge_block_ids_skips_partially_live_node():
+    """A node with some blocks still live (e.g. only one of several freed)
+    must NOT be purged."""
+    counter = [0]
+
+    def my_mint(n: int) -> list[str]:
+        ids = [f"b{counter[0] + i}" for i in range(n)]
+        counter[0] += n
+        return ids
+
+    tree = RadixTree(block_size=2, mint=my_mint)
+    # 4 tokens, bs=2 → 2 blocks per node.
+    tree.insert([1, 2, 3, 4])
+    # The node owns block_ids ["b0", "b1"]; only b1 is freed.
+    freed = {"b1"}
+
+    def tier_of(bid: str) -> str | None:
+        return None if bid in freed else "gpu"
+
+    purged = tree.purge_block_ids(["b1"], tier_of)
+    assert purged == 0
+    # Node should still be present.
+    assert "b0" in tree._nodes
+
+
+def test_purge_block_ids_empty_input_is_noop():
+    """purge_block_ids with empty freed list is a fast no-op."""
+    counter = [0]
+
+    def my_mint(n: int) -> list[str]:
+        ids = [f"b{counter[0] + i}" for i in range(n)]
+        counter[0] += n
+        return ids
+
+    tree = RadixTree(block_size=4, mint=my_mint)
+    tree.insert([1, 2, 3, 4])
+
+    purged = tree.purge_block_ids([], lambda bid: "gpu")
+    assert purged == 0
+    assert "b0" in tree._nodes
+
+
+# ---------------------------------------------------------------------------
+# M6.fix2: purge_block_ids non-leaf + purge_path_with_any_dead
+# ---------------------------------------------------------------------------
+
+
+def test_purge_block_ids_non_leaf_partial():
+    """Non-leaf nodes are preserved even when their own blocks are dead,
+    as long as they have at least one alive child.
+
+    Tree: root → mid([1..4], b_m) → { child1([5..8], b_c1), child2([9..12], b_c2) }
+    b_m and b_c1 are freed; b_c2 is alive.
+    purge_block_ids([b_m, b_c1]) should:
+    - remove child1 (fully dead leaf)
+    - preserve mid (non-leaf — cannot remove safely)
+    - preserve child2 (alive leaf)
+    """
+    counter = [0]
+
+    def my_mint(n: int) -> list[str]:
+        ids = [f"b{counter[0] + i}" for i in range(n)]
+        counter[0] += n
+        return ids
+
+    tree = RadixTree(block_size=4, mint=my_mint)
+    tree.insert([1, 2, 3, 4, 5, 6, 7, 8])    # mid=[1..4] b0; child1=[5..8] b1
+    tree.insert([1, 2, 3, 4, 9, 10, 11, 12])  # split; child2=[9..12] b2
+
+    b_m, b_c1, b_c2 = "b0", "b1", "b2"
+    freed = {b_m, b_c1}
+
+    def tier_of(bid: str) -> str | None:
+        return None if bid in freed else "gpu"
+
+    purged = tree.purge_block_ids([b_m, b_c1], tier_of)
+
+    # child1 (fully dead leaf) must be removed.
+    assert b_c1 not in tree._nodes
+    # mid (non-leaf with alive child2) must be preserved.
+    assert b_m in tree._nodes
+    # child2 (alive leaf) must be preserved.
+    assert b_c2 in tree._nodes
+    # Exactly 1 node removed (child1).
+    assert purged == 1
+    # Lookup via alive path still works.
+    matched, _ = tree.match_prefix([1, 2, 3, 4, 9, 10, 11, 12])
+    assert matched == 8
+
+
+def test_purge_path_with_any_dead_removes_mixed_state_node():
+    """purge_path_with_any_dead removes a node that has some alive + some dead blocks,
+    frees alive blocks back to pool, and lets subsequent insert re-allocate."""
+    counter = [0]
+    freed_calls: list[list[str]] = []
+
+    def my_mint(n: int) -> list[str]:
+        ids = [f"b{counter[0] + i}" for i in range(n)]
+        counter[0] += n
+        return ids
+
+    def my_free(bids: list[str]) -> None:
+        freed_calls.append(list(bids))
+
+    tree = RadixTree(block_size=2, mint=my_mint, free_blocks=my_free)
+    # Insert 4 tokens with bs=2 → 1 node, 2 blocks: b0 (alive), b1 (dead)
+    tree.insert([1, 2, 3, 4])
+    node_bids = list(tree._nodes.values())[0].block_ids
+    assert node_bids == ["b0", "b1"]
+
+    dead = {"b1"}
+
+    def tier_of(bid: str) -> str | None:
+        return None if bid in dead else "cpu"
+
+    purged = tree.purge_path_with_any_dead([1, 2, 3, 4], tier_of, my_free)
+
+    # Node removed from tree.
+    assert "b0" not in tree._nodes
+    # Alive block b0 returned to pool caller.
+    freed_alive = [b for call in freed_calls for b in call if b == "b0"]
+    assert freed_alive == ["b0"]
+    assert purged == 1
+    # Tree is now empty — insert should re-create.
+    matched, _ = tree.match_prefix([1, 2, 3, 4])
+    assert matched == 0

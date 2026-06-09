@@ -197,7 +197,7 @@ def test_admit_triggers_eviction_when_full() -> None:
     seq_b = _tokens(160, start=1000)
     cm.admit(seq_b, "n0")
 
-    # Eviction happened: A no longer cached (its tree node was removed)
+    # M6: blocks freed (cpu_blocks=0, disk_blocks=0) → zombie node stays but lookup returns 0
     assert cm.lookup(_req(seq_a), "n0").matched_tokens == 0
 
     # B is now fully cached
@@ -467,11 +467,11 @@ def test_evict_frees_pool_blocks() -> None:
     # Admit a 3-block sequence that requires eviction (pool: 5 used, cap=6)
     cm.admit(_tokens(48, start=2000), "n0")
 
-    # After eviction + new admit, pool.used must match tree state
+    # M6: pool.used reflects only live GPU blocks; tree may have zombie nodes.
     pool_used = cm._pools["n0"].used("gpu")
-    tree_blocks = sum(len(n.block_ids) for n in cm._trees["n0"]._nodes.values())
-    assert pool_used == tree_blocks
     assert pool_used <= 6
+    # New sequence must be accessible after eviction
+    assert cm.lookup(_req(_tokens(48, start=2000)), "n0").matched_tokens == 48
 
 
 # ---------------------------------------------------------------------------
@@ -518,5 +518,309 @@ def test_gpu_blocks_sensitivity() -> None:
         1 for seq in sequences if cm_small.lookup(_req(seq), "n0").matched_tokens > 0
     )
 
-    assert large_hits == 5           # all cached
-    assert small_hits < large_hits   # tighter capacity → more evictions
+    assert large_hits == 5           # all cached on GPU
+    # M6: with default cpu/disk capacity, small-GPU node demotes to CPU/Disk
+    # rather than evicting from tree → all sequences still accessible.
+    assert small_hits == 5
+    # Key M6 difference: tighter GPU → CPU/Disk hits → higher transfer cost
+    large_transfer = sum(
+        cm_large.lookup(_req(seq), "n0").transfer_cost_ms for seq in sequences
+    )
+    small_transfer = sum(
+        cm_small.lookup(_req(seq), "n0").transfer_cost_ms for seq in sequences
+    )
+    assert large_transfer == 0.0     # large cap: all GPU hits, no transfer cost
+    assert small_transfer > 0.0      # small cap: some CPU hits, non-zero transfer cost
+
+
+# ---------------------------------------------------------------------------
+# M6: Multi-tier demotion + tier-aware lookup
+# ---------------------------------------------------------------------------
+
+
+def test_demotion_gpu_to_cpu_on_admit_when_gpu_full() -> None:
+    """When GPU is full, admitted blocks demote LRU to CPU (not freed from pool)."""
+    model_cfg = ModelConfig(block_size=BLOCK_SIZE, kv_bytes_per_token=512)
+    node_cfg = NodeConfig(gpu_blocks=2, cpu_blocks=4, disk_blocks=0)
+    bw_cfg = BandwidthConfig(gpu_to_cpu=10_000_000_000, cpu_to_disk=1_000_000_000)
+    cm = CacheManager(
+        node_ids=["n0"],
+        model_config=model_cfg,
+        node_config=node_cfg,
+        bandwidth_config=bw_cfg,
+    )
+
+    # Fill GPU: 2 blocks = 32 tokens
+    cm.admit(_tokens(BLOCK_SIZE * 2, start=0), "n0")
+    assert cm.free_blocks("n0", "gpu") == 0
+
+    # Admit a new sequence — LRU should be demoted to CPU, not discarded
+    cm.admit(_tokens(BLOCK_SIZE * 2, start=100), "n0")
+
+    # CPU must now have at least 1 block (the demoted one)
+    assert cm.free_blocks("n0", "cpu") < 4  # something moved to CPU
+
+
+def test_demotion_cpu_to_disk_when_cpu_also_full() -> None:
+    """GPU→CPU→Disk cascade: when CPU is also full, demotion continues to Disk."""
+    model_cfg = ModelConfig(block_size=BLOCK_SIZE, kv_bytes_per_token=512)
+    node_cfg = NodeConfig(gpu_blocks=2, cpu_blocks=2, disk_blocks=4)
+    bw_cfg = BandwidthConfig(gpu_to_cpu=10_000_000_000, cpu_to_disk=1_000_000_000)
+    cm = CacheManager(
+        node_ids=["n0"],
+        model_config=model_cfg,
+        node_config=node_cfg,
+        bandwidth_config=bw_cfg,
+    )
+
+    # Fill GPU
+    cm.admit(_tokens(BLOCK_SIZE * 2, start=0), "n0")
+    # Move existing GPU blocks to CPU to fill it
+    pool = cm._pools["n0"]
+    gpu_bids = list(pool._tiers["gpu"].allocated)
+    for bid in gpu_bids:
+        pool.move(bid, "gpu", "cpu")
+
+    # Re-fill GPU with new blocks
+    for bid in list(pool._tiers["gpu"].allocated):
+        pool.free([bid])
+    cm.admit(_tokens(BLOCK_SIZE * 2, start=200), "n0")
+
+    # Now admit again — GPU full, CPU full → demotion cascades to Disk
+    cm.admit(_tokens(BLOCK_SIZE * 2, start=300), "n0")
+
+    disk_used = cm._pools["n0"].used("disk")
+    assert disk_used >= 1
+
+
+def test_lookup_returns_tier_distribution() -> None:
+    """After demotion to CPU, lookup reports matched_blocks_by_tier with 'cpu' entry."""
+    model_cfg = ModelConfig(block_size=BLOCK_SIZE, kv_bytes_per_token=512)
+    node_cfg = NodeConfig(gpu_blocks=2, cpu_blocks=4, disk_blocks=0)
+    bw_cfg = BandwidthConfig(gpu_to_cpu=10_000_000_000, cpu_to_disk=1_000_000_000)
+    cm = CacheManager(
+        node_ids=["n0"],
+        model_config=model_cfg,
+        node_config=node_cfg,
+        bandwidth_config=bw_cfg,
+    )
+
+    # Admit sequence A, then demote it to CPU manually
+    toks_a = _tokens(BLOCK_SIZE * 2, start=0)
+    cm.admit(toks_a, "n0")
+
+    # Move all GPU blocks to CPU
+    pool = cm._pools["n0"]
+    for bid in list(pool._tiers["gpu"].allocated):
+        pool.move(bid, "gpu", "cpu")
+
+    # Lookup should reflect CPU tier
+    lookup = cm.lookup(_req(toks_a), "n0")
+    assert lookup.matched_tokens > 0
+    assert lookup.matched_blocks_by_tier.get("cpu", 0) > 0
+    assert lookup.matched_blocks_by_tier.get("gpu", 0) == 0
+
+
+def test_transfer_cost_uses_bandwidth_config() -> None:
+    """transfer_cost_ms is correctly computed from bandwidth config for CPU blocks."""
+    block_size = 16
+    kv_bytes = 1_000_000  # 1 MB / token — large to make cost measurable
+    gpu_to_cpu_bw = 1_000_000_000  # 1 GB/s
+
+    model_cfg = ModelConfig(block_size=block_size, kv_bytes_per_token=kv_bytes)
+    node_cfg = NodeConfig(gpu_blocks=4, cpu_blocks=4, disk_blocks=0)
+    bw_cfg = BandwidthConfig(gpu_to_cpu=gpu_to_cpu_bw, cpu_to_disk=1_000_000_000)
+    cm = CacheManager(
+        node_ids=["n0"],
+        model_config=model_cfg,
+        node_config=node_cfg,
+        bandwidth_config=bw_cfg,
+    )
+
+    toks = _tokens(block_size * 2, start=0)  # 2 blocks
+    cm.admit(toks, "n0")
+
+    # Manually move all GPU blocks to CPU tier
+    pool = cm._pools["n0"]
+    for bid in list(pool._tiers["gpu"].allocated):
+        pool.move(bid, "gpu", "cpu")
+
+    lookup = cm.lookup(_req(toks), "n0")
+    cpu_n = lookup.matched_blocks_by_tier.get("cpu", 0)
+    assert cpu_n > 0
+
+    kv_bytes_per_block = block_size * kv_bytes
+    expected_ms = cpu_n * kv_bytes_per_block / gpu_to_cpu_bw * 1000.0
+    assert abs(lookup.transfer_cost_ms - expected_ms) < 1e-6
+
+
+def test_disk_hit_contributes_to_transfer_cost() -> None:
+    """Disk-tier blocks pay both Disk→CPU and CPU→GPU hops (M6.fix2 Important #2)."""
+    block_size = 16
+    kv_bytes = 500_000  # 0.5 MB / token
+    cpu_to_disk_bw = 500_000_000     # 500 MB/s
+    gpu_to_cpu_bw = 10_000_000_000   # 10 GB/s
+
+    model_cfg = ModelConfig(block_size=block_size, kv_bytes_per_token=kv_bytes)
+    node_cfg = NodeConfig(gpu_blocks=4, cpu_blocks=4, disk_blocks=4)
+    bw_cfg = BandwidthConfig(gpu_to_cpu=gpu_to_cpu_bw, cpu_to_disk=cpu_to_disk_bw)
+    cm = CacheManager(
+        node_ids=["n0"],
+        model_config=model_cfg,
+        node_config=node_cfg,
+        bandwidth_config=bw_cfg,
+    )
+
+    toks = _tokens(block_size * 2, start=0)
+    cm.admit(toks, "n0")
+
+    # Move blocks: GPU → CPU → Disk
+    pool = cm._pools["n0"]
+    for bid in list(pool._tiers["gpu"].allocated):
+        pool.move(bid, "gpu", "cpu")
+    for bid in list(pool._tiers["cpu"].allocated):
+        pool.move(bid, "cpu", "disk")
+
+    lookup = cm.lookup(_req(toks), "n0")
+    disk_n = lookup.matched_blocks_by_tier.get("disk", 0)
+    assert disk_n > 0
+
+    # Disk hit = disk→cpu + cpu→gpu (serial).
+    kv_bytes_per_block = block_size * kv_bytes
+    expected_ms = (
+        disk_n * kv_bytes_per_block
+        * (1.0 / cpu_to_disk_bw + 1.0 / gpu_to_cpu_bw) * 1000.0
+    )
+    assert abs(lookup.transfer_cost_ms - expected_ms) < 1e-6
+
+
+def test_disk_load_includes_two_hops() -> None:
+    """M6.fix2 Important #2: disk hit must include both hops in series.
+
+    With cpu_to_disk = gpu_to_cpu = 1 GB/s, the disk cost should be
+    exactly 2× the disk-only single-hop formula.
+    """
+    block_size = 16
+    kv_bytes = 1_000_000
+    bw = 1_000_000_000  # both legs the same
+
+    model_cfg = ModelConfig(block_size=block_size, kv_bytes_per_token=kv_bytes)
+    node_cfg = NodeConfig(gpu_blocks=4, cpu_blocks=4, disk_blocks=4)
+    bw_cfg = BandwidthConfig(gpu_to_cpu=bw, cpu_to_disk=bw)
+    cm = CacheManager(
+        node_ids=["n0"],
+        model_config=model_cfg,
+        node_config=node_cfg,
+        bandwidth_config=bw_cfg,
+    )
+
+    toks = _tokens(block_size * 2, start=0)
+    cm.admit(toks, "n0")
+    pool = cm._pools["n0"]
+    for bid in list(pool._tiers["gpu"].allocated):
+        pool.move(bid, "gpu", "cpu")
+    for bid in list(pool._tiers["cpu"].allocated):
+        pool.move(bid, "cpu", "disk")
+
+    lookup = cm.lookup(_req(toks), "n0")
+    disk_n = lookup.matched_blocks_by_tier["disk"]
+    kv_bytes_per_block = block_size * kv_bytes
+    single_hop = disk_n * kv_bytes_per_block / bw * 1000.0
+    # New formula: both hops counted → exactly 2x single-hop when BWs equal.
+    assert lookup.transfer_cost_ms == pytest.approx(2 * single_hop)
+
+
+def test_zombie_prefix_readmits_correctly() -> None:
+    """M6.fix2 Critical #1: after a prefix's blocks are truly freed
+    (no downstream tier capacity), re-admitting the same prefix must
+    re-materialise it instead of taking the fast-path no-op.
+    """
+    block_size = 16
+    model_cfg = ModelConfig(block_size=block_size, kv_bytes_per_token=512)
+    node_cfg = NodeConfig(gpu_blocks=4, cpu_blocks=0, disk_blocks=0)
+    bw_cfg = BandwidthConfig()
+    cm = CacheManager(
+        node_ids=["n0"],
+        model_config=model_cfg,
+        node_config=node_cfg,
+        bandwidth_config=bw_cfg,
+    )
+
+    toks_a = _tokens(block_size * 4, start=0)   # fills the 4-block pool
+    toks_b = _tokens(block_size * 4, start=500) # disjoint prefix
+
+    cm.admit(toks_a, "n0")
+    assert cm._pools["n0"].used("gpu") == 4
+
+    # Admitting B forces A's blocks to be freed (no cpu/disk capacity).
+    cm.admit(toks_b, "n0")
+
+    # A should no longer be cached anywhere.
+    lookup_a_after_b = cm.lookup(_req(toks_a), "n0")
+    assert lookup_a_after_b.matched_tokens == 0, (
+        "A's blocks were truly freed — lookup should report 0 matches"
+    )
+
+    # Re-admitting A used to short-circuit on the (now zombie) tree path.
+    # After the fix, A must be re-materialised.
+    cm.admit(toks_a, "n0")
+    lookup_a_again = cm.lookup(_req(toks_a), "n0")
+    assert lookup_a_again.matched_tokens == block_size * 4, (
+        f"re-admit must re-materialise A, got matched_tokens={lookup_a_again.matched_tokens}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# M6.fix2: Critical #1 — partial-zombie re-admit
+# ---------------------------------------------------------------------------
+
+
+def test_partial_zombie_readmits_correctly() -> None:
+    """Codex critical repro: gpu=4, cpu=2, disk=0.
+
+    After admit(A) + admit(B) forces A's blocks partially to CPU and partially
+    freed, a second admit(A) must re-populate all 4 blocks on GPU rather than
+    short-circuiting on the zombie tree node and leaving pool.gpu_used == 0.
+    """
+    model_cfg = ModelConfig(block_size=BLOCK_SIZE, kv_bytes_per_token=512)
+    node_cfg = NodeConfig(gpu_blocks=4, cpu_blocks=2, disk_blocks=0)
+    bw_cfg = BandwidthConfig(gpu_to_cpu=10_000_000_000, cpu_to_disk=1_000_000_000)
+    cm = CacheManager(
+        node_ids=["d0"],
+        model_config=model_cfg,
+        node_config=node_cfg,
+        bandwidth_config=bw_cfg,
+    )
+
+    A_tokens = _tokens(BLOCK_SIZE * 4, start=0)
+    B_tokens = _tokens(BLOCK_SIZE * 4, start=100)
+
+    # Step 1: A fills GPU (4 blocks).
+    cm.admit(A_tokens, "d0")
+    assert cm._pools["d0"].used("gpu") == 4
+
+    # Step 2: B is admitted, forcing A's blocks into demotion chain.
+    #         cpu=2 → 2 of A's blocks survive on CPU, 2 are truly freed.
+    cm.admit(B_tokens, "d0")
+
+    lk_mid = cm.lookup(_req(A_tokens), "d0")
+    assert lk_mid.matched_tokens == BLOCK_SIZE * 2  # only 2 live CPU blocks
+    assert lk_mid.matched_blocks_by_tier.get("cpu", 0) == 2
+
+    # Step 3: Re-admit A. Bug: purge_block_ids skips mixed-state node → insert
+    #         reuses zombie node without calling mint → gpu_used stays 0.
+    #         Fix: purge_path_with_any_dead clears the zombie path first.
+    cm.admit(A_tokens, "d0")
+
+    gpu_used = cm._pools["d0"].used("gpu")
+    lk_final = cm.lookup(_req(A_tokens), "d0")
+
+    assert lk_final.matched_tokens == BLOCK_SIZE * 4, (
+        f"Expected {BLOCK_SIZE * 4} matched tokens, got {lk_final.matched_tokens}"
+    )
+    assert lk_final.matched_blocks_by_tier.get("gpu", 0) == 4, (
+        f"Expected 4 GPU blocks, got {lk_final.matched_blocks_by_tier}"
+    )
+    assert gpu_used == 4, (
+        f"Expected gpu_used=4 after re-admit, got {gpu_used}"
+    )

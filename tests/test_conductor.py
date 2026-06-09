@@ -356,3 +356,66 @@ def test_ttft_includes_chunked_prefill(
     chunk = _MC.prefill_chunk_size  # 512
     step_per_chunk = chunk * _MC.prefill_cost_per_token_ms + _MC.decode_base_ms + 1 * _MC.marginal_decode_ms
     assert dec.estimated_ttft_ms == pytest.approx(2 * step_per_chunk + _MC.decode_base_ms + _MC.marginal_decode_ms)
+
+
+# ---------------------------------------------------------------------------
+# M6: transfer_penalty reflects CPU/Disk tier cost
+# ---------------------------------------------------------------------------
+
+
+def test_transfer_penalty_prefers_gpu_hot_node() -> None:
+    """Node with GPU-hot cache gets lower est_ttft than node with CPU-resident cache.
+
+    Set up:
+    - n0: all matched blocks on CPU  → transfer_cost_ms > 0
+    - n1: all matched blocks on GPU  → transfer_cost_ms == 0
+
+    With identical queue lengths and capacities, n1 must win.
+    """
+    TOKENS = list(range(64))  # 64 tokens = 4 blocks at block_size=16
+
+    model_cfg = ModelConfig(
+        block_size=BLOCK_SIZE,
+        kv_bytes_per_token=1_000_000,  # 1 MB/token → cost measurable
+        prefill_cost_per_token_ms=0.1,
+        decode_base_ms=5.0,
+        marginal_decode_ms=0.5,
+    )
+    # Finite bandwidth so transfer cost is non-trivial
+    bw_cfg = BandwidthConfig(gpu_to_cpu=1_000_000_000, gpu_to_gpu=1e30)
+    node_cfg = NodeConfig(gpu_blocks=10, cpu_blocks=10, disk_blocks=0)
+
+    cm = CacheManager(
+        node_ids=["n0", "n1"],
+        model_config=model_cfg,
+        node_config=node_cfg,
+        bandwidth_config=bw_cfg,
+    )
+
+    # Admit same sequence on both nodes
+    cm.admit(TOKENS, "n0")
+    cm.admit(TOKENS, "n1")
+
+    # Demote n0's blocks to CPU
+    pool0 = cm._pools["n0"]
+    for bid in list(pool0._tiers["gpu"].allocated):
+        pool0.move(bid, "gpu", "cpu")
+
+    # n1 keeps blocks on GPU
+
+    lookup_n0 = cm.lookup(_req(TOKENS), "n0")
+    lookup_n1 = cm.lookup(_req(TOKENS), "n1")
+
+    assert lookup_n1.transfer_cost_ms == 0.0
+    assert lookup_n0.transfer_cost_ms > 0.0
+
+    # Scheduler should prefer n1 (lower effective TTFT)
+    nodes = [MockEngineNode(f"n{i}", model_cfg, NodeConfig(capacity=8)) for i in range(2)]
+    conductor = MooncakeConductor(
+        alpha=1.0, beta=1.0, gamma=1.0,
+        model_config=model_cfg, bandwidth_config=bw_cfg,
+    )
+    req = _req(TOKENS, slo_ttft=50000.0)
+    dec = conductor.schedule(req, nodes, nodes, cm)
+    assert not dec.is_rejected
+    assert dec.decode_node == "n1", f"expected n1 (GPU hot), got {dec.decode_node}"

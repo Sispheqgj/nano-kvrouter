@@ -307,3 +307,254 @@ class RadixTree:
             del self._nodes[victim.block_ids[0]]
 
         return evicted
+
+    def match_prefix_path(self, token_ids: list[int]) -> tuple[int, list[str]]:
+        """Find the longest cached prefix and return all block_ids on the path.
+
+        Like :meth:`match_prefix` but accumulates block_ids from every node
+        on the root-to-deepest-match path, not just the deepest node.
+
+        Args:
+            token_ids: Candidate prompt tokens to look up.
+
+        Returns:
+            ``(matched_token_count, path_block_ids)`` where
+            ``path_block_ids`` is the flat concatenation of ``block_ids``
+            for every fully-matched node from root to the deepest match.
+            The root (which has no block_ids) is excluded.
+        """
+        if not token_ids:
+            return 0, []
+
+        node = self._root
+        pos = 0
+        best_pos = 0
+        path_block_ids: list[str] = []
+        now = self._clock()
+
+        while pos < len(token_ids):
+            first = token_ids[pos]
+            if first not in node.children:
+                break
+
+            child = node.children[first]
+            cp = self._cp_len(token_ids[pos:], child.key)
+
+            if cp < len(child.key):
+                break
+
+            child.last_access_time = now
+            pos += cp
+            node = child
+            best_pos = pos
+            path_block_ids.extend(child.block_ids)
+
+        return best_pos, path_block_ids
+
+    def purge_block_ids(
+        self,
+        freed_block_ids: list[str],
+        tier_of: "Callable[[str], str | None]",
+    ) -> int:
+        """Remove leaf nodes whose every block_id is no longer allocated.
+
+        M6.fix2 (Important #1): synchronous tree GC. When
+        ``CacheManager._demote_block`` truly frees a block (disk full, or
+        cpu_blocks==disk_blocks==0), the tree node that owned it becomes
+        a *zombie* — still present, still discoverable by
+        ``match_prefix*``, but pointing at freed pool slots. Future
+        ``lookup`` correctly skips zombies via ``pool.tiers_of``, but
+        ``admit``'s fast path historically used ``tree.match_prefix``
+        (which has no pool awareness) and short-circuited on zombies.
+
+        This API gives the caller a way to purge those zombie leaves
+        immediately after a real free, keeping the tree consistent with
+        the pool.
+
+        Only leaves with ``ref_count == 0`` are eligible — non-leaves
+        cannot be safely removed (their children depend on the path).
+
+        Args:
+            freed_block_ids: Block IDs that have just been released from
+                the pool. Used as a hint to narrow the scan to nodes
+                that could plausibly contain a freed block.
+            tier_of: Callable ``(block_id) -> tier | None`` used to
+                detect zombies. Typically ``pool.tier_of``.
+
+        Returns:
+            Number of zombie leaf nodes removed from the tree.
+        """
+        if not freed_block_ids:
+            return 0
+        freed_set = set(freed_block_ids)
+
+        purged = 0
+        # Snapshot ``_nodes.values()`` because we mutate during iteration.
+        for node in list(self._nodes.values()):
+            if node.children or node.ref_count > 0:
+                continue
+            if not any(b in freed_set for b in node.block_ids):
+                continue
+            if any(tier_of(bid) is not None for bid in node.block_ids):
+                # Mixed-state node: some blocks still live. Don't touch.
+                continue
+            # Fully zombie leaf — detach.
+            if node.parent is not None:
+                # Use first key token (not block_ids[0]) to index parent.children.
+                node.parent.children.pop(node.key[0], None)
+                node.parent = None
+            self._nodes.pop(node.block_ids[0], None)
+            purged += 1
+        return purged
+
+    def _purge_subtree_alive(
+        self,
+        subtree_root: "RadixNode",
+        tier_of: "Callable[[str], str | None]",
+        free_blocks: "Callable[[list[str]], None]",
+    ) -> int:
+        """Recursively detach all descendants, freeing any alive blocks."""
+        purged = 0
+        for child in list(subtree_root.children.values()):
+            alive = [b for b in child.block_ids if tier_of(b) is not None]
+            if alive:
+                free_blocks(alive)
+            if child.block_ids:
+                self._nodes.pop(child.block_ids[0], None)
+            child.parent = None
+            purged += 1
+            purged += self._purge_subtree_alive(child, tier_of, free_blocks)
+        subtree_root.children.clear()
+        return purged
+
+    def purge_path_with_any_dead(
+        self,
+        token_ids: list[int],
+        tier_of: "Callable[[str], str | None]",
+        free_blocks: "Callable[[list[str]], None]",
+    ) -> int:
+        """Walk the prefix path and purge any node that contains a dead block.
+
+        Called by :meth:`CacheManager.admit` when the fast path detects a
+        partial-zombie on the cached path (some blocks alive, some freed).
+        :meth:`purge_block_ids` intentionally skips mixed-state nodes; this
+        method removes the whole node (and its subtree) even when some blocks
+        are still alive, returning those alive blocks to the pool so their
+        tier-capacity is not leaked.
+
+        After this call, :meth:`insert` re-creates the path from scratch
+        and allocates fresh GPU blocks for every position, satisfying the
+        post-admit invariant that the full prompt is resident on GPU.
+
+        Only unreferenced nodes (ref_count == 0) are eligible.
+
+        Args:
+            token_ids: Token sequence that selects the path to inspect.
+            tier_of: pool.tier_of — None return marks dead blocks.
+            free_blocks: pool.free — called with alive block IDs on
+                removed nodes so tier capacity is reclaimed.
+
+        Returns:
+            Total number of tree nodes removed (node + its descendants).
+        """
+        if not token_ids:
+            return 0
+
+        node = self._root
+        pos = 0
+        purged = 0
+
+        while pos < len(token_ids):
+            first = token_ids[pos]
+            if first not in node.children:
+                break
+
+            child = node.children[first]
+            if child.ref_count > 0:
+                break  # pinned — cannot purge
+
+            cp = self._cp_len(token_ids[pos:], child.key)
+            if cp < len(child.key):
+                break
+
+            if any(tier_of(bid) is None for bid in child.block_ids):
+                # Node has at least one dead block — purge it and its subtree.
+                alive = [b for b in child.block_ids if tier_of(b) is not None]
+                if alive:
+                    free_blocks(alive)
+                del node.children[first]
+                if child.block_ids:
+                    self._nodes.pop(child.block_ids[0], None)
+                child.parent = None
+                purged += 1
+                purged += self._purge_subtree_alive(child, tier_of, free_blocks)
+                break  # path severed here
+
+            pos += cp
+            node = child
+
+        return purged
+
+    def demote_lru(
+        self,
+        n_nodes: int,
+        tier_of: "Callable[[str], str | None] | None" = None,
+    ) -> list[list[str]]:
+        """Select LRU leaf nodes for tier demotion without removing them from the tree.
+
+        Like :meth:`evict_lru` in candidate selection (LRU unreferenced
+        leaves) but keeps nodes in the tree so future prefix matches can
+        still find them (at a transfer cost if their blocks are on a slow
+        tier).
+
+        If *tier_of* is supplied, zombie nodes — nodes whose every
+        block_id is no longer allocated (``tier_of`` returns ``None``) —
+        are silently evicted from the tree during the scan so they cannot
+        cause infinite loops in the caller.
+
+        Args:
+            n_nodes: Maximum number of live nodes to return.
+            tier_of: Optional callable ``(block_id) -> tier | None``
+                (e.g. ``pool.tier_of``) used to detect and clean up
+                zombie nodes. Pass ``None`` to skip zombie cleanup.
+
+        Returns:
+            List of ``block_ids`` lists, one per selected node. The
+            caller is responsible for moving or freeing these blocks.
+        """
+        from collections.abc import Callable  # local import to avoid top-level cycle
+
+        demoted: list[list[str]] = []
+
+        # Bound iterations to prevent infinite scan when many zombies exist.
+        max_scans = len(self._nodes) + n_nodes + 1
+        scans = 0
+
+        while len(demoted) < n_nodes and scans < max_scans:
+            scans += 1
+            candidates = [
+                n for n in self._nodes.values()
+                if not n.children and n.ref_count == 0
+            ]
+            if not candidates:
+                break
+
+            victim = min(candidates, key=lambda n: n.last_access_time)
+
+            if tier_of is not None:
+                # Check for zombie (all blocks freed from pool).
+                live = [b for b in victim.block_ids if tier_of(b) is not None]
+                if not live:
+                    # Evict zombie node: clean it from tree but don't touch pool.
+                    assert victim.parent is not None
+                    del victim.parent.children[victim.key[0]]
+                    victim.parent = None
+                    del self._nodes[victim.block_ids[0]]
+                    continue  # pick next candidate
+
+            # Live node: return its block_ids for the caller to demote.
+            demoted.append(victim.block_ids)
+            # Advance last_access_time so repeated calls pick different nodes.
+            victim.last_access_time = self._clock() + 1e-9
+
+        return demoted

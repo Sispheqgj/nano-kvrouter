@@ -8,9 +8,10 @@ SLO early rejection. Prefill_node is selected independently by lowest
                        − β × load_penalty(decode_node)
                        − γ × transfer_penalty(decode_node)
 
-In M5a ``transfer_penalty`` is still always ``0.0`` (the CacheLookup
-field is unused on decode side because KV is already there). M5b will
-attach a KV-transfer penalty term keyed on ``bandwidth.gpu_to_gpu``.
+``transfer_penalty`` is ``CacheLookup.transfer_cost_ms`` for the chosen
+decode_node.  In GPU-only configs this is ``0.0``.  With M6 multi-tier
+HiCache it reflects CPU/Disk prefix-load cost and guides the scheduler
+toward nodes whose hot prefix sits in GPU HBM.
 """
 from __future__ import annotations
 
@@ -124,7 +125,7 @@ class MooncakeConductor:
                 decode.current_load() * prompt_len * ppt
                 + decode.queue_wait_time(prompt_len, request.expected_output_len)
             )
-            transfer_penalty = match.transfer_cost_ms  # 0 in M5a
+            transfer_penalty = match.transfer_cost_ms  # 0 GPU-only; non-0 M6 CPU/Disk hit
             score = (
                 self._alpha * cache_benefit
                 - self._beta * load_penalty

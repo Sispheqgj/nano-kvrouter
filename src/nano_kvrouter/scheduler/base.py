@@ -218,6 +218,11 @@ def compute_est_ttft(
     * ``first_decode_tick`` is the first decode step time on decode_node
       using ``len(decode_node.decoding) + 1`` as the batch size hint
       (the decode_node's own concurrent streams).
+    * ``cache_load_ms`` is ``decode_cache_match.transfer_cost_ms`` — the
+      estimated time to load matched prefix blocks from CPU/Disk into GPU
+      HBM before prefill can start (M6 HiCache).  Zero in GPU-only configs.
+      **This is the within-node tier-migration cost**, distinct from the
+      prefill_node→decode_node KV transfer (``kv_transfer`` term above).
 
     Args:
         prefill_node: Node assigned for the prefill phase.
@@ -249,8 +254,10 @@ def compute_est_ttft(
     kv_bytes = prompt_len * kv_bytes_per_token
     # bandwidth_bytes_per_s is validated > 0 by Pydantic at config load.
     kv_transfer = (kv_bytes / bandwidth_bytes_per_s) * 1000.0
+    # M6: CPU/Disk prefix blocks need loading into GPU HBM before prefill.
+    cache_load_ms = decode_cache_match.transfer_cost_ms
     first_decode_tick = decode_node.estimate_decode_time(decoding_bs)
-    return prefill_phase + queue_wait + kv_transfer + first_decode_tick
+    return prefill_phase + queue_wait + kv_transfer + cache_load_ms + first_decode_tick
 
 
 def compute_est_tbt(decode_node: MockEngineNode) -> float:

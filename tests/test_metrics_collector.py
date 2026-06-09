@@ -706,3 +706,68 @@ def test_b2_mid_prefill_reject_cleans_active_prefills(engine, collector):
                          payload={"request_id": "r0", "reason": "mid_prefill_slo"}))
     engine.run()
     assert "r0" not in collector._active_prefills
+
+
+# ------------------------------------------------------------------
+# M6: cache_hit_by_tier accumulation
+# ------------------------------------------------------------------
+
+
+def test_cache_hit_by_tier_accumulates(engine, collector):
+    """SCHEDULED events with matched_blocks_by_tier increment cache_hit_by_tier."""
+    collector.attach(engine)
+
+    req = _make_request("r0")
+    engine.schedule(_arrive(req, 0.0))
+    # SCHEDULED with tier breakdown
+    engine.schedule(Event(
+        time=1.0,
+        type=EventType.SCHEDULED,
+        payload={
+            "request_id": "r0",
+            "matched_tokens": 32,
+            "matched_blocks_by_tier": {"gpu": 1, "cpu": 2},
+        },
+    ))
+    engine.run()
+
+    summary = collector.summary()
+    by_tier = summary["cache_hit_by_tier_blocks"]
+    assert by_tier["gpu"] == 1
+    assert by_tier["cpu"] == 2
+    assert by_tier["disk"] == 0
+
+
+def test_cache_hit_by_tier_ratio_sums_to_one_when_all_gpu(engine, collector):
+    """When all cache hits are GPU, gpu_ratio == 1.0, others == 0.0."""
+    collector.attach(engine)
+
+    req = _make_request("r1")
+    engine.schedule(_arrive(req, 0.0))
+    engine.schedule(Event(
+        time=1.0,
+        type=EventType.SCHEDULED,
+        payload={
+            "request_id": "r1",
+            "matched_tokens": 16,
+            "matched_blocks_by_tier": {"gpu": 4},
+        },
+    ))
+    engine.run()
+
+    summary = collector.summary()
+    ratio = summary["cache_hit_by_tier_ratio"]
+    # ratio omits tiers with 0 count — use .get() with default 0.0
+    assert ratio.get("gpu", 0.0) == pytest.approx(1.0)
+    assert ratio.get("cpu", 0.0) == pytest.approx(0.0)
+    assert ratio.get("disk", 0.0) == pytest.approx(0.0)
+
+
+def test_cache_hit_by_tier_ratio_zero_when_no_hits(engine, collector):
+    """When no cache hits recorded, ratio returns None (no hits to divide)."""
+    collector.attach(engine)
+    engine.run()
+
+    summary = collector.summary()
+    # No hits → ratio is None (division by zero guard)
+    assert summary["cache_hit_by_tier_ratio"] is None

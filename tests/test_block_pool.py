@@ -159,3 +159,59 @@ def test_default_capacities():
 def test_unknown_tier_raises(pool):
     with pytest.raises(ValueError, match="Unknown tier"):
         pool.allocate(1, "nvme")
+
+
+# ---------------------------------------------------------------------------
+# M6 new: tier_of / tiers_of / move
+# ---------------------------------------------------------------------------
+
+
+def test_tier_of_returns_current_tier() -> None:
+    """tier_of returns the tier name for allocated blocks."""
+    from nano_kvrouter.config import NodeConfig
+    from nano_kvrouter.kv_cache.block_pool import BlockPool
+
+    pool = BlockPool(NodeConfig(gpu_blocks=4, cpu_blocks=4, disk_blocks=4))
+    [gpu_b] = pool.allocate(1, "gpu")
+    [cpu_b] = pool.allocate(1, "cpu")
+    [disk_b] = pool.allocate(1, "disk")
+
+    assert pool.tier_of(gpu_b) == "gpu"
+    assert pool.tier_of(cpu_b) == "cpu"
+    assert pool.tier_of(disk_b) == "disk"
+    assert pool.tier_of("does-not-exist") is None
+
+
+def test_tiers_of_batch_query() -> None:
+    """tiers_of returns a mapping of block_id to tier, omitting freed blocks."""
+    from nano_kvrouter.config import NodeConfig
+    from nano_kvrouter.kv_cache.block_pool import BlockPool
+
+    pool = BlockPool(NodeConfig(gpu_blocks=4, cpu_blocks=4, disk_blocks=0))
+    bids = pool.allocate(2, "gpu")
+    cbids = pool.allocate(2, "cpu")
+
+    result = pool.tiers_of(bids + cbids + ["zombie"])
+    assert result[bids[0]] == "gpu"
+    assert result[bids[1]] == "gpu"
+    assert result[cbids[0]] == "cpu"
+    assert result[cbids[1]] == "cpu"
+    assert "zombie" not in result
+
+
+def test_move_decrements_src_increments_dst() -> None:
+    """move() updates tier tracking and capacity counters."""
+    from nano_kvrouter.config import NodeConfig
+    from nano_kvrouter.kv_cache.block_pool import BlockPool
+
+    pool = BlockPool(NodeConfig(gpu_blocks=2, cpu_blocks=2, disk_blocks=0))
+    [bid] = pool.allocate(1, "gpu")
+    assert pool.tier_of(bid) == "gpu"
+    assert pool.used("gpu") == 1
+    assert pool.used("cpu") == 0
+
+    pool.move(bid, "gpu", "cpu")
+
+    assert pool.tier_of(bid) == "cpu"
+    assert pool.used("gpu") == 0
+    assert pool.used("cpu") == 1

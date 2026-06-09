@@ -209,6 +209,33 @@ class BlockPool:
             for tier, s in self._tiers.items()
         }
 
+    def tier_of(self, block_id: str) -> str | None:
+        """Return the tier of *block_id*, or ``None`` if not allocated."""
+        return self._block_tier.get(block_id)
+
+    def tiers_of(self, block_ids: list[str]) -> dict[str, str]:
+        """Map each *block_id* to its current tier, omitting freed blocks."""
+        return {
+            bid: tier
+            for bid in block_ids
+            if (tier := self._block_tier.get(bid)) is not None
+        }
+
+    def move(self, block_id: str, from_tier: str, to_tier: str) -> None:
+        """Move one block between tiers (public wrapper around ``_move``).
+
+        Args:
+            block_id: Block to move.
+            from_tier: Current tier (validated).
+            to_tier: Destination tier; must have free capacity.
+
+        Raises:
+            KeyError: Block not on ``from_tier``.
+            MemoryError: ``to_tier`` has no free slots.
+        """
+        self._move(block_id, from_tier, to_tier)
+        logger.debug("Moved %s: %s -> %s", block_id, from_tier, to_tier)
+
     def stats(self) -> dict[str, dict[str, int]]:
         """Snapshot of per-tier capacity / used / free counts.
 

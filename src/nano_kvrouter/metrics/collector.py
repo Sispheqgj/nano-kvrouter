@@ -93,6 +93,8 @@ class MetricsCollector:
         # M5a metrics
         # KV transfer cost samples (one per KV_TRANSFER_COMPLETE event).
         self._kv_transfer_cost_samples: list[float] = []
+        # M6 tier-hit counters: accumulated from SCHEDULED matched_blocks_by_tier.
+        self._cache_hit_by_tier: dict[str, int] = {"gpu": 0, "cpu": 0, "disk": 0}
         # transfer_ids seen via KV_TRANSFER_START; guards against stale
         # KV_TRANSFER_COMPLETE events that arrive after cli drops the transfer.
         self._seen_transfer_ids: set[str] = set()
@@ -168,6 +170,9 @@ class MetricsCollector:
                 if self._kv_transfer_cost_samples else None
             ),
             "dual_phase_tick_count": self._dual_phase_tick_count,
+            # M6 tier-hit metrics
+            "cache_hit_by_tier_blocks": dict(self._cache_hit_by_tier),
+            "cache_hit_by_tier_ratio": self._cache_hit_by_tier_ratio(),
         }
 
     # ------------------------------------------------------------------
@@ -208,6 +213,11 @@ class MetricsCollector:
         if decision is not None:
             rec["prefill_node"] = getattr(decision, "prefill_node", None)
             rec["decode_node"] = getattr(decision, "decode_node", None)
+        # M6: accumulate per-tier hit block counts.
+        by_tier = event.payload.get("matched_blocks_by_tier") or {}
+        for tier, n in by_tier.items():
+            if tier in self._cache_hit_by_tier:
+                self._cache_hit_by_tier[tier] += n
 
     def _on_rejected(self, event: Event, engine: SimulationEngine) -> None:
         request_id = event.payload.get("request_id")
@@ -415,3 +425,9 @@ class MetricsCollector:
         if duration_s <= 0:
             return None
         return self._total_decode_tokens / duration_s
+    def _cache_hit_by_tier_ratio(self) -> dict[str, float] | None:
+        """Per-tier hit ratio relative to total matched blocks across all tiers."""
+        total = sum(self._cache_hit_by_tier.values())
+        if total == 0:
+            return None
+        return {tier: n / total for tier, n in self._cache_hit_by_tier.items() if n > 0}
