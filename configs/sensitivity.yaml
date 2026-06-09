@@ -1,0 +1,99 @@
+# nano-kvrouter — LIVE field sensitivity acceptance
+#
+# Notes:
+# - base_config paths are resolved relative to this file by default
+# - each experiment runs one baseline, then one run per candidate value
+# - a field is considered LIVE if any candidate value changes any
+#   primary metric above the CLI threshold policy
+
+experiments:
+  - field: model.decode_base_ms
+    base_config: default.yaml
+    scheduler: conductor
+    values: [7.5, 10.0]
+    primary_metrics: [ttft_p50_ms, tbt_avg_ms]
+    note: Decode step base latency should move TTFT and steady-state TBT.
+
+  - field: model.marginal_decode_ms
+    base_config: default.yaml
+    scheduler: conductor
+    values: [1.0]
+    primary_metrics: [tbt_avg_ms, ttft_p50_ms]
+    note: Larger batch marginal cost should inflate per-token decode latency.
+
+  - field: model.prefill_cost_per_token_ms
+    base_config: default.yaml
+    scheduler: conductor
+    values: [0.066]
+    primary_metrics: [ttft_p50_ms, cache_hit_ratio]
+    note: Prefill cost should show up in TTFT under the default prompt-heavy workload.
+
+  - field: model.prefill_chunk_size
+    base_config: default.yaml
+    scheduler: conductor
+    values: [128, 2048]
+    primary_metrics: [ttft_p50_ms, avg_chunked_prefill_steps_per_request]
+    note: Smaller chunks increase chunk count; larger chunks compress it.
+
+  - field: model.kv_bytes_per_token
+    base_config: default.yaml
+    scheduler: conductor
+    values: [4096, 8192]
+    primary_metrics: [kv_transfer_time_avg_ms, ttft_p50_ms]
+    note: Post-prefill KV transfer cost is linear in bytes per token.
+
+  - field: cluster.decode_nodes
+    base_config: heavy.yaml
+    scheduler: conductor
+    values: [2, 4]
+    primary_metrics: [rejection_rate, throughput_req_per_s]
+    note: Heavy overload scenario is needed to surface decode-pool size sensitivity.
+
+  - field: node.capacity
+    base_config: heavy.yaml
+    scheduler: conductor
+    values: [2, 8]
+    primary_metrics: [rejection_rate, throughput_req_per_s]
+    note: Decode admission capacity should change both rejection and throughput.
+
+  - field: node.gpu_blocks
+    base_config: hicache.yaml
+    scheduler: prefix_greedy
+    values: [200, 2000]
+    primary_metrics: [cache_hit_ratio, cache_hit_by_tier_ratio]
+    note: GPU block pressure should rebalance hits across GPU/CPU/Disk tiers.
+
+  - field: node.cpu_blocks
+    base_config: hicache.yaml
+    scheduler: conductor
+    values: [0, 800]
+    primary_metrics: [cache_hit_ratio, cache_hit_by_tier_ratio]
+    note: CPU tier capacity should absorb demotions before they spill to disk.
+
+  - field: node.disk_blocks
+    base_config: hicache.yaml
+    scheduler: conductor
+    values: [0, 4000]
+    primary_metrics: [cache_hit_ratio, cache_hit_by_tier_ratio]
+    note: Disk tier capacity should change whether cold blocks remain reusable.
+
+  - field: bandwidth.gpu_to_gpu
+    base_config: default.yaml
+    scheduler: conductor
+    values: [5000000000.0, 10000000.0]
+    primary_metrics: [kv_transfer_time_avg_ms, ttft_p50_ms]
+    note: Split P/D KV migration should get slower as GPU-to-GPU bandwidth drops.
+
+  - field: bandwidth.gpu_to_cpu
+    base_config: hicache.yaml
+    scheduler: conductor
+    values: [32000000.0]
+    primary_metrics: [cache_hit_by_tier_ratio, ttft_p50_ms]
+    note: Slower CPU-to-GPU promotion should penalize CPU-resident cache hits.
+
+  - field: bandwidth.cpu_to_disk
+    base_config: hicache.yaml
+    scheduler: conductor
+    values: [5000000.0]
+    primary_metrics: [cache_hit_by_tier_ratio, ttft_p50_ms]
+    note: Slower Disk-to-CPU leg should penalize disk-resident cache hits.

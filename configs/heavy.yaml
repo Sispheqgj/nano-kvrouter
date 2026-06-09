@@ -1,16 +1,15 @@
 # nano-kvrouter — heavy load demo configuration
 #
 # 15-second high-load scenario, designed to:
-# - drive the cluster into saturation so queue_wait dominates TTFT
-# - showcase MooncakeConductor's SLO early rejection vs baselines
-# - cache-aware schedulers reduce prefill, but only conductor maintains SLO hit rate
+# - drive the decode side into saturation
+# - make rejection_rate and throughput_req_per_s sensitive to decode-side capacity
+# - provide a stable scenario for cluster.decode_nodes / node.capacity acceptance sweeps
 #
-# Expected sweep behavior:
-#   round_robin   — rejection ≈ 0%, slo_ttft_hit < 40%   (oblivious overload)
-#   least_loaded  — rejection ≈ 0%, slo_ttft_hit < 50%
-#   prefix_greedy — rejection ≈ 0%, slo_ttft_hit 50-70%  (cache reduces prefill, not queue_wait)
-#   e2_policy     — rejection ≈ 0%, slo_ttft_hit 50-70%
-#   conductor     — rejection 30-60%, slo_ttft_hit > 80% ← the story
+# Expected qualitative behavior:
+# - fewer decode nodes -> higher rejection, lower throughput
+# - smaller node capacity -> higher rejection, lower throughput
+# - schedulers still differ, but this file is primarily a pressure scenario,
+#   not a locked-in benchmark table
 
 cluster:
   prefill_nodes: 4

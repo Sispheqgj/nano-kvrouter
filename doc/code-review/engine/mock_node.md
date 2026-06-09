@@ -71,10 +71,16 @@ running_requests / capacity
 `queue_wait_time()` 使用：
 
 ```text
-queue_depth * decode_base_ms
+n_blockers * (prompt_len * prefill_cost_per_token_ms
+            + expected_output_len * (decode_base_ms + bs * marginal_decode_ms))
 ```
 
-这是一个有意简化的相对惩罚。它可以告诉 scheduler “这个节点已经有等待请求”，但不能作为严格 TTFT/TBT 预测。
+这已经不是最早期的“只按队列深度乘固定 decode 基线”的粗略惩罚，而是一个
+基于“新请求自身长度”和当前 batch 上界的保守等待时间估算。
+
+它仍然是 simulator 级近似，因为节点内部没有保存每个 blocker 的真实
+`(prompt_len, expected_output_len)`，所以面对 mixed-length workload 时会有
+高估或低估。
 
 ### 5. 请求生命周期
 
@@ -125,7 +131,7 @@ iteration_cost = f(prefill_chunk_tokens + decode_batch_tokens)
 | ~~Prefill 被建模成一次性原子阶段~~ | ~~无法模拟长 prompt 阻塞 decode 的 generation stall~~ | ~~`estimate_prefill_time()` 直接返回总 prefill time~~ | ~~高~~ → **M3 已解决** |
 | ~~缺少 chunked prefill 抽象~~ | ~~不能对照 Sarathi-Serve 的核心机制做实验~~ | ~~没有 `chunk_size`、`token_budget`、chunk event~~ | ~~高~~ → **M3 已解决** |
 | 没有暴露 KV cache 占用/剩余容量 | 调度器无法判断某个节点还能不能容纳新的 prefix，也无法做 capacity-aware cache placement | `MockEngineNode` 只暴露 running/queue load | 高 |
-| `queue_wait_time()` 过于乐观 | 不适合用于严格 SLO admission 判断 | 只使用 `queue_depth * decode_base_ms` | 中 |
+| `queue_wait_time()` 仍是长度近似 | mixed-length workload 下会高估或低估 blocker 生命周期 | 以“新请求自身长度”估算所有 blocker | 中 |
 | latency 公式和节点状态耦合在一个类里 | 后续增加 transfer、stall、chunk 逻辑时文件会变重 | `MockEngineNode` 同时维护状态和公式 | 中 |
 
 ## 后续 PR 候选

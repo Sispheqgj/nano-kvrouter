@@ -20,6 +20,8 @@ nano-kvrouter 是一个 KV-cache-centric LLM serving control-plane simulator。
 - 纯 Python、事件驱动、单线程模拟。
 - 不运行真实 GPU 推理，不存实际 tensor。
 - 节点通过 mock latency model 模拟 prefill、decode、排队和容量压力。
+- 当前主线能力已经覆盖 continuous batching、chunked prefill、
+  split P/D、multi-tier HiCache 和 sensitivity acceptance workflow。
 - 重点不是复刻 vLLM/SGLang 的底层执行引擎，而是在 control plane 层学习调度、admission、cache-aware routing、metrics 和 SLO 判断。
 
 ## 文档索引
@@ -38,7 +40,7 @@ nano-kvrouter 是一个 KV-cache-centric LLM serving control-plane simulator。
 | 模块 | Review 文档 | 对照系统 | 重点问题 |
 |------|-------------|----------|----------|
 | Mock node | [`doc/code-review/engine/mock_node.md`](code-review/engine/mock_node.md) | Sarathi-Serve | chunked prefill、token budget、generation stall |
-| Cache manager | [`doc/code-review/kv_cache/cache_manager.md`](code-review/kv_cache/cache_manager.md) | RadixTree / BlockPool | split-aware reconcile rollback，区分逻辑命中和物理占用 |
+| Cache manager | [`doc/code-review/kv_cache/cache_manager.md`](code-review/kv_cache/cache_manager.md) | SGLang / vLLM v1 / Mooncake / HiCache | split headroom over-evict，tier hit 成本仍是简化带宽模型 |
 | Request generator | [`doc/code-review/simulator/generator.md`](code-review/simulator/generator.md) | BurstGPT / Preble / Mooncake / vLLM / AIPerf | trace replay、混合长度、burst、session-aware prefix |
 | Radix prefix cache | 待建 | SGLang RadixAttention | prefix match、node split、LRU eviction 是否表达清楚 |
 | Block pool | 待建 | vLLM v1 / HiCache | block metadata、tier movement、capacity pressure |

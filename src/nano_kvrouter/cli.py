@@ -17,13 +17,22 @@ import argparse
 import csv
 import json
 import logging
+from collections.abc import Mapping
+from numbers import Number
 from pathlib import Path
 from typing import Any
 
 from rich.console import Console
 from rich.table import Table
 
-from nano_kvrouter.config import BandwidthConfig, ModelConfig, NanoKVConfig, load_config
+from nano_kvrouter.config import (
+    BandwidthConfig,
+    ModelConfig,
+    NanoKVConfig,
+    SensitivityExperiment,
+    load_config,
+    load_sensitivity_config,
+)
 from nano_kvrouter.engine.mock_node import MockEngineNode
 from nano_kvrouter.kv_cache.cache_manager import CacheManager
 from nano_kvrouter.metrics.collector import MetricsCollector
@@ -581,6 +590,207 @@ def _fmt(v: Any) -> str:
     return str(v)
 
 
+def _resolve_related_config_path(config_path: str, related_path: str) -> Path:
+    candidate = Path(related_path)
+    if candidate.is_absolute():
+        return candidate
+
+    config_parent_candidate = Path(config_path).resolve().parent / candidate
+    if config_parent_candidate.exists():
+        return config_parent_candidate
+
+    cwd_candidate = Path.cwd() / candidate
+    if cwd_candidate.exists():
+        return cwd_candidate
+
+    return config_parent_candidate
+
+
+def _get_nested_attr(cfg: NanoKVConfig, field_path: str) -> Any:
+    current: Any = cfg
+    for part in field_path.split("."):
+        if not hasattr(current, part):
+            raise AttributeError(f"Unknown config field path: {field_path!r}")
+        current = getattr(current, part)
+    return current
+
+
+def _set_nested_config_value(cfg: NanoKVConfig, field_path: str, value: Any) -> NanoKVConfig:
+    cloned = cfg.model_copy(deep=True)
+    parts = field_path.split(".")
+    current: Any = cloned
+    for part in parts[:-1]:
+        if not hasattr(current, part):
+            raise AttributeError(f"Unknown config field path: {field_path!r}")
+        current = getattr(current, part)
+
+    leaf = parts[-1]
+    if not hasattr(current, leaf):
+        raise AttributeError(f"Unknown config field path: {field_path!r}")
+    setattr(current, leaf, value)
+    return cloned
+
+
+def _set_scheduler_name(cfg: NanoKVConfig, scheduler_name: str) -> NanoKVConfig:
+    cloned = cfg.model_copy(deep=True)
+    cloned.scheduler.name = scheduler_name
+    return cloned
+
+
+def _select_metrics(summary: dict[str, Any], metric_names: list[str]) -> dict[str, Any]:
+    return {name: summary.get(name) for name in metric_names}
+
+
+def _delta_abs(baseline: Any, candidate: Any) -> Any:
+    if isinstance(baseline, Mapping) and isinstance(candidate, Mapping):
+        return {
+            key: _delta_abs(baseline.get(key), candidate.get(key))
+            for key in sorted(baseline.keys() | candidate.keys())
+        }
+    if isinstance(baseline, Number) and isinstance(candidate, Number):
+        return candidate - baseline
+    return None
+
+
+def _delta_pct(baseline: Any, candidate: Any) -> Any:
+    if isinstance(baseline, Mapping) and isinstance(candidate, Mapping):
+        return {
+            key: _delta_pct(baseline.get(key), candidate.get(key))
+            for key in sorted(baseline.keys() | candidate.keys())
+        }
+    if not isinstance(baseline, Number) or not isinstance(candidate, Number):
+        return None
+    if baseline == 0:
+        return None
+    return (candidate - baseline) / baseline
+
+
+def _iter_metric_leaves(metric_name: str, value: Any) -> list[tuple[str, Any]]:
+    if isinstance(value, Mapping):
+        leaves: list[tuple[str, Any]] = []
+        for key, inner_value in value.items():
+            leaves.extend(_iter_metric_leaves(f"{metric_name}.{key}", inner_value))
+        return leaves
+    return [(metric_name, value)]
+
+
+def _metric_threshold_met(metric_name: str, baseline: Any, candidate: Any) -> bool:
+    if not isinstance(baseline, Number) or not isinstance(candidate, Number):
+        return False
+
+    delta_abs = abs(candidate - baseline)
+    delta_pct = None if baseline == 0 else abs((candidate - baseline) / baseline)
+    root_metric = metric_name.split(".", 1)[0]
+
+    if root_metric.endswith("_ratio") or root_metric.endswith("_rate"):
+        return delta_abs >= 0.005
+    if root_metric.endswith("_ms"):
+        return delta_abs >= 0.5 or (delta_pct is not None and delta_pct >= 0.01)
+    if "throughput" in root_metric or "rejection" in root_metric:
+        return delta_abs >= 0.005 or (delta_pct is not None and delta_pct >= 0.01)
+    if root_metric.endswith("_count") or "steps_per_request" in root_metric or "batch_size" in root_metric:
+        return delta_abs >= 0.5 or (delta_pct is not None and delta_pct >= 0.01)
+    return delta_abs > 1e-9
+
+
+def _changed_metric_names(
+    baseline_metrics: dict[str, Any],
+    candidate_metrics: dict[str, Any],
+) -> list[str]:
+    changed: list[str] = []
+    for metric_name, baseline_value in baseline_metrics.items():
+        candidate_value = candidate_metrics.get(metric_name)
+        baseline_leaves = dict(_iter_metric_leaves(metric_name, baseline_value))
+        candidate_leaves = dict(_iter_metric_leaves(metric_name, candidate_value))
+        for leaf_name in baseline_leaves.keys() | candidate_leaves.keys():
+            if _metric_threshold_met(
+                leaf_name,
+                baseline_leaves.get(leaf_name),
+                candidate_leaves.get(leaf_name),
+            ):
+                changed.append(leaf_name)
+    return sorted(set(changed))
+
+
+def _run_sensitivity_experiment(
+    experiment: SensitivityExperiment,
+    *,
+    sensitivity_config_path: str,
+) -> dict[str, Any]:
+    base_config_path = _resolve_related_config_path(sensitivity_config_path, experiment.base_config)
+    base_cfg = _set_scheduler_name(load_config(str(base_config_path)), experiment.scheduler)
+    baseline_value = _get_nested_attr(base_cfg, experiment.field)
+    baseline_summary = _run_one(base_cfg, experiment.scheduler)
+    baseline_metrics = _select_metrics(baseline_summary, experiment.primary_metrics)
+
+    candidates: list[dict[str, Any]] = []
+    for candidate_value in experiment.values:
+        candidate_cfg = _set_nested_config_value(base_cfg, experiment.field, candidate_value)
+        candidate_summary = _run_one(candidate_cfg, experiment.scheduler)
+        candidate_metrics = _select_metrics(candidate_summary, experiment.primary_metrics)
+        changed_metrics = _changed_metric_names(baseline_metrics, candidate_metrics)
+        candidates.append(
+            {
+                "field": experiment.field,
+                "base_config": experiment.base_config,
+                "scheduler": experiment.scheduler,
+                "baseline_value": baseline_value,
+                "candidate_value": candidate_value,
+                "primary_metrics": list(experiment.primary_metrics),
+                "note": experiment.note,
+                "metrics": {
+                    "baseline": baseline_metrics,
+                    "candidate": candidate_metrics,
+                    "delta_abs": _delta_abs(baseline_metrics, candidate_metrics),
+                    "delta_pct": _delta_pct(baseline_metrics, candidate_metrics),
+                },
+                "candidate_summary": candidate_summary,
+                "changed_metrics": changed_metrics,
+                "changed": bool(changed_metrics),
+            }
+        )
+
+    return {
+        "field": experiment.field,
+        "base_config": experiment.base_config,
+        "scheduler": experiment.scheduler,
+        "primary_metrics": list(experiment.primary_metrics),
+        "note": experiment.note,
+        "baseline": {
+            "value": baseline_value,
+            "summary": baseline_summary,
+            "metrics": baseline_metrics,
+        },
+        "candidates": candidates,
+        "changed": any(candidate["changed"] for candidate in candidates),
+    }
+
+
+def _run_sensitivity_report(config_path: str) -> dict[str, Any]:
+    sensitivity_cfg = load_sensitivity_config(config_path)
+    experiments: list[dict[str, Any]] = []
+
+    for experiment in sensitivity_cfg.experiments:
+        console.print(
+            f"[dim]running sensitivity {experiment.field} "
+            f"({experiment.base_config}, {experiment.scheduler})...[/dim]"
+        )
+        experiments.append(
+            _run_sensitivity_experiment(
+                experiment,
+                sensitivity_config_path=config_path,
+            )
+        )
+
+    passed_fields = sum(1 for experiment in experiments if experiment["changed"])
+    return {
+        "config": config_path,
+        "experiments": experiments,
+        "passed_fields": passed_fields,
+        "total_fields": len(experiments),
+    }
+
+
 def _print_single_table(summary: dict, scheduler_name: str) -> None:
     table = Table(title=f"nano-kvrouter — {scheduler_name}")
     table.add_column("Metric", style="cyan")
@@ -603,6 +813,38 @@ def _print_comparison_table(results: dict[str, dict]) -> None:
     console.print(table)
 
 
+def _print_sensitivity_table(report: dict[str, Any]) -> None:
+    table = Table(
+        title=(
+            "nano-kvrouter — sensitivity acceptance "
+            f"({report['passed_fields']}/{report['total_fields']} fields PASS)"
+        )
+    )
+    table.add_column("Field", style="cyan")
+    table.add_column("Scenario")
+    table.add_column("Value")
+    table.add_column("Changed Metrics")
+    table.add_column("Candidate", justify="center")
+    table.add_column("Field LIVE", justify="center")
+
+    for experiment in report["experiments"]:
+        field_live = "PASS" if experiment["changed"] else "FAIL"
+        scenario = f"{experiment['base_config']} / {experiment['scheduler']}"
+        for candidate in experiment["candidates"]:
+            changed_metrics = ", ".join(candidate["changed_metrics"]) or "—"
+            candidate_live = "PASS" if candidate["changed"] else "FAIL"
+            table.add_row(
+                experiment["field"],
+                scenario,
+                f"{candidate['baseline_value']} -> {candidate['candidate_value']}",
+                changed_metrics,
+                candidate_live,
+                field_live,
+            )
+
+    console.print(table)
+
+
 def _write_csv(results: dict[str, dict], output_path: str) -> None:
     """Long format: one row per (scheduler, metric)."""
     with Path(output_path).open("w", newline="") as f:
@@ -615,6 +857,64 @@ def _write_csv(results: dict[str, dict], output_path: str) -> None:
 
 def _write_json(results: dict[str, dict], output_path: str) -> None:
     Path(output_path).write_text(json.dumps(results, indent=2, default=str))
+
+
+def _flatten_metric_rows(prefix: str, value: Any) -> list[tuple[str, Any]]:
+    if isinstance(value, Mapping):
+        rows: list[tuple[str, Any]] = []
+        for key in sorted(value):
+            inner_value = value[key]
+            rows.extend(_flatten_metric_rows(f"{prefix}.{key}", inner_value))
+        return rows
+    return [(prefix, value)]
+
+
+def _write_sensitivity_csv(report: dict[str, Any], output_path: str) -> None:
+    with Path(output_path).open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "field",
+                "base_config",
+                "scheduler",
+                "baseline_value",
+                "candidate_value",
+                "metric",
+                "baseline_metric_value",
+                "candidate_metric_value",
+                "delta_abs",
+                "delta_pct",
+                "candidate_changed",
+                "field_changed",
+            ]
+        )
+        for experiment in report["experiments"]:
+            for candidate in experiment["candidates"]:
+                baseline_rows = dict(_flatten_metric_rows("", candidate["metrics"]["baseline"]))
+                candidate_rows = dict(_flatten_metric_rows("", candidate["metrics"]["candidate"]))
+                delta_abs_rows = dict(_flatten_metric_rows("", candidate["metrics"]["delta_abs"]))
+                delta_pct_rows = dict(_flatten_metric_rows("", candidate["metrics"]["delta_pct"]))
+                for metric_name in sorted(baseline_rows.keys() | candidate_rows.keys()):
+                    writer.writerow(
+                        [
+                            experiment["field"],
+                            experiment["base_config"],
+                            experiment["scheduler"],
+                            candidate["baseline_value"],
+                            candidate["candidate_value"],
+                            metric_name.lstrip("."),
+                            baseline_rows.get(metric_name),
+                            candidate_rows.get(metric_name),
+                            delta_abs_rows.get(metric_name),
+                            delta_pct_rows.get(metric_name),
+                            candidate["changed"],
+                            experiment["changed"],
+                        ]
+                    )
+
+
+def _write_sensitivity_json(report: dict[str, Any], output_path: str) -> None:
+    Path(output_path).write_text(json.dumps(report, indent=2, default=str))
 
 
 # ----------------- argparse + entrypoints -----------------
@@ -667,6 +967,24 @@ def cmd_sweep(args: argparse.Namespace) -> None:
     _print_comparison_table(results)
 
 
+def cmd_sensitivity(args: argparse.Namespace) -> None:
+    """Run config-driven LIVE field sensitivity acceptance experiments."""
+    report = _run_sensitivity_report(args.config)
+
+    if args.output:
+        if args.output.endswith(".csv"):
+            _write_sensitivity_csv(report, args.output)
+        elif args.output.endswith(".json"):
+            _write_sensitivity_json(report, args.output)
+        else:
+            raise SystemExit(
+                f"--output must end in .csv or .json; got {args.output!r}"
+            )
+        console.print(f"[dim]results written to {args.output}[/dim]")
+
+    _print_sensitivity_table(report)
+
+
 def main() -> None:
     """Parse CLI arguments and dispatch to the appropriate command."""
     parser = argparse.ArgumentParser(
@@ -697,6 +1015,22 @@ def main() -> None:
         help="write results to FILE.csv or FILE.json",
     )
     p_sweep.set_defaults(func=cmd_sweep)
+
+    p_sensitivity = sub.add_parser(
+        "sensitivity",
+        help="Run config-driven LIVE field sensitivity acceptance experiments",
+    )
+    p_sensitivity.add_argument(
+        "--config",
+        required=True,
+        help="path to sensitivity YAML config file",
+    )
+    p_sensitivity.add_argument(
+        "--output",
+        default=None,
+        help="write results to FILE.csv or FILE.json",
+    )
+    p_sensitivity.set_defaults(func=cmd_sensitivity)
 
     args = parser.parse_args()
     args.func(args)

@@ -1,3 +1,11 @@
+# nano-kvrouter — HiCache demo configuration
+#
+# Multi-tier cache scenario, designed to:
+# - keep GPU capacity intentionally small
+# - force GPU -> CPU -> Disk demotion and tier-aware lookup
+# - surface sensitivity for gpu_blocks / cpu_blocks / disk_blocks /
+#   gpu_to_cpu / cpu_to_disk
+
 cluster:
   prefill_nodes: 2
   decode_nodes: 4

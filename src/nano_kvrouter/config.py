@@ -22,23 +22,43 @@ class ClusterConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     prefill_nodes: int = Field(default=4, ge=1)
-    decode_nodes: int = Field(default=4, ge=1)
+    decode_nodes: int = Field(
+        default=4,
+        ge=1,
+        description="LIVE in P2-Infra M5+. Sizes the decode-node pool built by cli._run_one().",
+    )
 
 
 class NodeConfig(BaseModel):
     """Per-node resource limits.
 
-    `gpu_blocks` / `cpu_blocks` / `disk_blocks` size the three-tier
+    `gpu_blocks` / `cpu_blocks` / `disk_blocks` size the live three-tier
     `BlockPool`. `capacity` caps the number of concurrent running requests
-    on a node — exceeding it pushes new admits into the wait queue.
+    on a node and therefore affects queueing and decode-side rejection.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    gpu_blocks: int = Field(default=2_000, ge=0)
-    cpu_blocks: int = Field(default=10_000, ge=0)
-    disk_blocks: int = Field(default=100_000, ge=0)
-    capacity: int = Field(default=32, ge=1)
+    gpu_blocks: int = Field(
+        default=2_000,
+        ge=0,
+        description="LIVE in M4+. GPU-tier KV capacity in blocks.",
+    )
+    cpu_blocks: int = Field(
+        default=10_000,
+        ge=0,
+        description="LIVE in M6+. CPU-tier HiCache capacity in blocks.",
+    )
+    disk_blocks: int = Field(
+        default=100_000,
+        ge=0,
+        description="LIVE in M6+. Disk-tier HiCache capacity in blocks.",
+    )
+    capacity: int = Field(
+        default=32,
+        ge=1,
+        description="LIVE in M1+. Per-node concurrent request capacity used by admission and queueing.",
+    )
 
 
 class ModelConfig(BaseModel):
@@ -60,9 +80,21 @@ class ModelConfig(BaseModel):
                     "(prompt_len * kv_bytes_per_token / bandwidth.gpu_to_gpu) "
                     "for the post-prefill KV migration in split P/D.",
     )
-    prefill_cost_per_token_ms: float = Field(default=0.033, gt=0)
-    decode_base_ms: float = Field(default=5.0, gt=0)
-    marginal_decode_ms: float = Field(default=0.5, gt=0)
+    prefill_cost_per_token_ms: float = Field(
+        default=0.033,
+        gt=0,
+        description="LIVE in M1+. Prefill latency slope per uncached token.",
+    )
+    decode_base_ms: float = Field(
+        default=5.0,
+        gt=0,
+        description="LIVE in M1+. Base decode-step latency component.",
+    )
+    marginal_decode_ms: float = Field(
+        default=0.5,
+        gt=0,
+        description="LIVE in M1+. Per-batch decode-step marginal latency component.",
+    )
     prefill_chunk_size: int = Field(
         default=512,
         ge=1,
@@ -75,10 +107,10 @@ class ModelConfig(BaseModel):
 class BandwidthConfig(BaseModel):
     """Inter-tier transfer bandwidths in bytes/second.
 
-    Activation status:
-      - M5a (LIVE): ``gpu_to_gpu`` drives KV transfer cost for P/D split.
-      - P2-Infra M6 (DEAD): ``gpu_to_cpu`` / ``cpu_to_disk`` for HiCache tier
-        promotion / demotion latency.
+    All three fields are LIVE:
+      - ``gpu_to_gpu`` drives prefill->decode KV transfer cost in split P/D.
+      - ``gpu_to_cpu`` drives CPU-tier hit reload cost into GPU HBM.
+      - ``cpu_to_disk`` drives the Disk->CPU leg of disk-tier hit reload cost.
 
     Defaults approximate A100-class hardware: NVLink GPU↔GPU, PCIe Gen4
     GPU↔CPU, NVMe CPU↔Disk.
@@ -93,11 +125,11 @@ class BandwidthConfig(BaseModel):
     )
     gpu_to_cpu: float = Field(
         default=32e9, gt=0,
-        description="DEAD until P2-Infra M6. Will set GPU→CPU tier demotion bandwidth.",
+        description="LIVE in M6+. GPU-facing bandwidth used for CPU-tier reload cost.",
     )
     cpu_to_disk: float = Field(
         default=5e9, gt=0,
-        description="DEAD until P2-Infra M6. Will set CPU→Disk tier demotion bandwidth.",
+        description="LIVE in M6+. Disk-facing bandwidth used for disk-tier reload cost.",
     )
 
 
@@ -182,6 +214,27 @@ class NanoKVConfig(BaseModel):
     generator: GeneratorConfig = Field(default_factory=GeneratorConfig)
 
 
+class SensitivityExperiment(BaseModel):
+    """One field-level sensitivity experiment for LIVE acceptance."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    field: str = Field(min_length=1)
+    base_config: str = Field(min_length=1)
+    scheduler: str = Field(min_length=1)
+    values: list[int | float] = Field(min_length=1)
+    primary_metrics: list[str] = Field(min_length=1)
+    note: str | None = None
+
+
+class SensitivityConfig(BaseModel):
+    """Config-driven collection of sensitivity experiments."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    experiments: list[SensitivityExperiment] = Field(min_length=1)
+
+
 def load_config(path: str) -> NanoKVConfig:
     """Load and validate a `NanoKVConfig` from a YAML file.
 
@@ -198,4 +251,13 @@ def load_config(path: str) -> NanoKVConfig:
     data = yaml.safe_load(raw) or {}
     cfg = NanoKVConfig.model_validate(data)
     logger.debug("Loaded config from %s", path)
+    return cfg
+
+
+def load_sensitivity_config(path: str) -> SensitivityConfig:
+    """Load and validate a ``SensitivityConfig`` from a YAML file."""
+    raw = Path(path).read_text()
+    data = yaml.safe_load(raw) or {}
+    cfg = SensitivityConfig.model_validate(data)
+    logger.debug("Loaded sensitivity config from %s", path)
     return cfg

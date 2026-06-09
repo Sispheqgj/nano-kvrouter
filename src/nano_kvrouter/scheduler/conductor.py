@@ -47,25 +47,14 @@ class MooncakeConductor:
           decode scoring in M5a.
         * **Ties**: ``(−score, node_id)`` so ties resolve by node_id
           deterministically.
-        * **transfer_penalty** (roadmap):
+        * **transfer_penalty**:
 
-          transfer_penalty:
-              Currently ``0.0`` in M5a — ``CacheManager.lookup`` returns
-              ``transfer_cost_ms=0.0`` because all matched blocks are on GPU
-              HBM (GPU-only tier, no cross-node hit in M5a).
-
-          ``transfer_penalty`` in the score formula is always ``0.0`` in
-          M5a — ``CacheManager.lookup`` returns ``transfer_cost_ms=0.0``
-          because all matched blocks are on GPU HBM (GPU-only tier, no
-          cross-node hit possible in M5a).
-
-          The field is reserved for **M6 multi-tier HiCache**: when a
-          prefix hit resides on a CPU or Disk tier instead of GPU HBM,
-          ``CacheManager.lookup`` will return a non-zero
-          ``transfer_cost_ms`` reflecting the bandwidth-bound cost to
-          load those blocks back into GPU before prefill starts.  The
-          conductor can then trade off "use this distant cache hit" vs
-          "recompute from scratch on a lightly-loaded node".
+          ``transfer_penalty`` is ``CacheLookup.transfer_cost_ms`` from
+          ``CacheManager.lookup`` for the candidate decode node. GPU-tier
+          hits have ``0.0`` reload cost because the matched blocks are
+          already in HBM. M6 HiCache CPU/Disk tier hits return a non-zero
+          bandwidth-bound reload cost, allowing Conductor to trade "reuse
+          a colder prefix" against "recompute on a less loaded node".
 
           **Important**: ``transfer_penalty`` here is the *within-node
           tier-migration cost* (CPU → GPU or Disk → CPU → GPU).  It is
