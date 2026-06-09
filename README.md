@@ -39,6 +39,51 @@ The repository currently exposes three public CLI workflows:
 - `sweep`: run all five schedulers and print a comparison table
 - `sensitivity`: run config-driven LIVE field experiments and emit a field-level PASS/FAIL punch list
 
+## Why a simulator
+
+Real LLM serving systems answer four control-plane questions per request:
+
+1. **Which prefill node?** — cache affinity vs. load balance.
+2. **Which decode node?** — capacity headroom vs. tier-affinity for the KV transfer destination.
+3. **Which storage tier loads the KV cache?** — GPU HBM, CPU DRAM, or disk; the reload cost feeds back into routing.
+4. **Should this request be rejected?** — prediction-based early rejection when no node can hit the SLO.
+
+Studying these decisions on a real cluster is slow, expensive, and
+non-reproducible. Studying them on synthetic latency models on a single
+machine is fast, free, and deterministic — at the cost of not measuring
+absolute throughput. `nano-kvrouter` deliberately makes that trade.
+
+## Demo at a glance
+
+A 15-second saturation benchmark on the split P/D cluster (`configs/heavy.yaml`,
+`uv run python -m nano_kvrouter.cli sweep --config configs/heavy.yaml`,
+numbers as of M6, 2026-06-09):
+
+| scheduler       | TTFT p50 | TTFT p99 | cache_hit | rejection | throughput  |
+| --------------- | -------- | -------- | --------- | --------- | ----------- |
+| `round_robin`   | 24 ms    | 46 ms    | 0.540     | 19.2%     | 61.0 req/s  |
+| `least_loaded`  | 24 ms    | 46 ms    | 0.525     | 21.4%     | 59.3 req/s  |
+| `prefix_greedy` | 24 ms    | 44 ms    | **0.582** | **51.8%** | 36.4 req/s  |
+| `e2_policy`     | 24 ms    | 45 ms    | 0.564     | 21.6%     | 59.2 req/s  |
+| `conductor`     | 24 ms    | 46 ms    | 0.534     | **20.1%** | 60.3 req/s  |
+
+Notable from the same run:
+
+- `prefix_greedy` achieves the highest cache_hit_ratio (0.582) but its high
+  rejection (51.8%) reveals an implicit admission-control gap: cache-greedy
+  placement concentrates load on hot decode nodes.
+- `conductor` balances load best (20.1% rejection) close to the theoretical
+  minimum given the request rate vs. decode capacity ratio.
+- With P/D split (M5), TTFT is uniform across schedulers — back-pressure is
+  absorbed by the separate prefill pool, and rejection is now capacity-driven
+  rather than SLO-driven.
+
+The unsaturated demo (`configs/default.yaml`) shows all schedulers completing
+100% of requests at ~28 ms TTFT, with cache-aware policies at cache_hit ≈ 0.56
+vs. load-balanced at ≈ 0.50.
+
+For a multi-tier HiCache demo (CPU + Disk reuse), see `configs/hicache.yaml`.
+
 ## Quick start
 
 The project uses [`uv`](https://docs.astral.sh/uv/).
@@ -155,6 +200,31 @@ CPU or Disk tier can land in a platform region where a particular candidate
 shows `Candidate FAIL`, while a collapsing candidate such as `400 -> 0` or
 `2000 -> 0` still proves that the field is LIVE.
 
+## Schedulers
+
+Each scheduler is a small (~80–150 line) module implementing the
+`SchedulingPolicy` protocol. They are intentionally minimal — the
+algorithm should be readable in one sitting alongside the matching paper.
+
+| Scheduler           | Paper                          | Key idea                                                                              |
+| ------------------- | ------------------------------ | ------------------------------------------------------------------------------------- |
+| `RoundRobinPolicy`  | —                              | Rotate across nodes. Cache-blind baseline.                                            |
+| `LeastLoadedPolicy` | —                              | Pick the node with lowest `running / capacity`. Cache-blind baseline.                 |
+| `PrefixGreedyPolicy`| SGLang (NeurIPS'24)            | Pick the node with the longest cached prefix. Maximises cache reuse, ignores load.    |
+| `E2Policy`          | Preble (ICLR'25)               | Score = historical_load + eviction_cost + run_cost. Trades cache hit against pressure.|
+| `MooncakeConductor` | Mooncake (FAST'25 Best Paper)  | Three-objective scoring + SLO early rejection. Rejects when no node can hit the SLO.  |
+
+Selecting a scheduler is a one-line YAML change:
+
+```yaml
+scheduler:
+  name: conductor       # or round_robin / least_loaded / prefix_greedy / e2_policy
+  params:
+    alpha: 1.0          # cache_benefit weight
+    beta: 1.0           # load_penalty weight
+    gamma: 1.0          # transfer_penalty weight (GPU-only: 0; M6 multi-tier: CPU/Disk hit cost)
+```
+
 ## Paper fidelity matrix
 
 | System | What nano-kvrouter keeps | Current fidelity note |
@@ -224,6 +294,20 @@ src/nano_kvrouter/
 - KV transfer is modeled as bandwidth-bound latency, not a full transport stack.
 - Multi-tier tier-hit cost is additive and deterministic.
 - Llumnix-style migration remains a control-plane roadmap item, not a shipped execution path.
+
+## Reference papers
+
+The five schedulers in this repository simulate (a simplified version of)
+the following systems:
+
+- **Mooncake** — *Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving*, FAST'25 Best Paper.
+- **Preble** — *Preble: Efficient Distributed Prompt Scheduling for LLM Serving*, ICLR'25.
+- **SGLang** — *Efficiently Programming Large Language Models using SGLang* (RadixAttention), NeurIPS'24.
+- **Llumnix** — *Llumnix: Dynamic Scheduling for Large Language Model Serving*, OSDI'24 (migration logic — roadmap).
+- **vLLM** — *Efficient Memory Management for Large Language Model Serving with PagedAttention*, SOSP'23.
+
+A more detailed paper-to-module mapping lives in
+[`doc/code-review/README.md`](doc/code-review/README.md).
 
 ## Additional docs
 

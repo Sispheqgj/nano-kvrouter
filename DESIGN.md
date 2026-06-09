@@ -40,6 +40,38 @@
 | Preble ICLR'25 | E2 exploit-explore、prompt-aware load | 评分函数刻意收敛成便于对照的 simulator 版本 |
 | Llumnix OSDI'24 | migration / rebalance 作为控制面概念 | 目前只保留路线，不提供完整迁移执行链路 |
 
+### 3.1 MooncakeConductor 评分公式
+
+```python
+score(decode_node) = (
+    alpha * cache_benefit(decode_node)      # matched_tokens * prefill_cost_per_token_ms
+  - beta  * load_penalty(decode_node)       # current_load * prompt_len * ppt + queue_wait
+  - gamma * transfer_penalty(decode_node)   # CacheLookup.transfer_cost_ms (M6 tier reload)
+)
+
+# SLO 早期拒绝（基于得分最高的 decode_node 的预测）：
+if est_ttft > request.slo_ttft or est_tbt > request.slo_tbt:
+    REJECT
+```
+
+`transfer_penalty` 是 *within-node tier reload* 代价（CPU/Disk → GPU），不是
+prefill_node → decode_node 之间的 KV 网络传输代价 —— 后者已经在 `est_ttft`
+里通过 `compute_est_ttft` 计入 SLO gate，避免双重计算。
+
+### 3.2 E2 prompt-aware load 公式
+
+```python
+e2_score(decode_node, request) = (
+    w_historical * historical_load(decode_node)         # current_load * prompt_len * ppt
+  + w_eviction   * eviction_cost(decode_node, request)  # shortage_blocks * block_size * ppt
+  + w_run        * run_cost(prefill, decode, request)   # compute_est_ttft (含 KV transfer)
+)
+# 选 e2_score 最小的 decode_node；prefill_node 独立按最低 load 选
+```
+
+所有三项都以毫秒计，权重无量纲，便于权衡调参。冷启动 / 等负载时由 `node_id`
+词典序破并。
+
 ## 4. 总体架构
 
 ```text
@@ -278,6 +310,17 @@ uv run python -m nano_kvrouter.cli sensitivity \
 - 没有真实 RDMA / PCIe stack，只保留带宽驱动的时间代价
 - 没有 trace replay、session-aware workload、migration executor
 - 指标适合对比，不适合直接当生产容量规划数字
+
+### 10.1 关键简化对照表
+
+| 真实系统 | nano-kvrouter 的简化 | 保留的核心 |
+|----------|----------------------|------------|
+| 真实 GPU 张量计算 | 用 `cost_per_token + base + batch * marginal` 延迟模型替代 | 调度决策逻辑、batch 经济学 |
+| RDMA / PCIe / NVLink 传输 | 用 `bytes / bandwidth` 模型计算时间代价 | 传输代价对路由的影响、tier-aware reload |
+| 多副本 KV（TP/PP）+ 真实 paged attention kernel | 单副本 + block 元数据 (`block_id`, `tier`, `ref_count`) | block-level 占用、LRU eviction、demotion chain |
+| Token streaming + KV cache write | 离散 `DECODE_BATCH_STEP` + 整数 token 推进 | TBT 统计、continuous batching 行为 |
+| 真实 tokenizer | 随机 int token_ids + K-bucket 共享前缀 | RadixAttention 风格的前缀匹配 |
+| Llumnix live migration | 控制面概念占位，无 executor | 路线图保留 |
 
 ## 11. 下一步路线
 
