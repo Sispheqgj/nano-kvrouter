@@ -27,10 +27,12 @@ It also models the KV cache as a first-class cluster resource:
 
 ## Current status
 
-P2-Infra M1-M6 is implemented and verified.
+P2-Infra M1-M6 is implemented and verified. P3-C M1 (real-world trace
+replay) is also live.
 
-- `uv run pytest -q` -> `377 passed`
+- `uv run pytest -q` -> `393 passed`
 - `uv run python -m nano_kvrouter.cli sensitivity --config configs/sensitivity.yaml` -> `13/13 fields PASS`
+- `uv run python -m nano_kvrouter.cli sweep --config configs/trace_mooncake.yaml` -> 5 schedulers on Mooncake FAST'25 real trace, cache-aware ~2× cache_hit vs cache-blind
 - repo-outside absolute `--config` sensitivity execution is supported
 
 The repository currently exposes three public CLI workflows:
@@ -83,6 +85,31 @@ The unsaturated demo (`configs/default.yaml`) shows all schedulers completing
 vs. load-balanced at ≈ 0.50.
 
 For a multi-tier HiCache demo (CPU + Disk reuse), see `configs/hicache.yaml`.
+
+### Real-world trace replay (P3-C M1, 2026-06-10)
+
+Replaying the first 2000 requests of Mooncake's FAST'25 `conversation_trace.jsonl`
+(real `hash_ids` prefix structure, block_size=512,
+`configs/trace_mooncake.yaml`):
+
+| scheduler       | TTFT p50 | TTFT p99 | cache_hit | rejection | throughput |
+| --------------- | -------- | -------- | --------- | --------- | ---------- |
+| `round_robin`   | 522 ms   | 4100 ms  | 0.075     | 0%        | 3.0 req/s  |
+| `least_loaded`  | 521 ms   | 4312 ms  | 0.069     | 0%        | 3.0 req/s  |
+| `prefix_greedy` | 457 ms   | 4147 ms  | **0.146** | 0%        | 3.0 req/s  |
+| `e2_policy`     | 452 ms   | 4149 ms  | **0.153** | 0%        | 3.0 req/s  |
+| `conductor`     | 456 ms   | 4147 ms  | **0.146** | 0%        | 3.0 req/s  |
+
+Cache-aware schedulers (`prefix_greedy` / `e2_policy` / `conductor`) achieve
+~2× the cache hit ratio of cache-blind baselines on real Mooncake workload.
+TTFT is dominated by the trace's large prompts (~7000 tokens median) rather
+than queueing — SLO is loose, no rejections. This is the first scenario
+where reported numbers come from a *real* trace rather than a synthetic
+Poisson generator.
+
+The `hash_ids` field in the trace gives real block-level prefix identifiers
+(block_size=512, verified). Mooncake traces are bundled in-repo
+(`traces/mooncake/`, Apache-2.0 license, total ~10 MB).
 
 ## Quick start
 

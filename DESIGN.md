@@ -5,7 +5,7 @@
 
 ## 1. 当前实现边界
 
-截至当前 checkout，P2-Infra M1-M6 已经落地：
+截至当前 checkout，P2-Infra M1-M6 + P3-C M1 已经落地：
 
 - M2: continuous batching
 - M3: chunked prefill
@@ -13,6 +13,8 @@
 - M5: split prefill/decode pools + post-prefill KV transfer
 - M6: multi-tier HiCache (GPU / CPU / Disk) + tier-aware lookup
 - acceptance: config-driven `sensitivity` CLI
+- P3-C M1: real-world trace replay (Mooncake FAST'25, streaming JSONL),
+  per-request `output_length` truthfully drives decode pressure
 
 这个仓库故意不做的事情：
 
@@ -308,7 +310,8 @@ uv run python -m nano_kvrouter.cli sensitivity \
 
 - 没有真实 tokenizer / tensor / kernel
 - 没有真实 RDMA / PCIe stack，只保留带宽驱动的时间代价
-- 没有 trace replay、session-aware workload、migration executor
+- 没有完整 migration executor（trace replay 已在 P3-C M1 落地，但 session-aware
+  prefix synthesis 留到 P3-C M2、Llumnix migration 留到 P4）
 - 指标适合对比，不适合直接当生产容量规划数字
 
 ### 10.1 关键简化对照表
@@ -322,11 +325,58 @@ uv run python -m nano_kvrouter.cli sensitivity \
 | 真实 tokenizer | 随机 int token_ids + K-bucket 共享前缀 | RadixAttention 风格的前缀匹配 |
 | Llumnix live migration | 控制面概念占位，无 executor | 路线图保留 |
 
-## 11. 下一步路线
+## 11. Trace replay (P3-C M1)
 
-当前更合理的后续方向仍然是：
+### 11.1 入口与字段映射
 
-- Llumnix-style migration / rebalance control plane
-- trace replay / mixed-length workload
-- 更细的 tier-aware scheduler experiments
-- 按现有 `doc/code-review/` 体系继续补 per-file review 文档
+新增 `TraceGenerator` 作为 `RequestGenerator` 的并行实现：
+
+- 内部 JSONL schema：`{request_id, arrival_ms, input_length, output_length, hash_ids?, session_id?}`
+- 启用方式：YAML 加 `trace: { path, speedup, max_requests, prefix_mode }`
+  字段；非 None 时 CLI 用 `TraceGenerator` 替代 Poisson
+- 路径解析：CLI 层调 `_resolve_related_config_path` 把 `trace.path` 解析为
+  absolute 后写回 `cfg.trace.path`，`TraceGenerator` 只接收 absolute Path
+- `make_request` 加可选 `expected_output_len` 参数，trace 把 record 里的
+  `output_length` 真值传进去，让 decode 压力忠实反映 trace（不再写死
+  `config.workload.avg_output_len`）
+- `_attached` 双重 attach 防御 + `_close()` 在 EOF / cap 时关 file
+
+### 11.2 hash_ids → token_ids 合成
+
+`_build_token_ids` 保证 `len(tokens) == input_length` 强不变量：
+
+- 前 `min(len(hash_ids), full_blocks)` 个 hash_id 各展开为 `block_size` 个
+  连续 token（`token = hid * block_size + offset`，保证同 hash_id 跨 request
+  展开成相同序列 → RadixTree 命中）
+- hash_ids 不够覆盖的完整 block 用随机填充
+- 尾部不完整 block (`input_length % block_size`) 用随机填充
+- 末尾 `assert len(tokens) == input_length`，覆盖三种边界（hash_ids 多/少/等于
+  full_blocks + tail_len>0）
+
+### 11.3 prefix_mode 三档
+
+- `none`：纯随机 token，无 prefix 共享（保守 baseline）
+- `hash_ids`：用 trace 真实 hash_ids 合成（Mooncake 路径）
+- `synthesis`：P3-C M2 才接（合成 prefix 模型，BurstGPT 类长度型 trace）
+
+### 11.4 Mooncake trace 集成约束
+
+- `configs/trace_mooncake.yaml` 必须 `model.block_size: 512`（Mooncake hash_ids
+  block_size 是 512，跑前 `ceil(input_length/512) == len(hash_ids)` 已在 SOURCES.md
+  里 verified）。其他 yaml 保持 block_size=16
+- 副作用：`prefill_chunk_size=512 + block_size=512` 意味着每个 prefill chunk
+  = 1 个 block，chunked prefill 行为退化为 per-block。不是 bug，是 trace 的
+  block 粒度决定的
+- 3 个 Mooncake trace 文件 (`conversation/synthetic/toolagent_trace.jsonl`) 共
+  ~10 MB 直接 commit 进 `traces/mooncake/`（Apache-2.0 license，bundle
+  `LICENSES/Apache-2.0.txt`）
+
+## 12. 下一步路线
+
+- P3-C M2：`PrefixSynthesisModel`（Zipf bucket 偏斜 + 时间局部性 + 分层 prefix
+  长度）+ BurstGPT converter + sensitivity report（**不做 parity 硬 gate**，
+  设计层修订理由见 `.claude/plans/serene-tracing-keynes.md` § 修订记录）
+- P3-D：把 `PrefixSynthesisModel` 提取给 Poisson generator 也用（默认行为
+  零漂移，opt-in）
+- P4：Llumnix-style migration / rebalance executor、speculative decoding（必须
+  用 Leviathan 等式，不能线性近似）
