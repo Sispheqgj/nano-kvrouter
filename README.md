@@ -27,19 +27,21 @@ It also models the KV cache as a first-class cluster resource:
 
 ## Current status
 
-P2-Infra M1-M6 is implemented and verified. P3-C M1 (real-world trace
-replay) is also live.
+P2-Infra M1-M6 is implemented and verified. P3-C M1+M2 (real-world trace
+replay + synthetic prefix sharing on length-only traces) is also live.
 
-- `uv run pytest -q` -> `393 passed`
+- `uv run pytest -q` -> `413 passed`
 - `uv run python -m nano_kvrouter.cli sensitivity --config configs/sensitivity.yaml` -> `13/13 fields PASS`
 - `uv run python -m nano_kvrouter.cli sweep --config configs/trace_mooncake.yaml` -> 5 schedulers on Mooncake FAST'25 real trace, cache-aware ~2× cache_hit vs cache-blind
+- `uv run python -m nano_kvrouter.cli prefix-sensitivity --config configs/trace_burstgpt.yaml` -> 4-axis sweep over prefix-synthesis params on BurstGPT replay, with Mooncake real-trace `cache_hit` shown as informational anchor
 - repo-outside absolute `--config` sensitivity execution is supported
 
-The repository currently exposes three public CLI workflows:
+The repository currently exposes four public CLI workflows:
 
 - `run`: run one scheduler on one config
 - `sweep`: run all five schedulers and print a comparison table
 - `sensitivity`: run config-driven LIVE field experiments and emit a field-level PASS/FAIL punch list
+- `prefix-sensitivity`: scan prefix-synthesis params on a trace and report cache_hit sensitivity (Mooncake real-trace `cache_hit` shown as informational reference, **NOT** a fitting target)
 
 ## Why a simulator
 
@@ -111,6 +113,43 @@ The `hash_ids` field in the trace gives real block-level prefix identifiers
 (block_size=512, verified). Mooncake traces are bundled in-repo
 (`traces/mooncake/`, Apache-2.0 license, total ~10 MB).
 
+### Synthetic prefix sharing on BurstGPT (P3-C M2, 2026-06-10)
+
+BurstGPT (HPMLL, CC-BY-4.0) ships real arrival timestamps + prompt/response
+lengths + `session_id`, but no prefix structure. To still exercise cache-aware
+schedulers against its workload shape, M2 layers a `PrefixSynthesisModel` on
+top of the trace:
+
+- Zipf-distributed bucket selection across `num_buckets` prefix templates
+- time-local recency bias via a sliding window (`p_local`, `local_window_s`)
+- layered prefix sharing (e.g. 20% long-shared / 50% medium / 30% private)
+- bucket prefixes are lazy-extended on demand — no `max_prompt_len` ceiling
+
+Because the prefix model is a HYPOTHESIS layered onto BurstGPT, M2 ships a
+`prefix-sensitivity` CLI rather than a fixed sweep. It reports how `cache_hit`
+varies across the four synthesis axes and prints Mooncake's real-trace
+`cache_hit` as an informational anchor — **NOT** a fitting target:
+
+```bash
+uv run python -m nano_kvrouter.cli prefix-sensitivity \
+  --config configs/trace_burstgpt.yaml --scheduler conductor
+```
+
+Sample numbers on the bundled 1000-record BurstGPT sample with the conductor
+scheduler (baseline `zipf_alpha=1.0, p_local=0.6, num_buckets=64,
+sharing=mixed` gives `cache_hit=0.069`):
+
+| axis             | range explored               | cache_hit range |
+| ---------------- | ---------------------------- | --------------- |
+| `zipf_alpha`     | 0.5 — 1.5                    | 0.032 — 0.093   |
+| `p_local`        | 0.0 — 0.9                    | 0.047 — 0.073   |
+| `num_buckets`    | 16 — 256                     | 0.044 — 0.092   |
+| `sharing_layers` | `all_private` — `heavy_shared` | 0.000 — 0.140 |
+
+Reference: Mooncake real-`hash_ids` `cache_hit` on `configs/trace_mooncake.yaml`
+with conductor is **0.146** (informational; this is what real prefix reuse
+looks like, not what the synthesis is required to match).
+
 ## Quick start
 
 The project uses [`uv`](https://docs.astral.sh/uv/).
@@ -130,6 +169,14 @@ uv run python -m nano_kvrouter.cli sweep --config configs/heavy.yaml
 
 # Exercise multi-tier HiCache behavior
 uv run python -m nano_kvrouter.cli run --config configs/hicache.yaml
+
+# Replay Mooncake / BurstGPT traces (P3-C)
+uv run python -m nano_kvrouter.cli sweep --config configs/trace_mooncake.yaml
+uv run python -m nano_kvrouter.cli sweep --config configs/trace_burstgpt.yaml
+
+# Scan prefix-synthesis sensitivity on a length-only trace (BurstGPT)
+uv run python -m nano_kvrouter.cli prefix-sensitivity \
+  --config configs/trace_burstgpt.yaml --scheduler conductor
 
 # Run field-level sensitivity acceptance
 uv run python -m nano_kvrouter.cli sensitivity --config configs/sensitivity.yaml
@@ -166,6 +213,8 @@ uv run pytest -q
 | [`configs/heavy.yaml`](configs/heavy.yaml) | Decode-capacity pressure scenario for rejection and throughput effects |
 | [`configs/hicache.yaml`](configs/hicache.yaml) | Multi-tier HiCache scenario for GPU/CPU/Disk tier reuse behavior |
 | [`configs/sensitivity.yaml`](configs/sensitivity.yaml) | Acceptance matrix describing field experiments, not hard-coded CLI logic |
+| [`configs/trace_mooncake.yaml`](configs/trace_mooncake.yaml) | Mooncake FAST'25 trace replay (real `hash_ids`, block_size=512) |
+| [`configs/trace_burstgpt.yaml`](configs/trace_burstgpt.yaml) | BurstGPT trace replay with synthetic prefix sharing (`PrefixSynthesisModel`) |
 
 ## LIVE config matrix
 
@@ -309,7 +358,9 @@ src/nano_kvrouter/
 ├── simulator/
 │   ├── event.py
 │   ├── engine.py
-│   └── generator.py
+│   ├── generator.py         # Poisson generator
+│   ├── trace_generator.py   # JSONL trace replay (Mooncake / BurstGPT)
+│   └── prefix_synthesis.py  # Zipf+locality+layered prefix model (P3-C M2)
 └── metrics/
     └── collector.py
 ```

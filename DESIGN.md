@@ -325,7 +325,7 @@ uv run python -m nano_kvrouter.cli sensitivity \
 | 真实 tokenizer | 随机 int token_ids + K-bucket 共享前缀 | RadixAttention 风格的前缀匹配 |
 | Llumnix live migration | 控制面概念占位，无 executor | 路线图保留 |
 
-## 11. Trace replay (P3-C M1)
+## 11. Trace replay (P3-C M1 + M2)
 
 ### 11.1 入口与字段映射
 
@@ -357,7 +357,8 @@ uv run python -m nano_kvrouter.cli sensitivity \
 
 - `none`：纯随机 token，无 prefix 共享（保守 baseline）
 - `hash_ids`：用 trace 真实 hash_ids 合成（Mooncake 路径）
-- `synthesis`：P3-C M2 才接（合成 prefix 模型，BurstGPT 类长度型 trace）
+- `synthesis`：用 `PrefixSynthesisModel` 在 length-only trace 上合成 prefix 共享
+  （BurstGPT 路径，详见 §11.6）
 
 ### 11.4 Mooncake trace 集成约束
 
@@ -371,12 +372,66 @@ uv run python -m nano_kvrouter.cli sensitivity \
   ~10 MB 直接 commit 进 `traces/mooncake/`（Apache-2.0 license，bundle
   `LICENSES/Apache-2.0.txt`）
 
+### 11.5 BurstGPT trace + converter
+
+BurstGPT (HPMLL, CC-BY-4.0) 只有长度/时间戳/session_id，没有 prefix 结构：
+
+- 原始字段：`Timestamp(秒，非零基准) / Session ID / Request tokens /
+  Response tokens / 其它日志列`
+- `scripts/convert_burstgpt.py` 把原始 CSV 流式转 JSONL，统一到 P3-C
+  schema：`{request_id, arrival_ms, input_length, output_length, session_id}`
+- 默认开启 `--require-session-id`：实测原始 CSV 中约 51% 行是无 session 的
+  API log 行，必须过滤掉，否则 session_id 字段名存实亡
+- BurstGPT 不带 `hash_ids`，所以 `configs/trace_burstgpt.yaml` 必须配
+  `prefix_mode: synthesis`，由 §11.6 的 `PrefixSynthesisModel` 接管 prefix 合成
+- License 是 CC-BY-4.0，不能整库 commit；仓库只保留 1000 行 `sample.jsonl`
+  + `scripts/convert_burstgpt.py` 复现路径
+
+### 11.6 PrefixSynthesisModel
+
+`simulator/prefix_synthesis.py` 给 length-only trace 合成 prefix 共享，分三层：
+
+1. **Sharing layer 选择**：`sharing_layers` 是 `[(ratio, share_prob), ...]` 列表，
+   按 `ratio` 把 prompt 划成若干层段。每段以 `share_prob` 决定本段是 shared
+   token 还是 private random，覆盖 `all_private` / `mixed` / `heavy_shared`
+   三个典型分布
+2. **Bucket 选择（Zipf + 时间局部性）**：在 `num_buckets` 个 prefix 模板中，
+   以 `1 - p_local` 概率按 `zipf_alpha` 形状全局抽样，以 `p_local` 概率从
+   `local_window_s` 窗口里的最近 bucket 历史里抽（recency bias）
+3. **Bucket prefix 展开**：每个 bucket 维护一个 token 序列，按需 lazy extend，
+   遇到比 `initial_prompt_len` 长的 request 自动延伸——`initial_prompt_len`
+   仅是性能 hint，**没有真实截断**
+
+关键不变量：
+
+- `PrefixSynthesisConfig` 用 Pydantic `@field_validator` 强校验
+  `sharing_layers`（每条 ratio ∈ [0,1]、share_prob ≥ 0、ratio 求和 ≈ 1）
+- 合成 prompt 与 `_build_token_ids` 一样保持 `len(tokens) == input_length`
+- 全过程不引用 trace 真值（`output_length` / `session_id` 不参与合成）——
+  保证 BurstGPT cache_hit 只反映 synthesis 假设，不被 trace 污染
+
+### 11.7 prefix-sensitivity CLI
+
+`cli.py::cmd_prefix_sensitivity`：在 `configs/trace_burstgpt.yaml` 这种
+`prefix_mode=synthesis` 的 trace 配上扫四个轴（`zipf_alpha` / `p_local` /
+`num_buckets` / `sharing_layers`），每条 candidate 跑一次完整 sim，报
+`cache_hit` + `<scheduler>_uplift_vs_round_robin_pct`：
+
+- 表头列名按 `--scheduler` 参数化（`f"{scheduler_name}_uplift_vs_round_robin"`），
+  JSON 行也带 `uplift_column` / `uplift_vs_round_robin_pct` 字段
+- 末尾打一条 Mooncake 真值参考行：`Mooncake real hash_ids cache_hit
+  (conductor) = 0.146`，标注 **informational, NOT a target**——这是设计上的硬
+  约束（详见 `.claude/plans/serene-tracing-keynes.md` § 修订记录的统计学
+  谬误分析），任何后续 PR 都不许把 synthesis cache_hit 朝这个数字"调"
+- `--output FILE.json` 写结构化报告，行内含 `axis / value / cache_hit /
+  uplift_column / uplift_vs_round_robin_pct`，便于后续脚本接续
+
 ## 12. 下一步路线
 
-- P3-C M2：`PrefixSynthesisModel`（Zipf bucket 偏斜 + 时间局部性 + 分层 prefix
-  长度）+ BurstGPT converter + sensitivity report（**不做 parity 硬 gate**，
-  设计层修订理由见 `.claude/plans/serene-tracing-keynes.md` § 修订记录）
-- P3-D：把 `PrefixSynthesisModel` 提取给 Poisson generator 也用（默认行为
-  零漂移，opt-in）
-- P4：Llumnix-style migration / rebalance executor、speculative decoding（必须
-  用 Leviathan 等式，不能线性近似）
+- P3-D：把 `PrefixSynthesisModel` 提取给 Poisson `RequestGenerator` 也用
+  （硬约束：default yaml 行为零漂移，opt-in only）
+- P4 候选：
+  - **PagedAttention Tier 2**：让 CPU/Disk 块真正动起来（demote/promote
+    路径、HiCache 命中链、prefill cache_miss 不再只看 GPU 命中）
+  - Llumnix-style migration / rebalance executor
+  - Speculative decoding（必须用 Leviathan 等式，不能线性近似）
