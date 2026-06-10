@@ -81,3 +81,13 @@ def test_token_ids_copied(cfg: NanoKVConfig) -> None:
     req = make_request(tokens, 0.0, cfg)
     tokens.append(99)
     assert req.token_ids == [10, 20, 30]
+
+
+def test_make_request_explicit_output_len(cfg: NanoKVConfig) -> None:
+    req = make_request([1, 2, 3], 0.0, cfg, expected_output_len=99)
+    assert req.expected_output_len == 99
+
+
+def test_make_request_default_output_len_fallback(cfg: NanoKVConfig) -> None:
+    req = make_request([1, 2, 3], 0.0, cfg)
+    assert req.expected_output_len == cfg.workload.avg_output_len

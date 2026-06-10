@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
@@ -195,6 +195,43 @@ class GeneratorConfig(BaseModel):
     seed: int = Field(default=42)
 
 
+
+
+class TraceConfig(BaseModel):
+    """Trace replay configuration.
+
+    Activate trace mode by setting NanoKVConfig.trace to a TraceConfig
+    instance (via YAML). When None, the Poisson RequestGenerator is used
+    (backwards compatible).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(
+        min_length=1,
+        description=(
+            "Path to internal JSONL trace file. Resolved by CLI "
+            "relative to the config file directory, then handed "
+            "to TraceGenerator as absolute path."
+        ),
+    )
+    speedup: float = Field(
+        default=1.0, gt=0,
+        description="Time-axis speedup. arrival_ms_in_sim = trace.timestamp / speedup",
+    )
+    max_requests: int | None = Field(
+        default=None,
+        ge=1,
+        description="Stop after replaying this many requests. None = full trace.",
+    )
+    prefix_mode: Literal["none", "hash_ids", "synthesis"] = Field(
+        default="hash_ids",
+        description=(
+            "How to derive token_ids: none=random, hash_ids=expand "
+            "from trace.hash_ids (Mooncake), synthesis=M2 only."
+        ),
+    )
+
 class NanoKVConfig(BaseModel):
     """Root configuration aggregating every sub-config.
 
@@ -212,6 +249,7 @@ class NanoKVConfig(BaseModel):
     workload: WorkloadConfig = Field(default_factory=WorkloadConfig)
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
     generator: GeneratorConfig = Field(default_factory=GeneratorConfig)
+    trace: TraceConfig | None = None
 
 
 class SensitivityExperiment(BaseModel):

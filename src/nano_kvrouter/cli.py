@@ -46,6 +46,7 @@ from nano_kvrouter.simulator.engine import SimulationEngine
 from nano_kvrouter.simulator.event import Event, EventType
 from nano_kvrouter.request import Request
 from nano_kvrouter.simulator.generator import RequestGenerator
+from nano_kvrouter.simulator.trace_generator import TraceGenerator
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -527,7 +528,10 @@ def _run_one(cfg: NanoKVConfig, scheduler_name: str) -> dict:
     )
     sched = _build_scheduler(scheduler_name, cfg.scheduler.params, cfg.model, cfg.bandwidth)
     metrics = MetricsCollector()
-    gen = RequestGenerator(cfg)
+    if cfg.trace is not None:
+        gen = TraceGenerator(cfg, cfg.trace, trace_path=Path(cfg.trace.path))
+    else:
+        gen = RequestGenerator(cfg)
 
     _wire_simulator(
         eng, sched, cm, prefill_nodes, decode_nodes,
@@ -922,6 +926,9 @@ def _write_sensitivity_json(report: dict[str, Any], output_path: str) -> None:
 def cmd_run(args: argparse.Namespace) -> None:
     """Run a single scheduler and print results."""
     cfg = load_config(args.config)
+    if cfg.trace is not None:
+        abs_path = _resolve_related_config_path(args.config, cfg.trace.path)
+        cfg.trace.path = str(abs_path)
     sched_name = args.scheduler or cfg.scheduler.name
     if sched_name not in SCHEDULER_NAMES:
         raise SystemExit(
@@ -948,6 +955,9 @@ def cmd_run(args: argparse.Namespace) -> None:
 def cmd_sweep(args: argparse.Namespace) -> None:
     """Run all 5 schedulers sequentially and print a comparison table."""
     cfg = load_config(args.config)
+    if cfg.trace is not None:
+        abs_path = _resolve_related_config_path(args.config, cfg.trace.path)
+        cfg.trace.path = str(abs_path)
     results: dict[str, dict] = {}
     for name in SCHEDULER_NAMES:
         console.print(f"[dim]running {name}...[/dim]")

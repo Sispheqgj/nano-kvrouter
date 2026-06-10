@@ -1,0 +1,67 @@
+# nano-kvrouter — Mooncake trace replay configuration
+#
+# Replays Mooncake's FAST'25 conversation trace (12,031 requests, 59 min).
+# Uses real hash_ids prefix structure → cache_hit reflects actual Mooncake
+# workload prefix sharing.
+#
+# Notes:
+# - model.block_size: 512 is REQUIRED. Mooncake hash_ids are computed with
+#   block_size=512; using any other value silently distorts prefix matching.
+#   See traces/SOURCES.md for verification.
+# - prefill_chunk_size=512 + block_size=512 means each prefill chunk = 1
+#   block. Chunked prefill behavior degrades to per-block in this scenario;
+#   not a bug, intrinsic to the trace's block granularity.
+
+cluster:
+  prefill_nodes: 4
+  decode_nodes: 4
+
+node:
+  gpu_blocks: 2000
+  cpu_blocks: 0
+  disk_blocks: 0
+  capacity: 32
+
+model:
+  block_size: 512                # MUST be 512 for Mooncake trace
+  kv_bytes_per_token: 512
+  prefill_cost_per_token_ms: 0.033
+  decode_base_ms: 5.0
+  marginal_decode_ms: 0.5
+  prefill_chunk_size: 512
+
+bandwidth:
+  gpu_to_gpu: 300000000000.0
+  gpu_to_cpu: 32000000000.0
+  cpu_to_disk: 5000000000.0
+
+slo:
+  ttft_target_ms: 9999.0          # loose SLO, focus on cache_hit
+  tbt_target_ms: 9999.0
+
+# workload section still required (drives make_request fallback when
+# trace records lack output_length, which shouldn't happen for Mooncake)
+workload:
+  request_rate: 1.0               # ignored when trace is set
+  duration_s: 1.0                 # ignored when trace is set
+  prefix_sharing_ratio: 0.0       # ignored
+  avg_prompt_len: 1024
+  avg_output_len: 256             # fallback only
+
+generator:
+  num_buckets: 1                  # ignored
+  vocab_size: 32000               # used for random suffix tokens in _build_token_ids
+  seed: 42
+
+scheduler:
+  name: conductor
+  params:
+    alpha: 1.0
+    beta: 1.0
+    gamma: 1.0
+
+trace:
+  path: ../traces/mooncake/conversation_trace.jsonl
+  speedup: 1.0
+  max_requests: 2000              # cap to keep sweep fast; remove for full run
+  prefix_mode: hash_ids

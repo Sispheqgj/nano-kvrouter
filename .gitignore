@@ -16,3 +16,6 @@ wheels/
 
 # macOS junk
 .DS_Store
+
+# BurstGPT full trace (too large; M2 downloads via scripts/fetch_traces.sh)
+traces/burstgpt/full/

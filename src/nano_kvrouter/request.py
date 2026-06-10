@@ -61,6 +61,7 @@ def make_request(
     config: NanoKVConfig,
     *,
     priority: int = 0,
+    expected_output_len: int | None = None,
 ) -> Request:
     """Construct a `Request` with SLO and output-length fields filled from config.
 
@@ -70,20 +71,26 @@ def make_request(
             event loop, not wall-clock.
         config: Full `NanoKVConfig` — model.block_size is consulted for
             the prefix hash, slo.* for the per-request SLO stamp,
-            workload.avg_output_len as the expected output length.
+            workload.avg_output_len as the expected output length fallback.
         priority: Optional scheduling priority. Higher = earlier; equal
             priorities preserve arrival order.
+        expected_output_len: Override the expected output length for this
+            request. When None (default), falls back to
+            config.workload.avg_output_len so existing Poisson callers
+            require no change.
 
     Returns:
         A freshly-initialized `Request` with a new UUID `request_id` and
         a `token_ids` copy (defensive — caller's list is not retained).
     """
+    if expected_output_len is None:
+        expected_output_len = config.workload.avg_output_len
     prefix_hash = _hash_prefix(token_ids, config.model.block_size)
     return Request(
         request_id=str(uuid.uuid4()),
         token_ids=list(token_ids),
         prefix_hash=prefix_hash,
-        expected_output_len=config.workload.avg_output_len,
+        expected_output_len=expected_output_len,
         arrival_time=arrival_time,
         slo_ttft=config.slo.ttft_target_ms,
         slo_tbt=config.slo.tbt_target_ms,

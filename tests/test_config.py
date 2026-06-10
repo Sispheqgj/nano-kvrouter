@@ -218,3 +218,21 @@ def test_load_config_with_scheduler_and_generator(tmp_path):
     assert cfg.scheduler.params["w_historical"] == 2.0
     assert cfg.generator.num_buckets == 20
     assert cfg.generator.seed == 99
+
+
+# ---------------------------------------------------------------------------
+# TraceConfig validation tests (P3-M1.fix)
+# ---------------------------------------------------------------------------
+
+from pydantic import ValidationError
+from nano_kvrouter.config import TraceConfig
+
+
+def test_trace_config_rejects_max_requests_zero():
+    with pytest.raises(ValidationError):
+        TraceConfig(path="x.jsonl", max_requests=0)
+
+
+def test_trace_config_rejects_max_requests_negative():
+    with pytest.raises(ValidationError):
+        TraceConfig(path="x.jsonl", max_requests=-1)
