@@ -255,20 +255,58 @@ def test_prefix_mode_none(tmp_path: Path):
     assert len(arrived[0].token_ids) == 8
 
 
-def test_prefix_mode_synthesis_raises_not_implemented(tmp_path: Path):
-    """prefix_mode='synthesis' raises NotImplementedError mentioning M2."""
+def test_prefix_mode_synthesis_assigns_prefix(tmp_path: Path):
+    """prefix_mode='synthesis' assigns tokens with len == input_length invariant."""
     from nano_kvrouter.simulator.engine import SimulationEngine
+    from nano_kvrouter.simulator.event import EventType
+    from nano_kvrouter.simulator.prefix_synthesis import PrefixSynthesisConfig, PrefixSynthesisModel
 
-    records = [_make_record(timestamp=0, input_length=16, output_length=5, hash_ids=[1])]
+    block_size = 16
+    input_length = 64
+    # Use a record with arrival_ms (BurstGPT format)
+    record = {"arrival_ms": 0.0, "input_length": input_length, "output_length": 10}
+    trace_path = tmp_path / "trace.jsonl"
+    import json as _json
+    trace_path.write_text(_json.dumps(record) + "\n")
+
+    cfg = _make_config(block_size=block_size)
+    tc = TraceConfig(path=str(trace_path), max_requests=1, prefix_mode="synthesis")
+
+    ps_cfg = PrefixSynthesisConfig(
+        num_buckets=4,
+        sharing_layers=[(1.0, 0.5)],  # always 50% ratio
+        seed=0,
+    )
+    synthesis_model = PrefixSynthesisModel(
+        config=ps_cfg,
+        block_size=block_size,
+        vocab_size=32000,
+        initial_prompt_len=256,
+    )
+
+    arrived = []
+    eng = SimulationEngine()
+    gen = TraceGenerator(cfg, tc, trace_path, synthesis_model=synthesis_model)
+    gen.attach(eng)
+    eng.on(EventType.REQUEST_ARRIVE, lambda e, _=None: arrived.append(e.payload["request"]))
+    eng.run()
+
+    assert len(arrived) == 1
+    req = arrived[0]
+    assert len(req.token_ids) == input_length, (
+        f"len(token_ids)={len(req.token_ids)} != input_length={input_length}"
+    )
+
+
+def test_synthesis_requires_synthesis_model(tmp_path: Path):
+    """prefix_mode='synthesis' without synthesis_model must raise ValueError."""
+    records = [_make_record(timestamp=0, input_length=16, output_length=5)]
     trace_path = _write_trace(tmp_path, records)
     cfg = _make_config(block_size=16)
     tc = TraceConfig(path=str(trace_path), max_requests=1, prefix_mode="synthesis")
 
-    eng = SimulationEngine()
-    gen = TraceGenerator(cfg, tc, trace_path)
-    with pytest.raises(NotImplementedError, match="M2"):
-        gen.attach(eng)
-        eng.run()
+    with pytest.raises(ValueError, match="synthesis_model"):
+        TraceGenerator(cfg, tc, trace_path)
 
 
 def test_hash_ids_missing_raises(tmp_path: Path):

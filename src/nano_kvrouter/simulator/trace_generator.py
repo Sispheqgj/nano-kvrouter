@@ -1,18 +1,28 @@
-"""Trace-driven request generator for nano-kvrouter.
+"""Trace-driven request generator (Mooncake / BurstGPT-style JSONL).
 
-Replays a pre-recorded JSONL trace (Mooncake format) through the simulation
-engine, scheduling REQUEST_ARRIVE events in trace-timestamp order.
+Replays a pre-recorded JSONL trace through the simulation engine, scheduling
+REQUEST_ARRIVE events in arrival-time order.  The generator is streaming —
+it reads one record at a time and schedules the next ARRIVE inside the handler
+for the current one, so the full trace never needs to be loaded into memory.
 
-The generator is streaming — it reads one record at a time and schedules the
-next ARRIVE inside the handler for the current one, so the full trace never
-needs to be loaded into memory.
+Supports three prefix_mode values:
 
-JSONL schema (one JSON object per line):
+- ``"hash_ids"``: requires ``hash_ids`` field per record (Mooncake FAST'25
+  trace format, block_size=512).  Token IDs are derived from hash IDs to
+  preserve real prefix-sharing structure.
+- ``"synthesis"``: requires no prefix field; pairs with PrefixSynthesisModel
+  to synthesize prefix sharing on top of (arrival_ms, input_length).  Used
+  for BurstGPT / Azure-style length-only traces.
+- ``"none"``: pure random tokens, no prefix sharing (conservative baseline).
+
+Internal JSONL schema per line::
+
     {
-        "timestamp": int,        # milliseconds from trace start (0-based)
-        "input_length": int,     # prompt token count
-        "output_length": int,    # decode token count
-        "hash_ids": list[int]    # block-level prefix identifiers (Mooncake)
+      "arrival_ms": float,       # ms from trace start (0-based); or "timestamp" for Mooncake
+      "input_length": int,       # prompt token count
+      "output_length": int,      # decode token count
+      "hash_ids": list[int],     # optional; required when prefix_mode="hash_ids"
+      "session_id": str | null,  # optional; preserved for future P3-D use
     }
 """
 from __future__ import annotations
@@ -25,6 +35,7 @@ from pathlib import Path
 from typing import IO
 
 from nano_kvrouter.config import NanoKVConfig, TraceConfig
+from nano_kvrouter.simulator.prefix_synthesis import PrefixSynthesisModel
 from nano_kvrouter.request import make_request
 from nano_kvrouter.simulator.engine import SimulationEngine
 from nano_kvrouter.simulator.event import Event, EventType
@@ -110,15 +121,22 @@ class TraceGenerator:
         config: NanoKVConfig,
         trace_config: TraceConfig,
         trace_path: Path,
+        synthesis_model: PrefixSynthesisModel | None = None,
     ) -> None:
         if not trace_path.is_absolute():
             raise ValueError(
                 f"trace_path must be absolute (CLI resolves it via "
                 f"_resolve_related_config_path); got {trace_path!r}"
             )
+        if trace_config.prefix_mode == "synthesis" and synthesis_model is None:
+            raise ValueError(
+                "prefix_mode='synthesis' requires synthesis_model; "
+                "construct TraceGenerator with synthesis_model=PrefixSynthesisModel(...)"
+            )
         self._config = config
         self._trace_cfg = trace_config
         self._trace_path = trace_path
+        self._synthesis_model = synthesis_model
         self._rng = random.Random(config.generator.seed)
         self._idx = 0
         self._file: IO[str] | None = None
@@ -166,7 +184,10 @@ class TraceGenerator:
             return
 
         try:
-            arrival_ms = record["timestamp"] / self._trace_cfg.speedup
+            # BurstGPT uses "arrival_ms" (already zero-based ms);
+            # Mooncake uses "timestamp" (also ms). Prefer arrival_ms if present.
+            raw_arrival_ms = record.get("arrival_ms", record.get("timestamp", 0))
+            arrival_ms = raw_arrival_ms / self._trace_cfg.speedup
             token_ids = self._build_token_ids_from_record(record)
             req = make_request(
                 token_ids,
@@ -212,9 +233,15 @@ class TraceGenerator:
             hash_ids = record["hash_ids"]
             return _build_token_ids(hash_ids, input_length, block_size, self._rng, vocab_size)
         elif mode == "synthesis":
-            raise NotImplementedError(
-                "prefix_mode='synthesis' is not implemented in M1. "
-                "Use 'hash_ids' or 'none'. Synthesis will be added in M2."
+            raw_arrival_ms = record.get("arrival_ms", record.get("timestamp", 0))
+            prefix = self._synthesis_model.assign_prefix_tokens(
+                arrival_ms=raw_arrival_ms,
+                prompt_len=input_length,
             )
+            tail_len = input_length - len(prefix)
+            suffix = [self._rng.randint(0, vocab_size - 1) for _ in range(tail_len)]
+            tokens = prefix + suffix
+            assert len(tokens) == input_length
+            return tokens
         else:
             raise ValueError(f"Unknown prefix_mode: {mode!r}")

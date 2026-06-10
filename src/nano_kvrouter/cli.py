@@ -46,6 +46,7 @@ from nano_kvrouter.simulator.engine import SimulationEngine
 from nano_kvrouter.simulator.event import Event, EventType
 from nano_kvrouter.request import Request
 from nano_kvrouter.simulator.generator import RequestGenerator
+from nano_kvrouter.simulator.prefix_synthesis import PrefixSynthesisModel
 from nano_kvrouter.simulator.trace_generator import TraceGenerator
 
 logger = logging.getLogger(__name__)
@@ -529,7 +530,23 @@ def _run_one(cfg: NanoKVConfig, scheduler_name: str) -> dict:
     sched = _build_scheduler(scheduler_name, cfg.scheduler.params, cfg.model, cfg.bandwidth)
     metrics = MetricsCollector()
     if cfg.trace is not None:
-        gen = TraceGenerator(cfg, cfg.trace, trace_path=Path(cfg.trace.path))
+        synthesis_model = None
+        if cfg.trace.prefix_mode == "synthesis":
+            if cfg.trace.prefix_synthesis is None:
+                raise ValueError(
+                    "prefix_mode='synthesis' requires trace.prefix_synthesis config; "
+                    "add a prefix_synthesis section to your YAML."
+                )
+            synthesis_model = PrefixSynthesisModel(
+                config=cfg.trace.prefix_synthesis,
+                block_size=cfg.model.block_size,
+                vocab_size=cfg.generator.vocab_size,
+                initial_prompt_len=cfg.workload.avg_prompt_len,
+            )
+        gen = TraceGenerator(
+            cfg, cfg.trace, trace_path=Path(cfg.trace.path),
+            synthesis_model=synthesis_model,
+        )
     else:
         gen = RequestGenerator(cfg)
 
@@ -995,6 +1012,177 @@ def cmd_sensitivity(args: argparse.Namespace) -> None:
     _print_sensitivity_table(report)
 
 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# prefix-sensitivity command
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SHARING_PRESETS: dict[str, list[tuple[float, float]]] = {
+    "all_private":   [(1.0, 0.0)],
+    "mixed":         [(0.2, 0.5), (0.5, 0.25), (0.3, 0.0)],
+    "heavy_shared":  [(0.4, 0.75), (0.4, 0.5), (0.2, 0.0)],
+}
+
+# Mooncake conductor cache_hit measured at commit 8af1a3d (max_requests=2000).
+# informational, NOT a target — Mooncake and BurstGPT are different workloads.
+_MOONCAKE_REFERENCE_CACHE_HIT = 0.146
+
+
+def _run_one_with_synthesis_override(
+    base_cfg: NanoKVConfig,
+    scheduler_name: str,
+    overrides: dict,
+) -> float:
+    """Clone base_cfg, apply prefix_synthesis overrides, run, return cache_hit_ratio."""
+    cfg = base_cfg.model_copy(deep=True)
+    ps = cfg.trace.prefix_synthesis.model_copy(deep=True)
+    for key, val in overrides.items():
+        setattr(ps, key, val)
+    cfg.trace.prefix_synthesis = ps
+    summary = _run_one(cfg, scheduler_name)
+    return float(summary.get("cache_hit_ratio") or 0.0)
+
+
+def cmd_prefix_sensitivity(args: argparse.Namespace) -> None:
+    """Scan synthesis parameters and report cache_hit sensitivity on a trace.
+
+    Outputs a table showing how cache_hit_ratio varies across key synthesis
+    axes (zipf_alpha, p_local, num_buckets, sharing_layers).  Each axis is
+    scanned independently (not full grid).
+
+    A reference line shows Mooncake conductor cache_hit (informational, NOT
+    a target — different workload).
+    """
+    cfg = load_config(args.config)
+    if cfg.trace is None or cfg.trace.prefix_mode != "synthesis":
+        raise SystemExit(
+            "prefix-sensitivity requires a config with trace.prefix_mode=synthesis"
+        )
+    if cfg.trace.prefix_synthesis is None:
+        raise SystemExit(
+            "prefix-sensitivity requires trace.prefix_synthesis config section"
+        )
+
+    abs_path = _resolve_related_config_path(args.config, cfg.trace.path)
+    cfg.trace.path = str(abs_path)
+
+    scheduler_name = args.scheduler or "conductor"
+    trace_name = abs_path.name
+
+    # Baseline
+    console.print(f"[dim]running baseline ({scheduler_name})...[/dim]")
+    baseline_hit = _run_one_with_synthesis_override(cfg, scheduler_name, {})
+
+    console.print(f"[dim]running round_robin baseline for uplift...[/dim]")
+    baseline_rr_hit = _run_one_with_synthesis_override(cfg, "round_robin", {})
+
+    def uplift_vs_rr(hit: float, rr: float) -> str:
+        if rr == 0:
+            return "n/a"
+        diff = (hit - rr) / rr * 100
+        return f"{diff:+.1f}%"
+
+    def uplift_vs_rr_pct(hit: float, rr: float) -> float | None:
+        """Same as uplift_vs_rr but returns numeric percent for JSON consumers."""
+        if rr == 0:
+            return None
+        return (hit - rr) / rr * 100.0
+
+    rows: list[tuple[str, str, float, float, bool]] = []  # axis, value, hit, rr_hit, is_baseline
+
+    # --- zipf_alpha ---
+    for val in [0.5, 1.0, 1.5]:
+        is_base = val == cfg.trace.prefix_synthesis.zipf_alpha
+        if is_base:
+            hit = baseline_hit
+            rr_hit = baseline_rr_hit
+        else:
+            console.print(f"[dim]zipf_alpha={val}...[/dim]")
+            hit = _run_one_with_synthesis_override(cfg, scheduler_name, {"zipf_alpha": val})
+            rr_hit = _run_one_with_synthesis_override(cfg, "round_robin", {"zipf_alpha": val})
+        rows.append(("zipf_alpha", str(val), hit, rr_hit, is_base))
+
+    # --- p_local ---
+    for val in [0.0, 0.3, 0.6, 0.9]:
+        is_base = abs(val - cfg.trace.prefix_synthesis.p_local) < 1e-9
+        if is_base:
+            hit = baseline_hit
+            rr_hit = baseline_rr_hit
+        else:
+            console.print(f"[dim]p_local={val}...[/dim]")
+            hit = _run_one_with_synthesis_override(cfg, scheduler_name, {"p_local": val})
+            rr_hit = _run_one_with_synthesis_override(cfg, "round_robin", {"p_local": val})
+        rows.append(("p_local", str(val), hit, rr_hit, is_base))
+
+    # --- num_buckets ---
+    for val in [16, 64, 256]:
+        is_base = val == cfg.trace.prefix_synthesis.num_buckets
+        if is_base:
+            hit = baseline_hit
+            rr_hit = baseline_rr_hit
+        else:
+            console.print(f"[dim]num_buckets={val}...[/dim]")
+            hit = _run_one_with_synthesis_override(cfg, scheduler_name, {"num_buckets": val})
+            rr_hit = _run_one_with_synthesis_override(cfg, "round_robin", {"num_buckets": val})
+        rows.append(("num_buckets", str(val), hit, rr_hit, is_base))
+
+    # --- sharing_layers ---
+    base_layers = cfg.trace.prefix_synthesis.sharing_layers
+    for preset_name, preset_layers in _SHARING_PRESETS.items():
+        is_base = preset_layers == base_layers or preset_name == "mixed"
+        console.print(f"[dim]sharing={preset_name}...[/dim]")
+        hit = _run_one_with_synthesis_override(cfg, scheduler_name, {"sharing_layers": preset_layers})
+        rr_hit = _run_one_with_synthesis_override(cfg, "round_robin", {"sharing_layers": preset_layers})
+        rows.append(("sharing", preset_name, hit, rr_hit, is_base))
+
+    # ── print table ──
+    table = Table(
+        title=f"prefix synthesis sensitivity — {trace_name}, scheduler={scheduler_name}"
+    )
+    table.add_column("axis", style="cyan")
+    table.add_column("value")
+    table.add_column("cache_hit", justify="right")
+    table.add_column(f"{scheduler_name}_uplift_vs_round_robin", justify="right")
+
+    for axis, val_str, hit, rr_hit, is_base in rows:
+        label = f"{val_str}  (baseline)" if is_base else val_str
+        table.add_row(axis, label, f"{hit:.3f}", uplift_vs_rr(hit, rr_hit))
+
+    console.print(table)
+    console.print(
+        f"\nreference (informational, NOT a target):\n"
+        f"  Mooncake real hash_ids cache_hit (conductor, configs/trace_mooncake.yaml) "
+        f"= {_MOONCAKE_REFERENCE_CACHE_HIT}"
+    )
+
+    if args.output:
+        import json as _json
+        report = {
+            "trace": str(abs_path),
+            "scheduler": scheduler_name,
+            "uplift_column": f"{scheduler_name}_uplift_vs_round_robin",
+            "rows": [
+                {
+                    "axis": r[0],
+                    "value": r[1],
+                    "cache_hit": r[2],
+                    "rr_cache_hit": r[3],
+                    "uplift_vs_round_robin_pct": uplift_vs_rr_pct(r[2], r[3]),
+                    "is_baseline": r[4],
+                }
+                for r in rows
+            ],
+            "reference": {
+                "description": "informational, NOT a target",
+                "mooncake_conductor_cache_hit": _MOONCAKE_REFERENCE_CACHE_HIT,
+                "source": "configs/trace_mooncake.yaml, commit 8af1a3d",
+            },
+        }
+        Path(args.output).write_text(_json.dumps(report, indent=2))
+        console.print(f"[dim]report written to {args.output}[/dim]")
+
+
 def main() -> None:
     """Parse CLI arguments and dispatch to the appropriate command."""
     parser = argparse.ArgumentParser(
@@ -1041,6 +1229,23 @@ def main() -> None:
         help="write results to FILE.csv or FILE.json",
     )
     p_sensitivity.set_defaults(func=cmd_sensitivity)
+
+    p_ps = sub.add_parser(
+        "prefix-sensitivity",
+        help="Scan prefix synthesis parameters and report cache_hit sensitivity",
+    )
+    p_ps.add_argument("--config", required=True, help="path to trace YAML config (prefix_mode=synthesis)")
+    p_ps.add_argument(
+        "--scheduler",
+        default="conductor",
+        help="scheduler to use for cache_hit measurement (default: conductor)",
+    )
+    p_ps.add_argument(
+        "--output",
+        default=None,
+        help="write JSON report to FILE",
+    )
+    p_ps.set_defaults(func=cmd_prefix_sensitivity)
 
     args = parser.parse_args()
     args.func(args)

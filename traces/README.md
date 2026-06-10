@@ -53,8 +53,53 @@ https://github.com/kvcache-ai/Mooncake, released under Apache-2.0 with
 the FAST'25 paper. See upstream for the full preprocessing methodology
 and privacy mechanisms applied to the raw production data.
 
-## BurstGPT traces (not yet included)
+## BurstGPT trace sample
 
-BurstGPT traces (M2) will be added in a future milestone. The full dataset
-is too large to commit directly; `scripts/fetch_traces.sh` will handle
-download. See `traces/burstgpt/` (in `.gitignore`) for the download target.
+`burstgpt/sample.jsonl` is a 1000-record subset of the `BurstGPT_3.csv`
+v2.0 release from <https://github.com/HPMLL/BurstGPT>, with API-log rows
+(blank `session_id`) filtered out via
+`scripts/convert_burstgpt.py --require-session-id`.
+
+Each line is a JSON object:
+```json
+{
+  "request_id": "burstgpt-0",
+  "arrival_ms": 0.0,
+  "input_length": 906,
+  "output_length": 446,
+  "session_id": "1722ac82-0a46-4bf0-aa08-89794e7a2b3f"
+}
+```
+
+**No `hash_ids` field** — BurstGPT has no prefix structure. Use
+`prefix_mode: synthesis` with `configs/trace_burstgpt.yaml` to synthesize
+prefix sharing on top of the real arrival/length data.
+
+### To run the BurstGPT trace simulation
+
+```bash
+uv run python -m nano_kvrouter.cli sweep --config configs/trace_burstgpt.yaml
+uv run python -m nano_kvrouter.cli prefix-sensitivity --config configs/trace_burstgpt.yaml
+```
+
+### License: CC-BY-4.0
+
+Full text: <https://creativecommons.org/licenses/by/4.0/legalcode>
+
+### Attribution
+
+Wang, Y., et al. *BurstGPT: A Real-World Workload Dataset to Optimize LLM
+Serving Systems.* HPMLL, 2024.
+<https://github.com/HPMLL/BurstGPT>
+
+### Full dataset
+
+Full BurstGPT CSVs (188+ MB) are NOT in this repo. Download via:
+
+```bash
+mkdir -p traces/burstgpt/full
+curl -sL "https://github.com/HPMLL/BurstGPT/releases/download/v2.0/BurstGPT_3.csv" \
+  -o traces/burstgpt/full/BurstGPT_3.csv
+```
+
+`traces/burstgpt/full/` is in `.gitignore`.

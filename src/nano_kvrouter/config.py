@@ -6,6 +6,7 @@ from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
+from nano_kvrouter.simulator.prefix_synthesis import PrefixSynthesisConfig
 
 logger = logging.getLogger(__name__)
 
@@ -230,6 +231,10 @@ class TraceConfig(BaseModel):
             "How to derive token_ids: none=random, hash_ids=expand "
             "from trace.hash_ids (Mooncake), synthesis=M2 only."
         ),
+    )
+    prefix_synthesis: PrefixSynthesisConfig | None = Field(
+        default=None,
+        description="Required when prefix_mode=synthesis. Ignored otherwise.",
     )
 
 class NanoKVConfig(BaseModel):
