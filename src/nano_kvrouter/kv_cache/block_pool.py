@@ -69,6 +69,8 @@ class BlockPool:
             "disk": _TierState(capacity=node_config.disk_blocks),
         }
         self._block_tier: dict[str, str] = {}  # block_id → tier
+        self._ref_count: dict[str, int] = {}
+        self._pin_count: dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -97,6 +99,8 @@ class BlockPool:
             raise KeyError(
                 f"Block {block_id!r} is on tier {current!r}, not {from_tier!r}"
             )
+        if self.pin_count(block_id) > 0:
+            raise RuntimeError(f"Block {block_id!r} is pinned and cannot be moved")
         if dst.free < 1:
             raise MemoryError(
                 f"Tier {to_tier!r} is full (capacity {dst.capacity})"
@@ -136,6 +140,8 @@ class BlockPool:
         state.allocated.update(ids)
         for bid in ids:
             self._block_tier[bid] = tier
+            self._ref_count[bid] = 0
+            self._pin_count[bid] = 0
         logger.debug("Allocated %d block(s) on %s", num_blocks, tier)
         return ids
 
@@ -147,13 +153,72 @@ class BlockPool:
                 allocated; unknown ids raise `KeyError` so that
                 accidental double-free surfaces immediately rather than
                 silently corrupting capacity accounting.
+
+        Raises:
+            ValueError: Duplicate block ids in one call.
+            KeyError: Any block id is not currently allocated.
+            RuntimeError: Any block is pinned by an active request.
         """
+        tiers: dict[str, str] = {}
         for bid in block_ids:
-            tier = self._block_tier.pop(bid, None)
+            if bid in tiers:
+                raise ValueError(f"Duplicate block id {bid!r} in free()")
+            tier = self._block_tier.get(bid)
             if tier is None:
                 raise KeyError(f"Block {bid!r} is not allocated")
+            if self.pin_count(bid) > 0:
+                raise RuntimeError(f"Block {bid!r} is pinned and cannot be freed")
+            tiers[bid] = tier
+
+        for bid, tier in tiers.items():
+            self._block_tier.pop(bid)
             self._tiers[tier].allocated.discard(bid)
+            self._ref_count.pop(bid, None)
+            self._pin_count.pop(bid, None)
         logger.debug("Freed %d block(s)", len(block_ids))
+
+    def pin(self, block_ids: list[str]) -> None:
+        """Increment ref/pin counters for active request ownership.
+
+        Args:
+            block_ids: Allocated block IDs to retain for an active request.
+
+        Raises:
+            KeyError: If any block is not currently allocated.
+        """
+        for bid in block_ids:
+            if bid not in self._block_tier:
+                raise KeyError(f"Block {bid!r} is not allocated")
+        for bid in block_ids:
+            self._ref_count[bid] = self._ref_count.get(bid, 0) + 1
+            self._pin_count[bid] = self._pin_count.get(bid, 0) + 1
+
+    def unpin(self, block_ids: list[str]) -> None:
+        """Decrement ref/pin counters for active request release.
+
+        Args:
+            block_ids: Previously pinned block IDs.
+
+        Raises:
+            KeyError: If a block is unknown.
+            RuntimeError: If a block is not currently pinned.
+        """
+        for bid in block_ids:
+            if bid not in self._block_tier:
+                raise KeyError(f"Block {bid!r} is not allocated")
+            if self._pin_count.get(bid, 0) <= 0 or self._ref_count.get(bid, 0) <= 0:
+                raise RuntimeError(f"Block {bid!r} is not pinned")
+        for bid in block_ids:
+            self._ref_count[bid] -= 1
+            self._pin_count[bid] -= 1
+
+    def ref_count(self, block_id: str) -> int:
+        """Return active request reference count for *block_id*."""
+        return self._ref_count.get(block_id, 0)
+
+    def pin_count(self, block_id: str) -> int:
+        """Return active request pin count for *block_id*."""
+        return self._pin_count.get(block_id, 0)
 
     def promote(self, block_id: str, from_tier: str, to_tier: str) -> None:
         """Move a block toward a faster tier (e.g. ``cpu`` → ``gpu``).

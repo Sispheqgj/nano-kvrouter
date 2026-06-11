@@ -824,3 +824,23 @@ def test_partial_zombie_readmits_correctly() -> None:
     assert gpu_used == 4, (
         f"Expected gpu_used=4 after re-admit, got {gpu_used}"
     )
+
+
+def test_materialize_release_preserves_cache_manager_lookup_contract() -> None:
+    """BlockTable pin/release must not change the existing lookup/admit contract."""
+    cm = CacheManager(
+        node_ids=["d0"],
+        model_config=ModelConfig(block_size=BLOCK_SIZE, kv_bytes_per_token=512),
+        node_config=NodeConfig(gpu_blocks=4, cpu_blocks=0, disk_blocks=0),
+        bandwidth_config=BandwidthConfig(),
+    )
+    toks = _tokens(BLOCK_SIZE * 2, start=900)
+
+    table = cm.materialize_request("active", toks, "d0")
+    assert len(table.block_ids) == 2
+    assert cm.lookup(_req(toks), "d0").matched_tokens == len(toks)
+
+    cm.release_request("active", "d0")
+
+    assert all(cm._pools["d0"].pin_count(bid) == 0 for bid in table.block_ids)
+    assert cm.lookup(_req(toks), "d0").matched_tokens == len(toks)

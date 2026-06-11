@@ -499,6 +499,7 @@ class RadixTree:
         self,
         n_nodes: int,
         tier_of: "Callable[[str], str | None] | None" = None,
+        is_pinned: "Callable[[str], bool] | None" = None,
     ) -> list[list[str]]:
         """Select LRU leaf nodes for tier demotion without removing them from the tree.
 
@@ -517,6 +518,8 @@ class RadixTree:
             tier_of: Optional callable ``(block_id) -> tier | None``
                 (e.g. ``pool.tier_of``) used to detect and clean up
                 zombie nodes. Pass ``None`` to skip zombie cleanup.
+            is_pinned: Optional callable ``(block_id) -> bool`` used by
+                BlockTable-aware callers to skip active request blocks.
 
         Returns:
             List of ``block_ids`` lists, one per selected node. The
@@ -535,6 +538,7 @@ class RadixTree:
             candidates = [
                 n for n in self._nodes.values()
                 if not n.children and n.ref_count == 0
+                and not (is_pinned is not None and any(is_pinned(bid) for bid in n.block_ids))
             ]
             if not candidates:
                 break

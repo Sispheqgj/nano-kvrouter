@@ -40,6 +40,7 @@ import logging
 from collections.abc import Callable, Sequence
 
 from nano_kvrouter.config import BandwidthConfig, ModelConfig, NodeConfig
+from nano_kvrouter.kv_cache.block_table import RequestBlockTable
 from nano_kvrouter.kv_cache.block_pool import BlockPool
 from nano_kvrouter.kv_cache.radix_tree import RadixTree
 from nano_kvrouter.request import Request
@@ -47,7 +48,7 @@ from nano_kvrouter.scheduler.base import CacheLookup
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["CacheManager"]
+__all__ = ["CacheManager", "RequestBlockTable"]
 
 
 def _demote_block(pool: BlockPool, tree: RadixTree, bid: str) -> None:
@@ -69,6 +70,8 @@ def _demote_block(pool: BlockPool, tree: RadixTree, bid: str) -> None:
     current = pool.tier_of(bid)
     if current is None:
         return
+    if pool.pin_count(bid) > 0:
+        raise MemoryError(f"block {bid!r} is pinned and cannot be demoted")
     s = pool.stats()
     if current == "gpu":
         if s["cpu"]["free"] > 0:
@@ -151,6 +154,7 @@ class CacheManager:
                 free_blocks=lambda ids, _pool=pool: _pool.free(ids),
             )
         self._bw_cfg = bandwidth_config
+        self._block_tables: dict[tuple[str, str], RequestBlockTable] = {}
 
     # ------------------------------------------------------------------
     # CacheQuery Protocol — read-only
@@ -285,6 +289,136 @@ class CacheManager:
         return pool._tiers[tier].free
 
     # ------------------------------------------------------------------
+    # Active request BlockTables
+    # ------------------------------------------------------------------
+
+    def _table_key(self, request_id: str, node_id: str) -> tuple[str, str]:
+        return (node_id, request_id)
+
+    def _aligned_tokens(self, token_ids: list[int]) -> tuple[list[int], int]:
+        total_blocks = len(token_ids) // self._block_size
+        return token_ids[: total_blocks * self._block_size], total_blocks
+
+    def _live_prefix_block_ids(
+        self,
+        token_ids: list[int],
+        node_id: str,
+        total_blocks: int,
+    ) -> list[str]:
+        tree = self._trees[node_id]
+        pool = self._pools[node_id]
+
+        matched_raw, path_block_ids = tree.match_prefix_path(token_ids)
+        matched_blocks = min(matched_raw // self._block_size, total_blocks)
+        prefix_bids: list[str] = []
+        for bid in path_block_ids[:matched_blocks]:
+            if pool.tier_of(bid) is None:
+                break
+            prefix_bids.append(bid)
+        return prefix_bids
+
+    def _retain_blocks(self, node_id: str, block_ids: list[str]) -> None:
+        if not block_ids:
+            return
+        pool = self._pools[node_id]
+        pool.pin(block_ids)
+
+    def _release_blocks(self, node_id: str, block_ids: list[str]) -> None:
+        if not block_ids:
+            return
+        pool = self._pools[node_id]
+        pool.unpin(block_ids)
+
+    def materialize_request(
+        self,
+        request_id: str,
+        token_ids: list[int],
+        node_id: str,
+    ) -> RequestBlockTable:
+        """Create and pin the logical KV block table for an active request.
+
+        Existing prefix-hit physical blocks are shared and pinned before any
+        tail allocation so the demotion chain cannot move/free blocks that the
+        request will read. Missing tail blocks are materialised through the
+        existing :meth:`admit` path, preserving RadixTree and BlockPool
+        semantics.
+
+        Duplicate materialisation for the same ``(node_id, request_id)`` is a
+        caller error and raises ``ValueError``. Unknown nodes raise ``KeyError``.
+        """
+        if node_id not in self._trees:
+            raise KeyError(node_id)
+        key = self._table_key(request_id, node_id)
+        if key in self._block_tables:
+            raise ValueError(f"request {request_id!r} already materialized on {node_id!r}")
+
+        aligned_tokens, total_blocks = self._aligned_tokens(token_ids)
+        if total_blocks == 0:
+            table = RequestBlockTable(
+                request_id=request_id,
+                node_id=node_id,
+                block_ids=[],
+                matched_blocks=0,
+                new_blocks=0,
+            )
+            self._block_tables[key] = table
+            return table
+
+        retained: list[str] = []
+        try:
+            prefix_bids = self._live_prefix_block_ids(aligned_tokens, node_id, total_blocks)
+            self._retain_blocks(node_id, prefix_bids)
+            retained.extend(prefix_bids)
+
+            if len(prefix_bids) < total_blocks:
+                self.admit(aligned_tokens, node_id)
+
+            matched_after, path_block_ids = self._trees[node_id].match_prefix_path(aligned_tokens)
+            if matched_after // self._block_size < total_blocks:
+                raise MemoryError(
+                    f"node {node_id!r}: failed to materialize {total_blocks} blocks "
+                    f"for request {request_id!r}"
+                )
+
+            block_ids = path_block_ids[:total_blocks]
+            live_tiers = self._pools[node_id].tiers_of(block_ids)
+            if len(live_tiers) != total_blocks:
+                raise MemoryError(
+                    f"node {node_id!r}: materialized path contains freed blocks "
+                    f"for request {request_id!r}"
+                )
+
+            already_retained = set(retained)
+            new_retains = [bid for bid in block_ids if bid not in already_retained]
+            self._retain_blocks(node_id, new_retains)
+            retained.extend(new_retains)
+
+            table = RequestBlockTable(
+                request_id=request_id,
+                node_id=node_id,
+                block_ids=block_ids,
+                matched_blocks=len(prefix_bids),
+                new_blocks=total_blocks - len(prefix_bids),
+            )
+            self._block_tables[key] = table
+            return table
+        except Exception:
+            self._release_blocks(node_id, retained)
+            raise
+
+    def release_request(self, request_id: str, node_id: str) -> None:
+        """Release an active request's pinned BlockTable.
+
+        Unknown request/node pairs raise ``KeyError`` so lifecycle leaks and
+        double releases surface during tests.
+        """
+        if node_id not in self._trees:
+            raise KeyError(node_id)
+        key = self._table_key(request_id, node_id)
+        table = self._block_tables.pop(key)
+        self._release_blocks(node_id, table.block_ids)
+
+    # ------------------------------------------------------------------
     # Write path — called by SimulationEngine after PREFILL_COMPLETE
     # ------------------------------------------------------------------
 
@@ -367,7 +501,11 @@ class CacheManager:
 
         while pool.used("gpu") + worst_case_new > capacity_gpu:
             # Try tree-preserving demotion first.
-            demoted = tree.demote_lru(1, tier_of=pool.tier_of)
+            demoted = tree.demote_lru(
+                1,
+                tier_of=pool.tier_of,
+                is_pinned=lambda bid, _pool=pool: _pool.pin_count(bid) > 0,
+            )
             if not demoted:
                 raise MemoryError(
                     f"node {node_id!r} GPU pool full and no demotion candidates; "

@@ -48,6 +48,49 @@ def test_free_unknown_block_raises(pool):
         pool.free(["not-a-real-id"])
 
 
+def test_free_mixed_pinned_is_atomic() -> None:
+    p = BlockPool(NodeConfig(gpu_blocks=4, cpu_blocks=0, disk_blocks=0))
+    a, b = p.allocate(2, "gpu")
+    p.pin([b])
+
+    with pytest.raises(RuntimeError, match="pinned"):
+        p.free([a, b])
+
+    assert p.tier_of(a) == "gpu"
+    assert p.tier_of(b) == "gpu"
+    assert p.used("gpu") == 2
+    assert p.stats()["gpu"]["free"] == 2
+    assert p.ref_count(a) == 0
+    assert p.pin_count(a) == 0
+    assert p.ref_count(b) == 1
+    assert p.pin_count(b) == 1
+
+
+def test_free_unknown_is_atomic() -> None:
+    p = BlockPool(NodeConfig(gpu_blocks=4, cpu_blocks=0, disk_blocks=0))
+    a, b = p.allocate(2, "gpu")
+
+    with pytest.raises(KeyError):
+        p.free([a, "missing"])
+
+    assert p.tier_of(a) == "gpu"
+    assert p.tier_of(b) == "gpu"
+    assert p.used("gpu") == 2
+    assert p.stats()["gpu"]["free"] == 2
+
+
+def test_free_duplicate_block_id_is_atomic() -> None:
+    p = BlockPool(NodeConfig(gpu_blocks=4, cpu_blocks=0, disk_blocks=0))
+    (a,) = p.allocate(1, "gpu")
+
+    with pytest.raises(ValueError, match="Duplicate block id"):
+        p.free([a, a])
+
+    assert p.tier_of(a) == "gpu"
+    assert p.used("gpu") == 1
+    assert p.stats()["gpu"]["free"] == 3
+
+
 # ------------------------------------------------------------------
 # 跨 tier promote / demote
 # ------------------------------------------------------------------

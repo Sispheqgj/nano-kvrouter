@@ -403,12 +403,12 @@ def _wire_simulator(
             _requests.pop(request_id, None)
             return
 
-        # Admit KV into decode_node cache.
+        # Admit KV into decode_node cache and pin the active request BlockTable.
         try:
-            cm.admit(req.token_ids, decision.decode_node)
+            cm.materialize_request(request_id, req.token_ids, decision.decode_node)
         except MemoryError:
-            logger_.warning(
-                "cm.admit MemoryError for %s on %s; KV not cached",
+            logger_.debug(
+                "cm.materialize_request MemoryError for %s on %s; KV not cached",
                 request_id, decision.decode_node,
             )
 
@@ -488,6 +488,11 @@ def _wire_simulator(
             promoted_id = node.complete(request_id)
         except ValueError:
             promoted_id = None
+
+        try:
+            cm.release_request(request_id, node_id)
+        except KeyError:
+            logger_.debug("release_request skipped for %s on %s; no block table", request_id, node_id)
 
         _decisions.pop(request_id, None)
         _requests.pop(request_id, None)
