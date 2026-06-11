@@ -189,14 +189,17 @@ def test_ttft_equals_cold_prefill_plus_queue_wait(policy: LeastLoadedPolicy) -> 
     cache = NullCacheQuery(node_ids=["n0"])
     dec = policy.schedule(req, [node], [node], cache)
 
-    # M5a: bs_hint = len(decode.decoding)+1 = 1 (no decoding streams).
+    # Prefill estimate uses bs_hint = len(decode.decoding)+1 = 1
+    # because no decode streams are active on this node.
     # step_per_chunk = 512*0.1 + 5 + 1*1 = 57.2
-    # queue_wait: bs=max(0,8)=8, step=13.0, n_blockers=2, per_req=20*0.1+32*13=418.0
-    # queue_wait = 2*418.0 = 836.0; first_tick = 5+1*1 = 6.0
-    # expected_ttft = 57.2 + 836.0 + 6.0 = 899.2
+    # queue_wait v2: all 8 running requests release slots after one blocker
+    # lifecycle. The single queued request occupies one released slot; the new
+    # request can enter another released slot immediately.
+    # wait = 20*0.1 + 32*13 = 418.0; first_tick = 5+1*1 = 6.0
+    # expected_ttft = 57.2 + 418.0 + 6.0 = 481.2
     expected_ttft = (
         (512 * MODEL.prefill_cost_per_token_ms + MODEL.decode_base_ms + 1 * MODEL.marginal_decode_ms)
-        + 2 * (20 * MODEL.prefill_cost_per_token_ms + 32 * (MODEL.decode_base_ms + NODE_CFG.capacity * MODEL.marginal_decode_ms))
+        + (20 * MODEL.prefill_cost_per_token_ms + 32 * (MODEL.decode_base_ms + NODE_CFG.capacity * MODEL.marginal_decode_ms))
         + (MODEL.decode_base_ms + 1 * MODEL.marginal_decode_ms)
     )
     assert dec.estimated_ttft_ms == pytest.approx(expected_ttft)

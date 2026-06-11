@@ -491,11 +491,157 @@ def test_queue_wait_time_uses_actual_batch_size() -> None:
         node.start_decode(f"r{i}")
     node.admit("queued-0")
     node.admit("queued-1")
-    # n_blockers=3, bs=32, step_time=5+32*0.5=21
-    # per_req = 1024*0.033 + 64*21 = 33.792 + 1344 = 1377.792
-    # wait = 3 * 1377.792 = 4133.376
+    # All 32 running requests can release at the same simulated time. The two
+    # queued requests occupy two slots then, but 30 slots are still open, so the
+    # new request waits for the current decoding wave only.
     wait = node.queue_wait_time(prompt_len=1024, expected_output_len=64)
-    assert wait == pytest.approx(4133.376, rel=1e-4)
+    assert wait == pytest.approx(64 * (5.0 + 32 * 0.5), rel=1e-4)
+
+
+def test_queued_runtime_state_survives_promotion() -> None:
+    node = MockEngineNode("n", ModelConfig(), NodeConfig(capacity=1))
+    node.admit("running", expected_output_len=2, prompt_len=16)
+    node.admit("queued", expected_output_len=8, prompt_len=777, uncached_tokens=123)
+
+    promoted = node.complete("running")
+
+    assert promoted == "queued"
+    state = node._states["queued"]
+    assert state.prompt_len == 777
+    assert state.expected_output_len == 8
+    assert state.uncached_total == 123
+    assert state.uncached_remaining == 123
+    assert state.phase == "admitted"
+    assert state.has_prompt_len is True
+
+
+def test_queue_wait_time_warm_cache_blocker_skips_full_prompt_prefill() -> None:
+    model = ModelConfig(prefill_cost_per_token_ms=0.1, decode_base_ms=5.0, marginal_decode_ms=0.5)
+    node = MockEngineNode("n", model, NodeConfig(capacity=1))
+    node.admit("warm", expected_output_len=2, prompt_len=1000, uncached_tokens=0)
+
+    wait = node.queue_wait_time(prompt_len=2000, expected_output_len=1)
+
+    assert wait == pytest.approx(2 * (5.0 + 0.5))
+
+
+def test_queue_wait_time_partial_cache_blocker_uses_uncached_tokens() -> None:
+    model = ModelConfig(prefill_cost_per_token_ms=0.1, decode_base_ms=5.0, marginal_decode_ms=0.5)
+    node = MockEngineNode("n", model, NodeConfig(capacity=1))
+    node.admit("partial", expected_output_len=2, prompt_len=1000, uncached_tokens=100)
+
+    wait = node.queue_wait_time(prompt_len=10, expected_output_len=1)
+
+    assert wait == pytest.approx(100 * 0.1 + 2 * (5.0 + 0.5))
+
+
+def test_prefill_done_blocker_releases_prefill_slot_without_decode_wait() -> None:
+    model = ModelConfig(prefill_cost_per_token_ms=0.1, decode_base_ms=5.0, marginal_decode_ms=0.5)
+    node = MockEngineNode("n", model, NodeConfig(capacity=1))
+    node.admit("cached", expected_output_len=1000, prompt_len=1000, uncached_tokens=0)
+
+    node.mark_prefill_done("cached")
+    wait = node.queue_wait_time(prompt_len=1, expected_output_len=1)
+
+    assert node._states["cached"].phase == "prefill_done"
+    assert node._states["cached"].blocks_prefill_slot is False
+    assert wait == pytest.approx(0.0)
+
+
+def test_prefill_completion_releases_prefill_slot_without_decode_wait() -> None:
+    model = ModelConfig(
+        prefill_cost_per_token_ms=0.1,
+        decode_base_ms=5.0,
+        marginal_decode_ms=0.5,
+        prefill_chunk_size=100,
+    )
+    node = MockEngineNode("n", model, NodeConfig(capacity=1))
+    node.admit("prefill", expected_output_len=1000, prompt_len=1000, uncached_tokens=100)
+    node.enter_prefill("prefill", 100)
+
+    _, _, prefill_completed_id = node.tick_batch_step(0.0)
+    wait = node.queue_wait_time(prompt_len=1, expected_output_len=1)
+
+    assert prefill_completed_id == "prefill"
+    assert node._states["prefill"].phase == "prefill_done"
+    assert node._states["prefill"].blocks_prefill_slot is False
+    assert wait == pytest.approx(0.0)
+
+
+def test_decode_node_admission_wait_is_decode_only_after_start_decode() -> None:
+    model = ModelConfig(prefill_cost_per_token_ms=0.1, decode_base_ms=5.0, marginal_decode_ms=0.5)
+    node = MockEngineNode("d0", model, NodeConfig(capacity=1))
+    node.admit("decode", expected_output_len=1000, prompt_len=1000, uncached_tokens=0)
+    node.start_decode("decode")
+
+    wait = node.queue_wait_time(prompt_len=2000, expected_output_len=1)
+
+    assert wait == pytest.approx(1000 * (5.0 + 0.5))
+
+
+def test_queue_wait_time_uses_long_blocker_not_short_new_request() -> None:
+    model = ModelConfig(prefill_cost_per_token_ms=0.1, decode_base_ms=5.0, marginal_decode_ms=0.5)
+    node = MockEngineNode("n", model, NodeConfig(capacity=1))
+    node.admit("long", expected_output_len=2, prompt_len=1000)
+
+    wait = node.queue_wait_time(prompt_len=10, expected_output_len=1)
+
+    assert wait == pytest.approx(1000 * 0.1 + 2 * (5.0 + 0.5))
+
+
+def test_queue_wait_time_uses_short_blocker_not_long_new_request() -> None:
+    model = ModelConfig(prefill_cost_per_token_ms=0.1, decode_base_ms=5.0, marginal_decode_ms=0.5)
+    node = MockEngineNode("n", model, NodeConfig(capacity=1))
+    node.admit("short", expected_output_len=1, prompt_len=10)
+
+    wait = node.queue_wait_time(prompt_len=1000, expected_output_len=100)
+
+    assert wait == pytest.approx(10 * 0.1 + 1 * (5.0 + 0.5))
+
+
+def test_queue_wait_time_drops_as_decode_progresses() -> None:
+    model = ModelConfig(decode_base_ms=5.0, marginal_decode_ms=0.5)
+    node = MockEngineNode("n", model, NodeConfig(capacity=1))
+    node.admit("decoding", expected_output_len=10, prompt_len=1000)
+    node.start_decode("decoding")
+
+    before = node.queue_wait_time(prompt_len=1, expected_output_len=1)
+    node.tick_batch_step(0.0)
+    after = node.queue_wait_time(prompt_len=1, expected_output_len=1)
+
+    assert before == pytest.approx(10 * (5.0 + 0.5))
+    assert after == pytest.approx(9 * (5.0 + 0.5))
+    assert after < before
+
+
+def test_queue_wait_time_drops_as_prefill_progresses() -> None:
+    model = ModelConfig(
+        prefill_cost_per_token_ms=0.1,
+        decode_base_ms=5.0,
+        marginal_decode_ms=0.5,
+        prefill_chunk_size=100,
+    )
+    node = MockEngineNode("n", model, NodeConfig(capacity=1))
+    node.admit("prefilling", expected_output_len=2, prompt_len=250)
+    node.enter_prefill("prefilling", 250)
+
+    before = node.queue_wait_time(prompt_len=1, expected_output_len=1)
+    node.tick_batch_step(0.0)
+    after = node.queue_wait_time(prompt_len=1, expected_output_len=1)
+
+    assert before == pytest.approx(250 * 0.1 + 2 * (5.0 + 0.5))
+    assert after == pytest.approx(150 * 0.1 + 2 * (5.0 + 0.5))
+    assert after < before
+
+
+def test_complete_cleans_runtime_state() -> None:
+    node = MockEngineNode("n", ModelConfig(), NodeConfig(capacity=1))
+    node.admit("r0", expected_output_len=2, prompt_len=32)
+    node.start_decode("r0")
+
+    node.complete("r0")
+
+    assert "r0" not in node._states
 
 
 # ------------------------------------------------------------------

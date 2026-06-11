@@ -1,10 +1,27 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import logging
+from typing import Literal
 
 from nano_kvrouter.config import ModelConfig, NodeConfig
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class NodeRequestState:
+    """Runtime metadata for one request currently owned by a mock node."""
+
+    request_id: str
+    prompt_len: int
+    expected_output_len: int
+    phase: Literal["queued", "admitted", "prefilling", "prefill_done", "decoding"]
+    uncached_total: int | None = None
+    uncached_remaining: int = 0
+    generated_tokens: int = 0
+    has_prompt_len: bool = False
+    blocks_prefill_slot: bool = True
 
 
 class MockEngineNode:
@@ -58,6 +75,8 @@ class MockEngineNode:
         # Chunked prefill pipeline (M3). Maps request_id → remaining uncached tokens.
         # Insertion order is preserved (Python 3.7+ dict) for FIFO scheduling.
         self._prefill_remaining: dict[str, int] = {}
+        # Per-request runtime metadata used for length-aware queue wait estimates.
+        self._states: dict[str, NodeRequestState] = {}
 
     # ------------------------------------------------------------------
     # Latency estimation
@@ -144,80 +163,144 @@ class MockEngineNode:
     ) -> float:
         """Conservative upper-bound estimate of how long a new admittee waits.
 
-        Models capacity-aware admission:
+        Models capacity-aware admission with a deterministic multi-slot FIFO
+        release estimate:
         * If ``running_requests`` < ``capacity``, a slot is open for immediate
-          admission — wait time is 0.
-        * Otherwise the new request must wait for ``queue_length + 1``
-          currently-blocking requests to complete (each modelled as a full
-          prefill + decode lifecycle, the conservative upper bound).
+          admission, so wait time is 0.
+        * Otherwise each running blocker contributes its own remaining
+          lifecycle, queued-ahead requests occupy released slots in FIFO order,
+          and the new request waits for the first slot available after them.
 
         Args:
-            prompt_len: New request's prompt length in tokens. When supplied
-                with expected_output_len, computes full lifecycle estimate.
-            expected_output_len: New request's expected decode steps. Required
-                together with prompt_len for the accurate estimate.
+            prompt_len: Legacy fallback prompt length for blockers that were
+                admitted by older tests without per-request metadata.
+            expected_output_len: Legacy fallback decode length for blockers
+                admitted without output metadata.
 
         Returns:
             Wait time in milliseconds.
             - 0.0 when there is a free slot at admission time.
-            - With both args: ``n_blockers × (prompt_len × ppt + output_len ×
-              (decode_base + marginal))``
-            - Without args (legacy): ``n_blockers × decode_base_ms``. Coarse
-              fallback; new callers should always supply args.
-
-        Known limitation (v1):
-            Uses *the new request's* ``prompt_len`` / ``expected_output_len``
-            to estimate the lifecycle of every blocker — because the node
-            stores only request IDs, not the prompt/output lengths of
-            already-admitted requests. Accurate for the current fixed-length
-            :class:`RequestGenerator`. For trace replay / bursty workloads
-            with heterogeneous lengths, short blockers ahead of a long new
-            request will **overestimate** wait (we apply the long lifecycle
-            to short blockers), and a long blocker ahead of a short new
-            request will **underestimate** (we apply the short lifecycle to
-            long blockers). This is acceptable for v1 because the Conductor's
-            SLO check is intentionally a conservative *gate* (false accepts
-            are worse than false rejects); to make it length-aware in v2,
-            ``MockEngineNode`` would need to track the
-            ``(prompt_len, expected_output_len)`` of each running/queued
-            request.
-
-        Formula:
-            ``n_blockers × (prompt_len × ppt + output_len × step_time)``
-            where ``step_time = decode_base + bs × marginal``
-            and ``bs = max(len(decoding), len(running_requests))``.
-
-            Using ``running_requests`` as the lower bound on ``bs`` handles
-            the common case where all slots are occupied but none have yet
-            entered decode (all still prefilling): once prefill finishes,
-            every running request will join the decode batch, so using
-            ``running_requests`` is a more accurate upper bound than 0.
+            - For runtime-aware requests: FIFO slot wait computed from each
+              blocker request's own phase and remaining uncached/decode work.
+              ``prefill_done`` requests that no longer block a prefill slot
+              contribute 0; ``decoding`` requests still contribute remaining
+              decode work on decode nodes.
+            - For legacy tests that admitted blockers without prompt/output
+              metadata: falls back to the pre-v2 coarse estimate.
         """
         if len(self.running_requests) < self.node_config.capacity:
             return 0.0
 
-        n_blockers = len(self.queue) + 1  # 1 running must finish + N queued ahead
+        blocker_ids = [*self.running_requests, *self.queue]
+        if self._uses_legacy_wait_fallback(blocker_ids, prompt_len, expected_output_len):
+            legacy_wait_units = len(self.queue) + 1
+            return legacy_wait_units * self.model_config.decode_base_ms
 
-        if prompt_len is None or expected_output_len is None:
-            # Legacy fallback; new callers should always supply args.
-            return n_blockers * self.model_config.decode_base_ms
+        running_remaining = [
+            self._remaining_lifecycle_ms(
+                self._state_for_wait(request_id),
+                fallback_prompt_len=prompt_len,
+                fallback_output_len=expected_output_len,
+            )
+            for request_id in self.running_requests
+        ]
+        if not running_remaining:
+            return 0.0
 
-        # Use max(decoding, running) as batch-size estimate. When all requests
-        # are still prefilling (decoding=0), running_requests is the upper
-        # bound because they will all join the decode batch once prefill ends.
-        bs = max(len(self.decoding), len(self.running_requests))
-        step_time = self.model_config.decode_base_ms + bs * self.model_config.marginal_decode_ms
-        per_req_lifecycle_ms = (
-            prompt_len * self.model_config.prefill_cost_per_token_ms
-            + expected_output_len * step_time
+        # FIFO multi-server estimate: queued-ahead requests occupy the earliest
+        # slot releases before the new request can enter.
+        slot_release_times = sorted(running_remaining)
+        for request_id in self.queue:
+            state = self._state_for_wait(request_id)
+            earliest = slot_release_times.pop(0)
+            finish_time = earliest + self._remaining_lifecycle_ms(
+                state,
+                fallback_prompt_len=prompt_len,
+                fallback_output_len=expected_output_len,
+            )
+            slot_release_times.append(finish_time)
+            slot_release_times.sort()
+        return slot_release_times[0]
+
+    def _uses_legacy_wait_fallback(
+        self,
+        blocker_ids: list[str],
+        prompt_len: int | None,
+        expected_output_len: int | None,
+    ) -> bool:
+        """Preserve old no-arg tests when no blocker metadata exists."""
+        if prompt_len is not None or expected_output_len is not None:
+            return False
+        for request_id in blocker_ids:
+            state = self._states.get(request_id)
+            if state is None:
+                return True
+            if state.has_prompt_len or state.expected_output_len > 0:
+                return False
+        return True
+
+    def _state_for_wait(self, request_id: str) -> NodeRequestState:
+        state = self._states.get(request_id)
+        if state is not None:
+            return state
+        phase: Literal["queued", "admitted", "prefilling", "prefill_done", "decoding"] = (
+            "queued" if request_id in self.queue else "admitted"
         )
-        return n_blockers * per_req_lifecycle_ms
+        return NodeRequestState(
+            request_id=request_id,
+            prompt_len=0,
+            expected_output_len=0,
+            phase=phase,
+        )
+
+    def _remaining_lifecycle_ms(
+        self,
+        state: NodeRequestState,
+        *,
+        fallback_prompt_len: int | None = None,
+        fallback_output_len: int | None = None,
+    ) -> float:
+        expected_output = state.expected_output_len
+        if expected_output == 0 and not state.has_prompt_len and fallback_output_len is not None:
+            expected_output = fallback_output_len
+
+        remaining_decode_tokens = max(0, expected_output - state.generated_tokens)
+        decode_step = self._wait_decode_step_ms()
+
+        if state.phase == "prefill_done" and not state.blocks_prefill_slot:
+            return 0.0
+
+        if state.phase in {"prefill_done", "decoding"}:
+            return remaining_decode_tokens * decode_step
+
+        if state.phase == "prefilling":
+            prefill_tokens = max(0, state.uncached_remaining)
+        elif state.uncached_total is not None:
+            prefill_tokens = max(0, state.uncached_total)
+        else:
+            prompt_tokens = state.prompt_len if state.has_prompt_len else (fallback_prompt_len or 0)
+            prefill_tokens = max(0, prompt_tokens)
+
+        return (
+            prefill_tokens * self.model_config.prefill_cost_per_token_ms
+            + remaining_decode_tokens * decode_step
+        )
+
+    def _wait_decode_step_ms(self) -> float:
+        bs = max(len(self.decoding), len(self.running_requests), 1)
+        return self.model_config.decode_base_ms + bs * self.model_config.marginal_decode_ms
 
     # ------------------------------------------------------------------
     # Request lifecycle (used by the simulation engine)
     # ------------------------------------------------------------------
 
-    def admit(self, request_id: str, expected_output_len: int = 0) -> bool:
+    def admit(
+        self,
+        request_id: str,
+        expected_output_len: int = 0,
+        prompt_len: int | None = None,
+        uncached_tokens: int | None = None,
+    ) -> bool:
         """Admit a request — into `running_requests` if capacity allows, else `queue`.
 
         Also initialises output-tracking state (`_output_tokens`,
@@ -231,6 +314,11 @@ class MockEngineNode:
                 is expected to produce. Used by :meth:`tick_batch_step` to
                 detect completion. Defaults to 0 for backward compatibility
                 with tests that do not exercise the decode path.
+            prompt_len: Optional prompt length for length-aware wait
+                estimation. Omitted legacy calls remain supported.
+            uncached_tokens: Optional number of prompt tokens that still need
+                prefill after cache hit. When known, queued/admitted wait
+                estimates use this value instead of prompt-length fallback.
 
         Returns:
             True if the request entered `running_requests` immediately and
@@ -238,6 +326,18 @@ class MockEngineNode:
             capacity is exhausted; callers must defer downstream events until
             :meth:`complete` promotes this request.
         """
+        uncached_total = max(0, uncached_tokens) if uncached_tokens is not None else None
+        state = NodeRequestState(
+            request_id=request_id,
+            prompt_len=prompt_len if prompt_len is not None else 0,
+            expected_output_len=expected_output_len,
+            phase="admitted" if len(self.running_requests) < self.node_config.capacity else "queued",
+            uncached_total=uncached_total,
+            uncached_remaining=uncached_total if uncached_total is not None else 0,
+            has_prompt_len=prompt_len is not None,
+        )
+        self._states[request_id] = state
+
         if len(self.running_requests) < self.node_config.capacity:
             self.running_requests.append(request_id)
             self._output_tokens[request_id] = 0
@@ -305,10 +405,23 @@ class MockEngineNode:
                 f"node {self.node_id}: start_decode called for {request_id!r} "
                 "which is not in running_requests"
             )
+        state = self._states.get(request_id)
+        if state is not None:
+            state.phase = "decoding"
+            state.uncached_total = 0 if state.uncached_total is None else state.uncached_total
+            state.uncached_remaining = 0
+            state.generated_tokens = self._output_tokens.get(request_id, 0)
+            state.blocks_prefill_slot = True
         self.decoding.add(request_id)
         logger.debug("node %s started decode for %s", self.node_id, request_id)
 
-    def init_promoted(self, request_id: str, expected_output_len: int) -> None:
+    def init_promoted(
+        self,
+        request_id: str,
+        expected_output_len: int,
+        prompt_len: int | None = None,
+        uncached_tokens: int | None = None,
+    ) -> None:
         """Initialise output-tracking for a request promoted from `queue` to `running_requests`.
 
         Requests that were originally queued (admit returned False) bypass
@@ -319,6 +432,10 @@ class MockEngineNode:
         Args:
             request_id: ID returned by :meth:`complete` as the promoted request.
             expected_output_len: Expected decode output tokens for this request.
+            prompt_len: Optional prompt length. When omitted, preserves the
+                value stored while the request was queued.
+            uncached_tokens: Optional remaining prefill tokens after cache hit.
+                When omitted, preserves the value stored while queued.
 
         Raises:
             RuntimeError: If *request_id* is not in ``running_requests`` —
@@ -332,6 +449,29 @@ class MockEngineNode:
             )
         self._output_tokens[request_id] = 0
         self._expected_output[request_id] = expected_output_len
+        uncached_total = max(0, uncached_tokens) if uncached_tokens is not None else None
+        state = self._states.get(request_id)
+        if state is None:
+            state = NodeRequestState(
+                request_id=request_id,
+                prompt_len=prompt_len if prompt_len is not None else 0,
+                expected_output_len=expected_output_len,
+                phase="admitted",
+                uncached_total=uncached_total,
+                uncached_remaining=uncached_total if uncached_total is not None else 0,
+                has_prompt_len=prompt_len is not None,
+            )
+            self._states[request_id] = state
+        else:
+            state.phase = "admitted"
+            state.expected_output_len = expected_output_len
+            state.generated_tokens = 0
+            if prompt_len is not None:
+                state.prompt_len = prompt_len
+                state.has_prompt_len = True
+            if uncached_total is not None:
+                state.uncached_total = uncached_total
+                state.uncached_remaining = uncached_total
 
     def enter_prefill(self, request_id: str, uncached_tokens: int) -> None:
         """Mark a request as entering the chunked prefill pipeline.
@@ -355,10 +495,35 @@ class MockEngineNode:
                 "which is not in running_requests"
             )
         self._prefill_remaining[request_id] = uncached_tokens
+        state = self._states.get(request_id)
+        if state is not None:
+            state.phase = "prefilling"
+            state.uncached_total = max(0, uncached_tokens)
+            state.uncached_remaining = uncached_tokens
+            state.blocks_prefill_slot = True
         logger.debug(
             "node %s enter_prefill %s (%d uncached tokens)",
             self.node_id, request_id, uncached_tokens,
         )
+
+    def mark_prefill_done(self, request_id: str) -> None:
+        """Record that a running request has no remaining prefill work.
+
+        This covers both fully-cached fast paths and requests whose chunked
+        prefill just drained. It keeps later wait estimates from charging full
+        prompt prefill to a blocker that is waiting only for transfer/decode.
+        """
+        if request_id not in self.running_requests:
+            raise RuntimeError(
+                f"node {self.node_id}: mark_prefill_done called for {request_id!r} "
+                "which is not in running_requests"
+            )
+        state = self._states.get(request_id)
+        if state is not None:
+            state.phase = "prefill_done"
+            state.uncached_total = 0
+            state.uncached_remaining = 0
+            state.blocks_prefill_slot = False
 
     def tick_batch_step(self, now: float) -> tuple[float, list[str], str | None]:
         """Advance one batch step: optional prefill chunk piggybacked with all decode streams.
@@ -403,6 +568,9 @@ class MockEngineNode:
             chunk_this_step = min(remaining, self.model_config.prefill_chunk_size)
             chunk_cost = chunk_this_step * self.model_config.prefill_cost_per_token_ms
             self._prefill_remaining[prefill_id] -= chunk_this_step
+            state = self._states.get(prefill_id)
+            if state is not None:
+                state.uncached_remaining = self._prefill_remaining[prefill_id]
 
         # Decode step cost (0 when no active decode streams).
         decode_cost = (
@@ -415,6 +583,9 @@ class MockEngineNode:
         completed: list[str] = []
         for req_id in sorted(self.decoding):
             self._output_tokens[req_id] += 1
+            state = self._states.get(req_id)
+            if state is not None:
+                state.generated_tokens = self._output_tokens[req_id]
             if self._output_tokens[req_id] >= self._expected_output[req_id]:
                 completed.append(req_id)
 
@@ -426,6 +597,12 @@ class MockEngineNode:
         prefill_completed_id: str | None = None
         if prefill_id is not None and self._prefill_remaining[prefill_id] == 0:
             del self._prefill_remaining[prefill_id]
+            state = self._states.get(prefill_id)
+            if state is not None:
+                state.phase = "prefill_done"
+                state.uncached_total = 0
+                state.uncached_remaining = 0
+                state.blocks_prefill_slot = False
             prefill_completed_id = prefill_id
 
         return (now + step_time, completed, prefill_completed_id)
@@ -460,11 +637,16 @@ class MockEngineNode:
         self._expected_output.pop(request_id, None)
         self.decoding.discard(request_id)
         self._prefill_remaining.pop(request_id, None)
+        self._states.pop(request_id, None)
 
         logger.debug("node %s completed %s", self.node_id, request_id)
         if self.queue and len(self.running_requests) < self.node_config.capacity:
             promoted = self.queue.pop(0)
             self.running_requests.append(promoted)
+            state = self._states.get(promoted)
+            if state is not None:
+                state.phase = "admitted"
+                state.blocks_prefill_slot = True
             logger.debug("node %s promoted queued %s", self.node_id, promoted)
             return promoted
         return None

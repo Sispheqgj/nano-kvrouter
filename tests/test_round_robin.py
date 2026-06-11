@@ -148,14 +148,17 @@ def test_ttft_includes_queue_wait(
     cache = NullCacheQuery(node_ids=["n0"])
     req = _make_request(10)
     dec = policy.schedule(req, [node], [node], cache)
-    # M5a: bs_hint = len(decode.decoding)+1 = 1 (no decoding streams on this node).
+    # Prefill estimate uses bs_hint = len(decode.decoding)+1 = 1
+    # because no decode streams are active on this node.
     # step_per_chunk = 512*0.1 + 5 + 1*1 = 57.2
-    # queue_wait: bs=max(0,8)=8, step=13.0, n_blockers=2, per_req=10*0.1+32*13=417.0
-    # queue_wait = 2*417.0 = 834.0; first_tick = 5+1*1 = 6.0
-    # expected_ttft = 57.2 + 834.0 + 6.0 = 897.2
+    # queue_wait v2: the 8 running requests release slots simultaneously after
+    # one blocker lifecycle. The single queued request takes one slot, but the
+    # new request can enter another released slot immediately.
+    # wait = 10*0.1 + 32*13 = 417.0; first_tick = 5+1*1 = 6.0
+    # expected_ttft = 57.2 + 417.0 + 6.0 = 480.2
     assert dec.estimated_ttft_ms == pytest.approx(
         (512 * 0.1 + 5.0 + 1 * 1.0)
-        + 2 * (10 * 0.1 + 32 * (5.0 + 8 * 1.0))
+        + (10 * 0.1 + 32 * (5.0 + 8 * 1.0))
         + (5.0 + 1 * 1.0)
     )
 

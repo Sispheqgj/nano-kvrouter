@@ -178,12 +178,16 @@ def _wire_simulator(
         cache lives (M5a). The prefill node skips cached tokens as if it
         had the same prefix locally (Mooncake §3 simplification).
         """
+        uncached = _compute_uncached_tokens(req, decode_node_id)
+        return (uncached + chunk_size - 1) // chunk_size if uncached > 0 else 0
+
+    def _compute_uncached_tokens(req: Request, decode_node_id: str) -> int:
+        """Return prompt tokens that still require prefill after cache hit."""
         try:
             matched = cm.lookup(req, decode_node_id).matched_tokens
         except KeyError:
             matched = 0
-        uncached = max(0, len(req.token_ids) - matched)
-        return (uncached + chunk_size - 1) // chunk_size if uncached > 0 else 0
+        return max(0, len(req.token_ids) - matched)
 
     def _wake_batch_step(
         node: MockEngineNode,
@@ -234,8 +238,12 @@ def _wire_simulator(
         _requests[req.request_id] = req
 
         prefill_node = prefill_nodes_by_id[decision.prefill_node]
+        uncached = max(0, len(req.token_ids) - decode_lookup.matched_tokens)
         is_running = prefill_node.admit(
-            req.request_id, expected_output_len=req.expected_output_len
+            req.request_id,
+            expected_output_len=req.expected_output_len,
+            prompt_len=len(req.token_ids),
+            uncached_tokens=uncached,
         )
         if is_running:
             chunk_size = prefill_node.model_config.prefill_chunk_size
@@ -259,13 +267,10 @@ def _wire_simulator(
 
         decision = _decisions.get(request_id)
         decode_node_id = decision.decode_node if decision is not None else node_id
-        try:
-            matched = cm.lookup(req, decode_node_id).matched_tokens
-        except KeyError:
-            matched = 0
-        uncached = max(0, len(req.token_ids) - matched)
+        uncached = _compute_uncached_tokens(req, decode_node_id)
 
         if uncached == 0:
+            node.mark_prefill_done(request_id)
             # Fully cached on decode side: skip the chunked pipeline; fire
             # PREFILL_COMPLETE immediately (still triggers KV transfer).
             engine.schedule(Event(
@@ -304,7 +309,12 @@ def _wire_simulator(
                 )
             else:
                 prefill_node.init_promoted(
-                    promoted_id, expected_output_len=promoted_req.expected_output_len
+                    promoted_id,
+                    expected_output_len=promoted_req.expected_output_len,
+                    prompt_len=len(promoted_req.token_ids),
+                    uncached_tokens=_compute_uncached_tokens(
+                        promoted_req, promoted_decision.decode_node
+                    ),
                 )
                 chunk_size = prefill_node.model_config.prefill_chunk_size
                 engine.schedule(Event(
@@ -403,7 +413,12 @@ def _wire_simulator(
             )
 
         # Admit into decode_node. We just checked capacity → returns True.
-        decode_node.admit(request_id, expected_output_len=req.expected_output_len)
+        decode_node.admit(
+            request_id,
+            expected_output_len=req.expected_output_len,
+            prompt_len=len(req.token_ids),
+            uncached_tokens=0,
+        )
         decode_node.start_decode(request_id)
         _wake_batch_step(decode_node, decode_node.node_id, engine)
 
