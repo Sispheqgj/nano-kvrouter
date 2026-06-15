@@ -28,6 +28,7 @@ from nano_kvrouter.scheduler.base import (
     CacheLookup,
     CacheQuery,
     SchedulingDecision,
+    TransferBacklogView,
     compute_est_tbt,
     compute_est_ttft,
 )
@@ -48,7 +49,7 @@ class E2Policy:
       blocks that would need to be evicted on the decode_node.
     * **run_cost** (w_run): ``compute_est_ttft(...)`` — total predicted
       time from arrival to first token (Mooncake style, includes KV
-      transfer cost).
+      transfer cost and lane queue wait).
 
     Ties broken by ``(score, node_id)`` so cross-run reproducibility holds.
 
@@ -68,6 +69,7 @@ class E2Policy:
         *,
         model_config: ModelConfig | None = None,
         bandwidth_config: BandwidthConfig | None = None,
+        backlog_view: TransferBacklogView,
     ) -> None:
         for name, val in [
             ("w_historical", w_historical),
@@ -82,6 +84,7 @@ class E2Policy:
         self._w_r = w_run
         self._model_cfg: ModelConfig = model_config if model_config is not None else ModelConfig()
         self._bw_cfg = bandwidth_config if bandwidth_config is not None else BandwidthConfig()
+        self._backlog_view = backlog_view
 
     def schedule(
         self,
@@ -89,6 +92,8 @@ class E2Policy:
         prefill_nodes: Sequence[MockEngineNode],
         decode_nodes: Sequence[MockEngineNode],
         cache: CacheQuery,
+        *,
+        now: float,
     ) -> SchedulingDecision:
         if not prefill_nodes or not decode_nodes:
             return SchedulingDecision(
@@ -122,6 +127,8 @@ class E2Policy:
                 match,
                 kv_bytes_per_token=self._model_cfg.kv_bytes_per_token,
                 bandwidth_bytes_per_s=self._bw_cfg.gpu_to_gpu,
+                backlog_view=self._backlog_view,
+                now=now,
             )
             score = self._w_h * hist + self._w_e * evict + self._w_r * run
             return (score, decode.node_id)
@@ -136,6 +143,8 @@ class E2Policy:
             decode_match,
             kv_bytes_per_token=self._model_cfg.kv_bytes_per_token,
             bandwidth_bytes_per_s=self._bw_cfg.gpu_to_gpu,
+            backlog_view=self._backlog_view,
+            now=now,
         )
         tbt_ms = compute_est_tbt(decode)
 

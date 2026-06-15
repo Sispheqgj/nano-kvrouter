@@ -11,6 +11,7 @@ from nano_kvrouter.kv_cache.cache_manager import CacheManager
 from nano_kvrouter.request import Request
 from nano_kvrouter.scheduler.base import SchedulingPolicy
 from nano_kvrouter.scheduler.prefix_greedy import PrefixGreedyPolicy
+from nano_kvrouter.simulator.transfer_model import NoopTransferModel
 
 
 # ---------------------------------------------------------------------------
@@ -22,7 +23,7 @@ BW_INF = BandwidthConfig(gpu_to_gpu=1e30)
 
 
 def _policy(min_hit_ratio: float = 0.25) -> PrefixGreedyPolicy:
-    return PrefixGreedyPolicy(min_hit_ratio=min_hit_ratio, bandwidth_config=BW_INF)
+    return PrefixGreedyPolicy(min_hit_ratio=min_hit_ratio, bandwidth_config=BW_INF, backlog_view=NoopTransferModel())
 
 
 @pytest.fixture
@@ -66,7 +67,7 @@ def _make_request(token_ids: list[int]) -> Request:
 
 
 def test_satisfies_scheduling_policy_protocol() -> None:
-    assert isinstance(PrefixGreedyPolicy(), SchedulingPolicy)
+    assert isinstance(PrefixGreedyPolicy(backlog_view=NoopTransferModel()), SchedulingPolicy)
 
 
 # ---------------------------------------------------------------------------
@@ -76,9 +77,9 @@ def test_satisfies_scheduling_policy_protocol() -> None:
 
 def test_invalid_min_hit_ratio_raises() -> None:
     with pytest.raises(ValueError):
-        PrefixGreedyPolicy(min_hit_ratio=-0.1)
+        PrefixGreedyPolicy(min_hit_ratio=-0.1, backlog_view=NoopTransferModel())
     with pytest.raises(ValueError):
-        PrefixGreedyPolicy(min_hit_ratio=1.5)
+        PrefixGreedyPolicy(min_hit_ratio=1.5, backlog_view=NoopTransferModel())
 
 
 # ---------------------------------------------------------------------------
@@ -97,7 +98,7 @@ def test_cold_start_falls_back_to_least_loaded(
         nodes[1].admit(f"r{i}")
 
     req = _make_request(list(range(128)))
-    dec = _policy().schedule(req, nodes[:2], nodes[:2], cm)
+    dec = _policy().schedule(req, nodes[:2], nodes[:2], cm, now=0.0)
     assert dec.prefill_node == "n0"
 
 
@@ -117,7 +118,7 @@ def test_picks_node_with_highest_matched_tokens(
     """
     cm.admit(list(range(64)), "n1")  # 4 blocks on n1
     req = _make_request(list(range(64)))
-    dec = _policy().schedule(req, nodes[:2], nodes[:2], cm)
+    dec = _policy().schedule(req, nodes[:2], nodes[:2], cm, now=0.0)
     assert dec.decode_node == "n1"
 
 
@@ -137,7 +138,7 @@ def test_hit_below_threshold_falls_back_to_load(
         nodes[1].admit(f"r{i}")
 
     req = _make_request(list(range(128)))
-    dec = _policy(min_hit_ratio=0.25).schedule(req, nodes[:2], nodes[:2], cm)
+    dec = _policy(min_hit_ratio=0.25).schedule(req, nodes[:2], nodes[:2], cm, now=0.0)
     # hit ratio 16/128 = 12.5% < 25% → fallback → pick least loaded = n0
     assert dec.prefill_node == "n0"
 
@@ -159,7 +160,7 @@ def test_hit_above_threshold_picks_cache_node(
     # n0 is idle
 
     req = _make_request(list(range(128)))
-    dec = _policy(min_hit_ratio=0.25).schedule(req, nodes[:2], nodes[:2], cm)
+    dec = _policy(min_hit_ratio=0.25).schedule(req, nodes[:2], nodes[:2], cm, now=0.0)
     # M5a: cache rule → decode_node = n1. Prefill_node = min-load = n0.
     assert dec.decode_node == "n1"
 
@@ -182,7 +183,7 @@ def test_ties_in_hit_broken_by_load(
     # n1 has 0 running
 
     req = _make_request(prefix)
-    dec = _policy().schedule(req, nodes[:2], nodes[:2], cm)
+    dec = _policy().schedule(req, nodes[:2], nodes[:2], cm, now=0.0)
     assert dec.decode_node == "n1"
 
 
@@ -201,7 +202,7 @@ def test_ties_in_hit_and_load_broken_by_node_id(
     # Both n0 and n1 have 0 running requests (equal load)
 
     req = _make_request(prefix)
-    dec = _policy().schedule(req, nodes[:2], nodes[:2], cm)
+    dec = _policy().schedule(req, nodes[:2], nodes[:2], cm, now=0.0)
     assert dec.decode_node == "n0"
 
 
@@ -218,7 +219,7 @@ def test_ttft_reflects_cache_hit(
     cm.admit(list(range(64)), "n0")
     req = _make_request(list(range(128)))
 
-    dec = _policy().schedule(req, nodes[:1], nodes[:1], cm)
+    dec = _policy().schedule(req, nodes[:1], nodes[:1], cm, now=0.0)
 
     # M3: uncached=64, bs_hint=running+1=1; n_chunks=1 (64<512)
     # step_per_chunk = 512*0.1+5.0+1*0.5 = 56.7; first_tick = 5.0+0.5 = 5.5
@@ -233,7 +234,7 @@ def test_ttft_reflects_cache_hit(
 
 def test_empty_nodes_returns_rejection(cm: CacheManager) -> None:
     req = _make_request(list(range(64)))
-    dec = _policy().schedule(req, [], [], cm)
+    dec = _policy().schedule(req, [], [], cm, now=0.0)
     assert dec.is_rejected
     assert dec.reject_reason == "no_nodes_available"
 
@@ -256,7 +257,7 @@ def test_returns_separate_prefill_decode_nodes(
     for i in range(2):
         nodes[1].admit(f"r{i}")  # n1 more loaded
     req = _make_request(list(range(64)))
-    dec = _policy().schedule(req, nodes, nodes, cm)
+    dec = _policy().schedule(req, nodes, nodes, cm, now=0.0)
     assert dec.decode_node == "n1"      # cache-driven
     assert dec.prefill_node == "n0"     # load-driven (n0 idle)
     assert dec.prefill_node != dec.decode_node

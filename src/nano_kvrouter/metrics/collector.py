@@ -32,6 +32,9 @@ class MetricsCollector:
       ``cost_ms`` == service_cost_ms + queued_cost_ms (includes queue wait);
       under ``none``, equals pure transfer time. Drives ``bandwidth.gpu_to_gpu`` /
       ``model.kv_bytes_per_token`` sensitivity analysis.
+    * ``kv_transfer_queued_avg_ms``: mean of the ``queued_cost_ms`` component
+      from KV_TRANSFER_COMPLETE events. Zero under ``none`` contention model;
+      positive under ``per_node_lane`` when lanes back up. P4-B M1.
     * ``dual_phase_tick_count``: number of ``DECODE_BATCH_STEP`` events
       that fired while at least one request anywhere in the cluster was in
       the prefill phase AND at least one was in the decode phase. Replaces
@@ -98,6 +101,8 @@ class MetricsCollector:
         # M5a metrics
         # KV transfer cost samples (one per KV_TRANSFER_COMPLETE event).
         self._kv_transfer_cost_samples: list[float] = []
+        # P4-B: queued cost samples (lane wait component of KV transfer).
+        self._kv_transfer_queued_samples: list[float] = []
         # M6 tier-hit counters: accumulated from SCHEDULED matched_blocks_by_tier.
         self._cache_hit_by_tier: dict[str, int] = {"gpu": 0, "cpu": 0, "disk": 0}
         # transfer_ids seen via KV_TRANSFER_START; guards against stale
@@ -175,6 +180,11 @@ class MetricsCollector:
                 if self._kv_transfer_cost_samples else None
             ),
             "dual_phase_tick_count": self._dual_phase_tick_count,
+            # P4-B queued cost metric
+            "kv_transfer_queued_avg_ms": (
+                statistics.mean(self._kv_transfer_queued_samples)
+                if self._kv_transfer_queued_samples else 0.0
+            ),
             # M6 tier-hit metrics
             "cache_hit_by_tier_blocks": dict(self._cache_hit_by_tier),
             "cache_hit_by_tier_ratio": self._cache_hit_by_tier_ratio(),
@@ -276,6 +286,8 @@ class MetricsCollector:
         if cost_ms is None:
             return
         self._kv_transfer_cost_samples.append(float(cost_ms))
+        queued_cost_ms = event.payload.get("queued_cost_ms", 0.0)
+        self._kv_transfer_queued_samples.append(float(queued_cost_ms))
 
     def _on_decode_step(self, event: Event, engine: SimulationEngine) -> None:
         request_id = event.payload.get("request_id")

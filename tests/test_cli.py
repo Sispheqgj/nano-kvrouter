@@ -61,25 +61,25 @@ def _small_cfg(
 
 def test_build_scheduler_each_name_returns_protocol() -> None:
     for name in SCHEDULER_NAMES:
-        sched = _build_scheduler(name, {}, ModelConfig())
+        sched = _build_scheduler(name, {}, ModelConfig(), backlog_view=NoopTransferModel())
         assert isinstance(sched, SchedulingPolicy), f"{name} not SchedulingPolicy"
 
 
 def test_build_scheduler_unknown_raises() -> None:
     with pytest.raises(ValueError, match="Unknown scheduler"):
-        _build_scheduler("nonexistent", {}, ModelConfig())
+        _build_scheduler("nonexistent", {}, ModelConfig(), backlog_view=NoopTransferModel())
 
 
 def test_build_scheduler_coerces_string_params() -> None:
     """YAML may deliver numeric params as strings; factory must coerce to float."""
-    sched = _build_scheduler("conductor", {"alpha": "2.0", "beta": "1.5"}, ModelConfig())
+    sched = _build_scheduler("conductor", {"alpha": "2.0", "beta": "1.5"}, ModelConfig(), backlog_view=NoopTransferModel())
     assert isinstance(sched, MooncakeConductor)
 
 
 def test_build_scheduler_prefix_greedy_custom_ratio() -> None:
     from nano_kvrouter.scheduler.prefix_greedy import PrefixGreedyPolicy
 
-    sched = _build_scheduler("prefix_greedy", {"min_hit_ratio": 0.5}, ModelConfig())
+    sched = _build_scheduler("prefix_greedy", {"min_hit_ratio": 0.5}, ModelConfig(), backlog_view=NoopTransferModel())
     assert isinstance(sched, PrefixGreedyPolicy)
 
 
@@ -87,7 +87,8 @@ def test_build_scheduler_e2_policy_custom_weights() -> None:
     from nano_kvrouter.scheduler.e2_policy import E2Policy
 
     sched = _build_scheduler(
-        "e2_policy", {"w_historical": 2.0, "w_eviction": 0.5, "w_run": 1.0}, ModelConfig()
+        "e2_policy", {"w_historical": 2.0, "w_eviction": 0.5, "w_run": 1.0}, ModelConfig(),
+        backlog_view=NoopTransferModel(),
     )
     assert isinstance(sched, E2Policy)
 
@@ -189,7 +190,7 @@ def test_queued_request_does_not_get_prefill_start_immediately() -> None:
     eng = SimulationEngine()
     nodes = [MockEngineNode("n0", cfg.model, cfg.node)]
     cm = CacheManager(["n0"], cfg.model, cfg.node, cfg.bandwidth, clock=eng.now)
-    sched = RoundRobinPolicy(model_config=cfg.model, bandwidth_config=cfg.bandwidth)
+    sched = RoundRobinPolicy(model_config=cfg.model, bandwidth_config=cfg.bandwidth, backlog_view=NoopTransferModel())
 
     _wire_simulator(
         eng, sched, cm, nodes, nodes,
@@ -268,7 +269,7 @@ def test_m2_batch_decode_all_same_length_complete_together() -> None:
     eng = SimulationEngine()
     nodes = [MockEngineNode("n0", cfg.model, cfg.node)]
     cm = CacheManager(["n0"], cfg.model, cfg.node, cfg.bandwidth, clock=eng.now)
-    sched_obj = _build_scheduler("round_robin", {}, cfg.model, cfg.bandwidth)
+    sched_obj = _build_scheduler("round_robin", {}, cfg.model, cfg.bandwidth, backlog_view=NoopTransferModel())
 
     # Pre-warm cache: all 16 requests share token_ids=[0]*64.
     # Admitting once ensures matched=64 for every request → uncached=0 →
@@ -384,7 +385,7 @@ def test_lost_wakeup_new_decode_stream_at_same_time_as_batch_completion() -> Non
     eng = SimulationEngine()
     nodes = [MockEngineNode("n0", mc, nc)]
     cm = CacheManager(["n0"], mc, nc, BandwidthConfig(), clock=eng.now)
-    sched = RoundRobinPolicy()
+    sched = RoundRobinPolicy(backlog_view=NoopTransferModel())
     _wire_simulator(eng, sched, cm, nodes, nodes, logger_=logging.getLogger("test"), model_cfg=mc, bandwidth_cfg=BandwidthConfig(), transfer_model=NoopTransferModel())
 
     complete_times: dict[str, float] = {}
@@ -432,7 +433,7 @@ def test_duplicate_completion_prevented_when_wake_during_terminal() -> None:
     eng = SimulationEngine()
     nodes = [MockEngineNode("n0", mc, nc)]
     cm = CacheManager(["n0"], mc, nc, BandwidthConfig(), clock=eng.now)
-    sched = RoundRobinPolicy()
+    sched = RoundRobinPolicy(backlog_view=NoopTransferModel())
     _wire_simulator(eng, sched, cm, nodes, nodes, logger_=logging.getLogger("test"), model_cfg=mc, bandwidth_cfg=BandwidthConfig(), transfer_model=NoopTransferModel())
 
     complete_ids: list[str] = []
@@ -492,7 +493,7 @@ def test_long_prompt_does_not_freeze_decode() -> None:
     eng = SimulationEngine()
     nodes = [MockEngineNode("n0", mc, nc)]
     cm = CacheManager(["n0"], mc, nc, BandwidthConfig(), clock=eng.now)
-    sched = RoundRobinPolicy()
+    sched = RoundRobinPolicy(backlog_view=NoopTransferModel())
     _wire_simulator(eng, sched, cm, nodes, nodes, logger_=logging.getLogger("test"), model_cfg=mc, bandwidth_cfg=BandwidthConfig(), transfer_model=NoopTransferModel())
 
     a_token_times: list[float] = []
@@ -558,7 +559,7 @@ def test_short_prompt_completes_in_one_chunk() -> None:
     eng = SimulationEngine()
     nodes = [MockEngineNode("n0", mc, nc)]
     cm = CacheManager(["n0"], mc, nc, BandwidthConfig(), clock=eng.now)
-    sched = RoundRobinPolicy()
+    sched = RoundRobinPolicy(backlog_view=NoopTransferModel())
     _wire_simulator(eng, sched, cm, nodes, nodes, logger_=logging.getLogger("test"), model_cfg=mc, bandwidth_cfg=BandwidthConfig(), transfer_model=NoopTransferModel())
 
     prefill_times: list[float] = []
@@ -613,7 +614,7 @@ def test_promoted_request_records_n_chunks() -> None:
     prefill_nodes = [MockEngineNode("p0", mc, nc_p)]
     decode_nodes = [MockEngineNode("d0", mc, nc_d)]
     cm = CacheManager(["d0"], mc, nc_d, bw, clock=eng.now)
-    sched = RoundRobinPolicy(model_config=mc, bandwidth_config=bw)
+    sched = RoundRobinPolicy(model_config=mc, bandwidth_config=bw, backlog_view=NoopTransferModel())
 
     _wire_simulator(
         eng, sched, cm, prefill_nodes, decode_nodes,
@@ -701,7 +702,7 @@ def test_kv_admit_only_on_decode_node() -> None:
         node_ids=[n.node_id for n in decode_nodes],
         model_config=mc, node_config=nc, bandwidth_config=bw, clock=eng.now,
     )
-    sched = _build_scheduler("round_robin", {}, mc, bw)
+    sched = _build_scheduler("round_robin", {}, mc, bw, backlog_view=NoopTransferModel())
     _wire_simulator(
         eng, sched, cm, prefill_nodes, decode_nodes,
         logger_=logging.getLogger("test"),
@@ -739,7 +740,7 @@ def test_transfer_id_validation_drops_stale_event() -> None:
     prefill_nodes = [MockEngineNode("p0", mc, nc)]
     decode_nodes = [MockEngineNode("d0", mc, nc)]
     cm = CacheManager(["d0"], mc, nc, bw, clock=eng.now)
-    sched = RoundRobinPolicy(model_config=mc, bandwidth_config=bw)
+    sched = RoundRobinPolicy(model_config=mc, bandwidth_config=bw, backlog_view=NoopTransferModel())
     _wire_simulator(
         eng, sched, cm, prefill_nodes, decode_nodes,
         logger_=logging.getLogger("test"),
@@ -790,7 +791,7 @@ def test_decode_admit_failure_rejects() -> None:
     prefill_nodes = [MockEngineNode("p0", mc, nc_p)]
     decode_nodes = [MockEngineNode("d0", mc, nc_d)]
     cm = CacheManager(["d0"], mc, nc_d, bw, clock=eng.now)
-    sched = RoundRobinPolicy(model_config=mc, bandwidth_config=bw)
+    sched = RoundRobinPolicy(model_config=mc, bandwidth_config=bw, backlog_view=NoopTransferModel())
     _wire_simulator(
         eng, sched, cm, prefill_nodes, decode_nodes,
         logger_=logging.getLogger("test"),
@@ -861,7 +862,7 @@ def test_decode_admit_during_dual_phase() -> None:
     prefill_nodes = [MockEngineNode("p0", mc, nc_p)]
     decode_nodes = [MockEngineNode("d0", mc, nc_d)]
     cm = CacheManager(["d0"], mc, nc_d, bw, clock=eng.now)
-    sched = RoundRobinPolicy(model_config=mc, bandwidth_config=bw)
+    sched = RoundRobinPolicy(model_config=mc, bandwidth_config=bw, backlog_view=NoopTransferModel())
 
     _wire_simulator(
         eng, sched, cm, prefill_nodes, decode_nodes,
@@ -918,4 +919,54 @@ def test_per_node_lane_increases_kv_transfer_metric_paired():
     assert lane_summary["kv_transfer_time_avg_ms"] > none_summary["kv_transfer_time_avg_ms"], (
         f"per_node_lane ({lane_summary['kv_transfer_time_avg_ms']:.3f} ms) must exceed "
         f"none ({none_summary['kv_transfer_time_avg_ms']:.3f} ms)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# P4-B: kv_transfer_queued_avg_ms decomposition paired test
+# ---------------------------------------------------------------------------
+
+
+def test_kv_transfer_queued_avg_ms_decomposition_paired_fixed_length():
+    """Paired toggle: lane mode exposes non-zero queued component;
+    kv_total - kv_queued ≈ kv_total_none (decomposition invariant).
+
+    Uses transfer_contention.yaml (low bandwidth → measurable lane contention).
+    """
+    from nano_kvrouter.config import load_config
+    import os
+
+    yaml_path = os.path.join(
+        os.path.dirname(__file__), "..", "configs", "transfer_contention.yaml"
+    )
+    base = load_config(yaml_path)
+
+    none_cfg = base.model_copy(deep=True)
+    none_cfg.bandwidth.contention_model = "none"
+    lane_cfg = base.model_copy(deep=True)
+    lane_cfg.bandwidth.contention_model = "per_node_lane"
+
+    none_s = _run_one(none_cfg, "conductor")
+    lane_s = _run_one(lane_cfg, "conductor")
+
+    # none mode: queued == 0
+    assert none_s["kv_transfer_queued_avg_ms"] == 0.0, (
+        f"none.kv_transfer_queued_avg_ms should be 0.0, got {none_s['kv_transfer_queued_avg_ms']}"
+    )
+    # lane mode: queued > 0 (lane contention is non-trivial at 5 MB/s)
+    assert lane_s["kv_transfer_queued_avg_ms"] > 0.0, (
+        f"lane.kv_transfer_queued_avg_ms should be > 0, got {lane_s['kv_transfer_queued_avg_ms']}"
+    )
+    # Decomposition invariant: total = service + queued
+    # total_lane - queued_lane should equal total_none (within 1%).
+    # Per plan v4: paired diff on fixed-length transfer_contention.yaml
+    # makes service component invariant; empirically exact at ~104.86 ms.
+    service_approx = lane_s["kv_transfer_time_avg_ms"] - lane_s["kv_transfer_queued_avg_ms"]
+    expected = none_s["kv_transfer_time_avg_ms"]
+    tol = max(expected * 0.01, 1e-6)  # 1% tolerance or 1e-6 ms
+    assert abs(service_approx - expected) < tol, (
+        f"Decomposition invariant violated: "
+        f"lane_total({lane_s['kv_transfer_time_avg_ms']:.3f}) - "
+        f"lane_queued({lane_s['kv_transfer_queued_avg_ms']:.3f}) = {service_approx:.3f} "
+        f"!≈ none_total({expected:.3f})"
     )

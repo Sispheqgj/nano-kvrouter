@@ -8,6 +8,7 @@ from nano_kvrouter.engine.mock_node import MockEngineNode
 from nano_kvrouter.request import Request
 from nano_kvrouter.scheduler._testing import NullCacheQuery
 from nano_kvrouter.scheduler.round_robin import RoundRobinPolicy
+from nano_kvrouter.simulator.transfer_model import NoopTransferModel
 
 
 # ---------------------------------------------------------------------------
@@ -21,7 +22,7 @@ BW_INF = BandwidthConfig(gpu_to_gpu=1e30)
 
 
 def _policy() -> RoundRobinPolicy:
-    return RoundRobinPolicy(model_config=MODEL, bandwidth_config=BW_INF)
+    return RoundRobinPolicy(model_config=MODEL, bandwidth_config=BW_INF, backlog_view=NoopTransferModel())
 
 
 def _make_node(node_id: str) -> MockEngineNode:
@@ -71,7 +72,7 @@ def test_rotates_across_three_nodes(
     null_cache: NullCacheQuery,
     req: Request,
 ) -> None:
-    picks = [policy.schedule(req, three_nodes, three_nodes, null_cache).prefill_node for _ in range(3)]
+    picks = [policy.schedule(req, three_nodes, three_nodes, null_cache, now=0.0).prefill_node for _ in range(3)]
     assert picks == ["n0", "n1", "n2"]
 
 
@@ -82,8 +83,8 @@ def test_wraps_around_after_full_cycle(
     req: Request,
 ) -> None:
     for _ in range(3):
-        policy.schedule(req, three_nodes, three_nodes, null_cache)
-    fourth = policy.schedule(req, three_nodes, three_nodes, null_cache)
+        policy.schedule(req, three_nodes, three_nodes, null_cache, now=0.0)
+    fourth = policy.schedule(req, three_nodes, three_nodes, null_cache, now=0.0)
     assert fourth.prefill_node == "n0"
 
 
@@ -92,7 +93,7 @@ def test_single_node_always_picked(null_cache: NullCacheQuery, req: Request) -> 
     cache = NullCacheQuery(node_ids=["only"])
     p = _policy()
     for _ in range(5):
-        dec = p.schedule(req, single, single, cache)
+        dec = p.schedule(req, single, single, cache, now=0.0)
         assert dec.prefill_node == "only"
 
 
@@ -103,7 +104,7 @@ def test_single_node_always_picked(null_cache: NullCacheQuery, req: Request) -> 
 
 def test_empty_nodes_returns_rejection(policy: RoundRobinPolicy, req: Request) -> None:
     cache = NullCacheQuery(node_ids=[])
-    dec = policy.schedule(req, [], [], cache)
+    dec = policy.schedule(req, [], [], cache, now=0.0)
     assert dec.is_rejected
     assert dec.reject_reason == "no_nodes_available"
     assert dec.prefill_node is None
@@ -121,7 +122,7 @@ def test_ttft_equals_cold_prefill_with_empty_queue(
     null_cache: NullCacheQuery,
 ) -> None:
     req = _make_request(20)
-    dec = policy.schedule(req, three_nodes, three_nodes, null_cache)
+    dec = policy.schedule(req, three_nodes, three_nodes, null_cache, now=0.0)
     # M3 chunked-prefill: 20 tokens → 1 chunk (20 < chunk_size=512)
     # bs_hint = running+1 = 0+1 = 1
     # step_per_chunk = 512*ppt + base + 1*marginal = 51.2+5.0+1.0 = 57.2
@@ -147,7 +148,7 @@ def test_ttft_includes_queue_wait(
 
     cache = NullCacheQuery(node_ids=["n0"])
     req = _make_request(10)
-    dec = policy.schedule(req, [node], [node], cache)
+    dec = policy.schedule(req, [node], [node], cache, now=0.0)
     # Prefill estimate uses bs_hint = len(decode.decoding)+1 = 1
     # because no decode streams are active on this node.
     # step_per_chunk = 512*0.1 + 5 + 1*1 = 57.2
@@ -174,7 +175,7 @@ def test_tbt_reflects_empty_running_batch(
     null_cache: NullCacheQuery,
     req: Request,
 ) -> None:
-    dec = policy.schedule(req, three_nodes, three_nodes, null_cache)
+    dec = policy.schedule(req, three_nodes, three_nodes, null_cache, now=0.0)
     # 0 running + 1 for new request → decode_base + 1 * marginal
     expected_tbt = MODEL.decode_base_ms + 1 * MODEL.marginal_decode_ms
     assert dec.estimated_tbt_ms == pytest.approx(expected_tbt)
@@ -191,7 +192,7 @@ def test_tbt_grows_with_running_requests(
     assert len(node.running_requests) == 2
 
     cache = NullCacheQuery(node_ids=["n0"])
-    dec = policy.schedule(req, [node], [node], cache)
+    dec = policy.schedule(req, [node], [node], cache, now=0.0)
     # M5a: bs_hint = len(decode.decoding)+1 = 1 (no decoding streams).
     expected_tbt = MODEL.decode_base_ms + 1 * MODEL.marginal_decode_ms
     assert dec.estimated_tbt_ms == pytest.approx(expected_tbt)
@@ -209,7 +210,7 @@ def test_prefill_node_equals_decode_node(
     req: Request,
 ) -> None:
     for _ in range(6):
-        dec = policy.schedule(req, three_nodes, three_nodes, null_cache)
+        dec = policy.schedule(req, three_nodes, three_nodes, null_cache, now=0.0)
         assert dec.prefill_node == dec.decode_node
 
 
@@ -226,11 +227,11 @@ def test_two_instances_have_independent_cursors(
     p1 = _policy()
     p2 = _policy()
     # Advance p1 by 2
-    p1.schedule(req, three_nodes, three_nodes, null_cache)
-    p1.schedule(req, three_nodes, three_nodes, null_cache)
+    p1.schedule(req, three_nodes, three_nodes, null_cache, now=0.0)
+    p1.schedule(req, three_nodes, three_nodes, null_cache, now=0.0)
     # p2 should still start at index 0
-    assert p2.schedule(req, three_nodes, three_nodes, null_cache).prefill_node == "n0"
-    assert p1.schedule(req, three_nodes, three_nodes, null_cache).prefill_node == "n2"
+    assert p2.schedule(req, three_nodes, three_nodes, null_cache, now=0.0).prefill_node == "n0"
+    assert p1.schedule(req, three_nodes, three_nodes, null_cache, now=0.0).prefill_node == "n2"
 
 
 # ---------------------------------------------------------------------------
@@ -263,7 +264,7 @@ def test_ttft_assumes_cold_prefill_regardless_of_cache(
             return 1024
 
     req = _make_request(20)
-    dec = policy.schedule(req, three_nodes, three_nodes, FullHitCache())  # type: ignore[arg-type]
+    dec = policy.schedule(req, three_nodes, three_nodes, FullHitCache(), now=0.0)  # type: ignore[arg-type]
     # M5a: round_robin DOES call cache.lookup(req, decode_node_id) inside the
     # helper, so a full-hit stub now reduces cached_tokens. With 20 tokens
     # fully cached → 0 uncached → 0 prefill chunks; first_tick still fires.

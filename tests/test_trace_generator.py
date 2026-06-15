@@ -129,10 +129,10 @@ def test_per_request_output_length_drives_decode(tmp_path: Path):
         bandwidth_config=cfg.bandwidth,
         clock=eng.now,
     )
-    sched = _build_scheduler("round_robin", {}, cfg.model, cfg.bandwidth)
+    from nano_kvrouter.simulator.transfer_model import NoopTransferModel
+    sched = _build_scheduler("round_robin", {}, cfg.model, cfg.bandwidth, backlog_view=NoopTransferModel())
     all_nodes = {n.node_id: n for n in [*prefill_nodes, *decode_nodes]}
     metrics = MetricsCollector()
-    from nano_kvrouter.simulator.transfer_model import NoopTransferModel
     _wire_simulator(eng, sched, cm, prefill_nodes, decode_nodes,
                     logger_=logging.getLogger("test"), model_cfg=cfg.model,
                     bandwidth_cfg=cfg.bandwidth, transfer_model=NoopTransferModel())

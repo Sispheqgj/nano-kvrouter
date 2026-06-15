@@ -26,6 +26,14 @@ Design notes
   and the scheduler is free to return ``prefill_node == decode_node``
   (RoundRobin / LeastLoaded do; cache-aware policies may still split
   because cache state lives on the decode pool).
+* P4-B M1: ``TransferBacklogView`` is a narrow read-only Protocol that
+  exposes only ``peek_backlog``; it is satisfied structurally by both
+  ``NoopTransferModel`` and ``PerNodeLaneTransferModel`` without any
+  import of ``simulator.transfer_model`` from scheduler code.
+  ``compute_est_ttft`` now takes ``backlog_view`` + ``now`` so the
+  KV-transfer estimate includes current lane queue wait. Under
+  ``NoopTransferModel`` peek_backlog always returns zeros → estimate is
+  byte-identical to pre-P4-B.
 """
 from __future__ import annotations
 
@@ -40,6 +48,7 @@ __all__ = [
     "CacheQuery",
     "SchedulingDecision",
     "SchedulingPolicy",
+    "TransferBacklogView",
     "compute_est_ttft",
     "compute_est_tbt",
 ]
@@ -136,6 +145,35 @@ class CacheQuery(Protocol):
         ...
 
 
+@runtime_checkable
+class TransferBacklogView(Protocol):
+    """Narrow read-only view of KV-transfer lane backlog for schedulers.
+
+    Exposes only ``peek_backlog`` — schedulers must NOT call
+    ``request_transfer``. Both ``NoopTransferModel`` and
+    ``PerNodeLaneTransferModel`` satisfy this Protocol structurally.
+
+    P4-B M1: used by ``compute_est_ttft`` to include current lane queue
+    wait in the KV-transfer cost estimate. Under ``NoopTransferModel``
+    peek_backlog always returns ``{"egress": 0.0, "ingress": 0.0}`` so
+    the estimate remains byte-identical to pre-P4-B under the default
+    ``contention_model: "none"`` config.
+    """
+
+    def peek_backlog(self, node_id: str) -> dict[str, float]:
+        """Return current lane backlog timestamps for ``node_id``.
+
+        Args:
+            node_id: The node to inspect.
+
+        Returns:
+            Dict with ``"egress"`` and ``"ingress"`` keys, each holding
+            the wall-clock time (ms) at which the corresponding lane will
+            be free. ``0.0`` means idle.
+        """
+        ...
+
+
 @dataclass(slots=True)
 class SchedulingDecision:
     """A scheduler's verdict for one request.
@@ -190,10 +228,12 @@ def compute_est_ttft(
     *,
     kv_bytes_per_token: int,
     bandwidth_bytes_per_s: float,
+    backlog_view: TransferBacklogView,
+    now: float,
 ) -> float:
     """Estimated TTFT (ms) for one request under split P/D.
 
-    Formula (Mooncake §3 + Sarathi chunked-prefill):
+    Formula (Mooncake §3 + Sarathi chunked-prefill + P4-B lane backlog):
 
         est_ttft = prefill_phase + queue_wait + kv_transfer + first_decode_tick
 
@@ -211,10 +251,14 @@ def compute_est_ttft(
       behaviour is unchanged.
     * ``queue_wait`` is measured on prefill_node because that is where
       the request is admitted first.
-    * ``kv_transfer`` is ``(prompt_len * kv_bytes_per_token) /
-      bandwidth_bytes_per_s * 1000`` — always computed even in combined
-      deployments so sensitivity sweeps over ``bandwidth.gpu_to_gpu``
-      stay consistent.
+    * ``kv_transfer`` accounts for both service time and lane queue wait
+      (P4-B): service = (prompt_len × kv_bytes_per_token) /
+      bandwidth_bytes_per_s × 1000. Lane queue wait = max(src_egress_wait,
+      dst_ingress_wait) where each is max(0, backlog_view.peek_backlog(
+      node_id)[lane] − now). max-not-sum because both lanes are occupied
+      simultaneously for [start, finish). Under NoopTransferModel, all
+      backlog values are 0.0 so queue_wait == 0 and kv_transfer is
+      byte-identical to the pre-P4-B formula.
     * ``first_decode_tick`` is the first decode step time on decode_node
       using ``len(decode_node.decoding) + 1`` as the batch size hint
       (the decode_node's own concurrent streams).
@@ -235,6 +279,12 @@ def compute_est_ttft(
             present on decode side.
         kv_bytes_per_token: From ``model.kv_bytes_per_token``.
         bandwidth_bytes_per_s: From ``bandwidth.gpu_to_gpu``.
+        backlog_view: Read-only view of KV-transfer lane backlog
+            (P4-B). ``NoopTransferModel`` always returns 0.0 → no change
+            under default config. ``PerNodeLaneTransferModel`` returns
+            real backlog timestamps → queue wait is included.
+        now: Current simulated time (ms). Required to compute how much
+            of any existing backlog is still in the future.
 
     Returns:
         Estimated TTFT in milliseconds.
@@ -253,7 +303,13 @@ def compute_est_ttft(
     queue_wait = prefill_node.queue_wait_time(prompt_len, request.expected_output_len)
     kv_bytes = prompt_len * kv_bytes_per_token
     # bandwidth_bytes_per_s is validated > 0 by Pydantic at config load.
-    kv_transfer = (kv_bytes / bandwidth_bytes_per_s) * 1000.0
+    service = (kv_bytes / bandwidth_bytes_per_s) * 1000.0
+    # P4-B: include lane queue wait. max-not-sum because egress and ingress
+    # lanes are reserved simultaneously for the same transfer window.
+    src_egress_wait = max(0, backlog_view.peek_backlog(prefill_node.node_id)["egress"] - now)
+    dst_ingress_wait = max(0, backlog_view.peek_backlog(decode_node.node_id)["ingress"] - now)
+    lane_queue_wait = max(src_egress_wait, dst_ingress_wait)
+    kv_transfer = service + lane_queue_wait
     # M6: CPU/Disk prefix blocks need loading into GPU HBM before prefill.
     cache_load_ms = decode_cache_match.transfer_cost_ms
     first_decode_tick = decode_node.estimate_decode_time(decoding_bs)
@@ -294,6 +350,8 @@ class SchedulingPolicy(Protocol):
         prefill_nodes: Sequence[MockEngineNode],
         decode_nodes: Sequence[MockEngineNode],
         cache: CacheQuery,
+        *,
+        now: float,
     ) -> SchedulingDecision:
         """Decide where ``request`` should run under split P/D.
 
@@ -308,6 +366,8 @@ class SchedulingPolicy(Protocol):
                 ``matched_tokens`` against ``decode_nodes`` (not prefill).
             cache: Read-only handle for per-node prefix-hit details
                 and free-block counts. Tracks decode-pool nodes only.
+            now: Current simulated time (ms). Required; passed to
+                ``compute_est_ttft`` for lane backlog wait calculation.
 
         Returns:
             A :class:`SchedulingDecision`. To reject, return one with

@@ -9,6 +9,7 @@ from nano_kvrouter.request import Request
 from nano_kvrouter.scheduler._testing import NullCacheQuery
 from nano_kvrouter.scheduler.base import SchedulingPolicy
 from nano_kvrouter.scheduler.least_loaded import LeastLoadedPolicy
+from nano_kvrouter.simulator.transfer_model import NoopTransferModel
 
 
 # ---------------------------------------------------------------------------
@@ -21,7 +22,7 @@ BW_INF = BandwidthConfig(gpu_to_gpu=1e30)
 
 
 def _policy() -> LeastLoadedPolicy:
-    return LeastLoadedPolicy(model_config=MODEL, bandwidth_config=BW_INF)
+    return LeastLoadedPolicy(model_config=MODEL, bandwidth_config=BW_INF, backlog_view=NoopTransferModel())
 
 
 def _make_node(node_id: str) -> MockEngineNode:
@@ -79,7 +80,7 @@ def test_single_node_always_picked(req: Request) -> None:
     cache = NullCacheQuery(node_ids=["only"])
     p = _policy()
     for _ in range(5):
-        dec = p.schedule(req, single, single, cache)
+        dec = p.schedule(req, single, single, cache, now=0.0)
         assert dec.prefill_node == "only"
 
 
@@ -100,7 +101,7 @@ def test_picks_node_with_lowest_load(req: Request) -> None:
     n2.admit("t0")
 
     cache = NullCacheQuery(node_ids=["n0", "n1", "n2"])
-    dec = _policy().schedule(req, [n0, n1, n2], [n0, n1, n2], cache)
+    dec = _policy().schedule(req, [n0, n1, n2], [n0, n1, n2], cache, now=0.0)
     assert dec.prefill_node == "n2"
 
 
@@ -112,7 +113,7 @@ def test_picks_node_with_lowest_load(req: Request) -> None:
 def test_ties_broken_by_index_order(null_cache: NullCacheQuery, req: Request) -> None:
     # All three nodes start with 0 running → all load = 0.0 → n0 wins
     nodes = [_make_node("n0"), _make_node("n1"), _make_node("n2")]
-    dec = _policy().schedule(req, nodes, nodes, null_cache)
+    dec = _policy().schedule(req, nodes, nodes, null_cache, now=0.0)
     assert dec.prefill_node == "n0"
 
 
@@ -121,7 +122,7 @@ def test_ties_broken_by_node_id_lex_order(req: Request) -> None:
     # list-order. With load=0 everywhere, "n0" wins regardless of sequence.
     nodes = [_make_node("n2"), _make_node("n1"), _make_node("n0")]
     cache = NullCacheQuery(node_ids=["n2", "n1", "n0"])
-    dec = _policy().schedule(req, nodes, nodes, cache)
+    dec = _policy().schedule(req, nodes, nodes, cache, now=0.0)
     assert dec.prefill_node == "n0"
 
 
@@ -153,7 +154,7 @@ class _SelectionExplodingCache:
 
 def test_selection_does_not_consult_cache_methods(req: Request) -> None:
     nodes = [_make_node("n0")]
-    dec = _policy().schedule(req, nodes, nodes, _SelectionExplodingCache())  # type: ignore[arg-type]
+    dec = _policy().schedule(req, nodes, nodes, _SelectionExplodingCache(), now=0.0)  # type: ignore[arg-type]
     assert not dec.is_rejected
     assert dec.prefill_node == "n0"
 
@@ -165,7 +166,7 @@ def test_selection_does_not_consult_cache_methods(req: Request) -> None:
 
 def test_empty_nodes_returns_rejection(policy: LeastLoadedPolicy, req: Request) -> None:
     cache = NullCacheQuery(node_ids=[])
-    dec = policy.schedule(req, [], [], cache)
+    dec = policy.schedule(req, [], [], cache, now=0.0)
     assert dec.is_rejected
     assert dec.reject_reason == "no_nodes_available"
     assert dec.prefill_node is None
@@ -187,7 +188,7 @@ def test_ttft_equals_cold_prefill_plus_queue_wait(policy: LeastLoadedPolicy) -> 
 
     req = _make_request(20)
     cache = NullCacheQuery(node_ids=["n0"])
-    dec = policy.schedule(req, [node], [node], cache)
+    dec = policy.schedule(req, [node], [node], cache, now=0.0)
 
     # Prefill estimate uses bs_hint = len(decode.decoding)+1 = 1
     # because no decode streams are active on this node.
@@ -209,7 +210,7 @@ def test_ttft_zero_queue_cold_prefill(policy: LeastLoadedPolicy) -> None:
     req = _make_request(30)
     node = _make_node("n0")
     cache = NullCacheQuery(node_ids=["n0"])
-    dec = policy.schedule(req, [node], [node], cache)
+    dec = policy.schedule(req, [node], [node], cache, now=0.0)
     # M3: idle node, bs_hint=1; 1 chunk (30<512); step_per_chunk=512*0.1+5+1=57.2
     # queue_wait=0; first_tick=5+1=6.0; expected=57.2+6.0=63.2
     assert dec.estimated_ttft_ms == pytest.approx(
@@ -230,7 +231,7 @@ def test_tbt_reflects_running_plus_one(policy: LeastLoadedPolicy, req: Request) 
     assert len(node.running_requests) == 2
 
     cache = NullCacheQuery(node_ids=["n0"])
-    dec = policy.schedule(req, [node], [node], cache)
+    dec = policy.schedule(req, [node], [node], cache, now=0.0)
     # M5a: bs_hint = len(decode.decoding)+1 = 1 (no decoding streams).
     expected_tbt = MODEL.decode_base_ms + 1 * MODEL.marginal_decode_ms
     assert dec.estimated_tbt_ms == pytest.approx(expected_tbt)
@@ -248,5 +249,5 @@ def test_prefill_node_equals_decode_node(
     req: Request,
 ) -> None:
     for _ in range(6):
-        dec = policy.schedule(req, three_nodes, three_nodes, null_cache)
+        dec = policy.schedule(req, three_nodes, three_nodes, null_cache, now=0.0)
         assert dec.prefill_node == dec.decode_node

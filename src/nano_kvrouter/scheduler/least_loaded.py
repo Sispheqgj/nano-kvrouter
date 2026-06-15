@@ -17,6 +17,7 @@ from nano_kvrouter.scheduler.base import (
     CacheLookup,
     CacheQuery,
     SchedulingDecision,
+    TransferBacklogView,
     compute_est_tbt,
     compute_est_ttft,
 )
@@ -53,9 +54,11 @@ class LeastLoadedPolicy:
         *,
         model_config: ModelConfig | None = None,
         bandwidth_config: BandwidthConfig | None = None,
+        backlog_view: TransferBacklogView,
     ) -> None:
         self._model_cfg = model_config if model_config is not None else ModelConfig()
         self._bw_cfg = bandwidth_config if bandwidth_config is not None else BandwidthConfig()
+        self._backlog_view = backlog_view
 
     def schedule(
         self,
@@ -63,6 +66,8 @@ class LeastLoadedPolicy:
         prefill_nodes: Sequence[MockEngineNode],
         decode_nodes: Sequence[MockEngineNode],
         cache: CacheQuery,
+        *,
+        now: float,
     ) -> SchedulingDecision:
         """Pick the least-loaded node in each pool.
 
@@ -73,6 +78,7 @@ class LeastLoadedPolicy:
             decode_nodes: Live decode-pool nodes in stable order.
             cache: Decode-pool cache view (only used by
                 ``compute_est_ttft``).
+            now: Current simulated time (ms).
 
         Returns:
             :class:`SchedulingDecision`. Rejected with
@@ -105,6 +111,8 @@ class LeastLoadedPolicy:
             decode_match,
             kv_bytes_per_token=self._model_cfg.kv_bytes_per_token,
             bandwidth_bytes_per_s=self._bw_cfg.gpu_to_gpu,
+            backlog_view=self._backlog_view,
+            now=now,
         )
         tbt_ms = compute_est_tbt(decode)
 

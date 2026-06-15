@@ -25,6 +25,7 @@ from nano_kvrouter.scheduler.base import (
     CacheLookup,
     CacheQuery,
     SchedulingDecision,
+    TransferBacklogView,
     compute_est_tbt,
     compute_est_ttft,
 )
@@ -72,6 +73,7 @@ class MooncakeConductor:
         *,
         model_config: ModelConfig | None = None,
         bandwidth_config: BandwidthConfig | None = None,
+        backlog_view: TransferBacklogView,
     ) -> None:
         if alpha < 0 or beta < 0 or gamma < 0:
             raise ValueError(
@@ -82,6 +84,7 @@ class MooncakeConductor:
         self._gamma = gamma
         self._model_cfg = model_config if model_config is not None else ModelConfig()
         self._bw_cfg = bandwidth_config if bandwidth_config is not None else BandwidthConfig()
+        self._backlog_view = backlog_view
 
     def schedule(
         self,
@@ -89,6 +92,8 @@ class MooncakeConductor:
         prefill_nodes: Sequence[MockEngineNode],
         decode_nodes: Sequence[MockEngineNode],
         cache: CacheQuery,
+        *,
+        now: float,
     ) -> SchedulingDecision:
         if not prefill_nodes or not decode_nodes:
             return SchedulingDecision(
@@ -133,6 +138,8 @@ class MooncakeConductor:
             decode_match,
             kv_bytes_per_token=self._model_cfg.kv_bytes_per_token,
             bandwidth_bytes_per_s=self._bw_cfg.gpu_to_gpu,
+            backlog_view=self._backlog_view,
+            now=now,
         )
         est_tbt = compute_est_tbt(decode)
 

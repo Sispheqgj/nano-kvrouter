@@ -17,6 +17,7 @@ from nano_kvrouter.scheduler.base import (
     CacheLookup,
     CacheQuery,
     SchedulingDecision,
+    TransferBacklogView,
     compute_est_tbt,
     compute_est_ttft,
 )
@@ -54,6 +55,7 @@ class PrefixGreedyPolicy:
         *,
         model_config: ModelConfig | None = None,
         bandwidth_config: BandwidthConfig | None = None,
+        backlog_view: TransferBacklogView,
     ) -> None:
         """Create a PrefixGreedyPolicy.
 
@@ -64,6 +66,7 @@ class PrefixGreedyPolicy:
                 on the decode pool. Default 0.25.
             model_config: Forwarded to ``compute_est_ttft``.
             bandwidth_config: Forwarded to ``compute_est_ttft``.
+            backlog_view: Read-only KV transfer lane backlog view (P4-B).
 
         Raises:
             ValueError: If ``min_hit_ratio`` is outside [0.0, 1.0].
@@ -73,6 +76,7 @@ class PrefixGreedyPolicy:
         self._min_hit_ratio = min_hit_ratio
         self._model_cfg = model_config if model_config is not None else ModelConfig()
         self._bw_cfg = bandwidth_config if bandwidth_config is not None else BandwidthConfig()
+        self._backlog_view = backlog_view
 
     def schedule(
         self,
@@ -80,6 +84,8 @@ class PrefixGreedyPolicy:
         prefill_nodes: Sequence[MockEngineNode],
         decode_nodes: Sequence[MockEngineNode],
         cache: CacheQuery,
+        *,
+        now: float,
     ) -> SchedulingDecision:
         """Pick decode_node by cache affinity and prefill_node by load.
 
@@ -125,6 +131,8 @@ class PrefixGreedyPolicy:
             decode_match,
             kv_bytes_per_token=self._model_cfg.kv_bytes_per_token,
             bandwidth_bytes_per_s=self._bw_cfg.gpu_to_gpu,
+            backlog_view=self._backlog_view,
+            now=now,
         )
         tbt_ms = compute_est_tbt(decode)
 

@@ -11,6 +11,7 @@ from nano_kvrouter.scheduler.base import (
     CacheQuery,
     SchedulingDecision,
     SchedulingPolicy,
+    TransferBacklogView,
     compute_est_ttft,
 )
 from nano_kvrouter.scheduler._testing import NullCacheQuery
@@ -159,7 +160,8 @@ def test_null_cache_query_satisfies_cache_query_protocol(
 
 
 def test_round_robin_satisfies_scheduling_policy_protocol() -> None:
-    policy = RoundRobinPolicy()
+    from nano_kvrouter.simulator.transfer_model import NoopTransferModel
+    policy = RoundRobinPolicy(backlog_view=NoopTransferModel())
     assert isinstance(policy, SchedulingPolicy)
 
 
@@ -216,6 +218,7 @@ def test_compute_est_ttft_uses_prefill_node_bs() -> None:
     )
     no_cache = CacheLookup(matched_tokens=0, matched_blocks_by_tier={}, transfer_cost_ms=0.0)
 
+    from nano_kvrouter.simulator.transfer_model import NoopTransferModel
     est = compute_est_ttft(
         prefill_node,
         decode_node,
@@ -223,6 +226,8 @@ def test_compute_est_ttft_uses_prefill_node_bs() -> None:
         no_cache,
         kv_bytes_per_token=mc.kv_bytes_per_token,
         bandwidth_bytes_per_s=bw.gpu_to_gpu,
+        backlog_view=NoopTransferModel(),
+        now=0.0,
     )
 
     import pytest as _pytest
@@ -234,4 +239,219 @@ def test_compute_est_ttft_uses_prefill_node_bs() -> None:
     # Also verify it is NOT the old wrong value (60.2 + 9.0 = 69.2)
     assert abs(est - 69.2) > 0.5, (
         "est_ttft matches the OLD wrong value 69.2; fix did not take effect"
+    )
+
+
+
+# ---------------------------------------------------------------------------
+# P4-B: compute_est_ttft backlog integration tests
+# ---------------------------------------------------------------------------
+
+
+def _make_p4b_base() -> tuple:
+    """Helper: minimal nodes + request with real ModelConfig defaults.
+
+    Uses default ModelConfig (prefill_cost=0.033, decode_base=5.0, etc.)
+    and a high bandwidth (1 GB/s with 100 tokens×1024 bytes = 0.1024 ms service).
+    Tests compare compute_est_ttft WITH backlog against WITHOUT backlog to
+    isolate the lane_queue_wait term without needing zero-cost model fields.
+    """
+    from nano_kvrouter.simulator.transfer_model import NoopTransferModel, PerNodeLaneTransferModel
+    mc = ModelConfig(kv_bytes_per_token=1024)  # use defaults for cost fields
+    nc = NodeConfig(capacity=16)
+    pnode = MockEngineNode("p0", mc, nc)
+    dnode = MockEngineNode("d0", mc, nc)
+    req = Request(
+        request_id="r_p4b",
+        token_ids=list(range(100)),
+        prefix_hash="hash_p4b",
+        expected_output_len=32,
+        arrival_time=0.0,
+        slo_ttft=9999.0,
+        slo_tbt=9999.0,
+    )
+    no_cache = CacheLookup(matched_tokens=0, matched_blocks_by_tier={}, transfer_cost_ms=0.0)
+    bw_bps = 1e9  # 1 GB/s
+    return mc, nc, pnode, dnode, req, no_cache, bw_bps
+
+
+def _baseline_est(mc, pnode, dnode, req, no_cache, bw_bps) -> float:
+    """compute_est_ttft with NoopTransferModel (zero backlog)."""
+    from nano_kvrouter.simulator.transfer_model import NoopTransferModel
+    return compute_est_ttft(
+        pnode, dnode, req, no_cache,
+        kv_bytes_per_token=mc.kv_bytes_per_token,
+        bandwidth_bytes_per_s=bw_bps,
+        backlog_view=NoopTransferModel(),
+        now=0.0,
+    )
+
+
+def test_compute_est_ttft_ingress_only_backlog() -> None:
+    """Only dst ingress has backlog → kv_transfer inflated by backlog - now."""
+    from nano_kvrouter.simulator.transfer_model import PerNodeLaneTransferModel
+    mc, nc, pnode, dnode, req, no_cache, bw_bps = _make_p4b_base()
+    model = PerNodeLaneTransferModel()
+    model._ingress_available_at["d0"] = 50.0  # dst ingress backlog = 50ms
+    est_with = compute_est_ttft(
+        pnode, dnode, req, no_cache,
+        kv_bytes_per_token=mc.kv_bytes_per_token,
+        bandwidth_bytes_per_s=bw_bps,
+        backlog_view=model,
+        now=0.0,
+    )
+    baseline = _baseline_est(mc, pnode, dnode, req, no_cache, bw_bps)
+    import pytest as _p
+    # Only ingress backlog → queue_wait = 50ms increase
+    assert est_with - baseline == _p.approx(50.0, abs=1e-6), (
+        f"delta={est_with - baseline}, expected 50.0 from ingress backlog"
+    )
+
+
+def test_compute_est_ttft_egress_only_backlog() -> None:
+    """Only src egress has backlog → kv_transfer inflated."""
+    from nano_kvrouter.simulator.transfer_model import PerNodeLaneTransferModel
+    mc, nc, pnode, dnode, req, no_cache, bw_bps = _make_p4b_base()
+    model = PerNodeLaneTransferModel()
+    model._egress_available_at["p0"] = 30.0  # src egress backlog = 30ms
+    est_with = compute_est_ttft(
+        pnode, dnode, req, no_cache,
+        kv_bytes_per_token=mc.kv_bytes_per_token,
+        bandwidth_bytes_per_s=bw_bps,
+        backlog_view=model,
+        now=0.0,
+    )
+    baseline = _baseline_est(mc, pnode, dnode, req, no_cache, bw_bps)
+    import pytest as _p
+    assert est_with - baseline == _p.approx(30.0, abs=1e-6), (
+        f"delta={est_with - baseline}, expected 30.0 from egress backlog"
+    )
+
+
+def test_compute_est_ttft_uses_max_not_sum() -> None:
+    """Both lanes have backlog → queue_wait = max(src_egress, dst_ingress), not sum.
+
+    Per plan v4: this test constructs the asymmetric backlog state via
+    the public ``request_transfer`` API (no private field access), so
+    the formula and the runtime model agree on how state is produced.
+    """
+    from nano_kvrouter.simulator.transfer_model import PerNodeLaneTransferModel
+    mc, nc, pnode, dnode, req, no_cache, bw_bps = _make_p4b_base()
+    model = PerNodeLaneTransferModel()
+    # p0→d1 cost=20 ⇒ p0.egress.available_at = 20, d1.ingress = 20.
+    # p1→d0 cost=35 ⇒ p1.egress = 35, d0.ingress.available_at = 35.
+    # Resulting state under test: p0.egress = 20, d0.ingress = 35.
+    model.request_transfer("p0", "d1", now=0.0, cost_ms=20.0)
+    model.request_transfer("p1", "d0", now=0.0, cost_ms=35.0)
+    # queue_wait = max(20, 35) = 35 (NOT 20+35=55)
+    est_with = compute_est_ttft(
+        pnode, dnode, req, no_cache,
+        kv_bytes_per_token=mc.kv_bytes_per_token,
+        bandwidth_bytes_per_s=bw_bps,
+        backlog_view=model,
+        now=0.0,
+    )
+    baseline = _baseline_est(mc, pnode, dnode, req, no_cache, bw_bps)
+    delta = est_with - baseline
+    import pytest as _p
+    assert delta == _p.approx(35.0, abs=1e-6), (
+        f"delta={delta} should be max(20,35)=35, not sum=55"
+    )
+    assert abs(delta - 55.0) > 1.0, "Got sum(20+35)=55 instead of max=35 — formula is wrong"
+
+
+def test_compute_est_ttft_clamps_past_backlog_to_zero() -> None:
+    """Backlog timestamp in the past (< now) → wait = 0, not negative."""
+    from nano_kvrouter.simulator.transfer_model import PerNodeLaneTransferModel
+    mc, nc, pnode, dnode, req, no_cache, bw_bps = _make_p4b_base()
+    model = PerNodeLaneTransferModel()
+    # Inject backlog timestamps that are EARLIER than now=1000.0
+    model._egress_available_at["p0"] = 10.0   # backlog is in past
+    model._ingress_available_at["d0"] = 5.0   # backlog is in past
+    est_with = compute_est_ttft(
+        pnode, dnode, req, no_cache,
+        kv_bytes_per_token=mc.kv_bytes_per_token,
+        bandwidth_bytes_per_s=bw_bps,
+        backlog_view=model,
+        now=1000.0,
+    )
+    # With past backlog, result should equal NoopTransferModel at now=1000.0
+    from nano_kvrouter.simulator.transfer_model import NoopTransferModel
+    baseline_1000 = compute_est_ttft(
+        pnode, dnode, req, no_cache,
+        kv_bytes_per_token=mc.kv_bytes_per_token,
+        bandwidth_bytes_per_s=bw_bps,
+        backlog_view=NoopTransferModel(),
+        now=1000.0,
+    )
+    import pytest as _p
+    assert est_with == _p.approx(baseline_1000, abs=1e-6), (
+        f"est_with={est_with} should equal baseline={baseline_1000} (past backlog clamped to 0)"
+    )
+
+
+def test_compute_est_ttft_noop_is_now_invariant() -> None:
+    """NoopTransferModel: kv_transfer term does not change with now value."""
+    from nano_kvrouter.simulator.transfer_model import NoopTransferModel
+    mc, nc, pnode, dnode, req, no_cache, bw_bps = _make_p4b_base()
+    noop = NoopTransferModel()
+    est0 = compute_est_ttft(
+        pnode, dnode, req, no_cache,
+        kv_bytes_per_token=mc.kv_bytes_per_token,
+        bandwidth_bytes_per_s=bw_bps,
+        backlog_view=noop,
+        now=0.0,
+    )
+    est100 = compute_est_ttft(
+        pnode, dnode, req, no_cache,
+        kv_bytes_per_token=mc.kv_bytes_per_token,
+        bandwidth_bytes_per_s=bw_bps,
+        backlog_view=noop,
+        now=100.0,
+    )
+    est1e6 = compute_est_ttft(
+        pnode, dnode, req, no_cache,
+        kv_bytes_per_token=mc.kv_bytes_per_token,
+        bandwidth_bytes_per_s=bw_bps,
+        backlog_view=noop,
+        now=1_000_000.0,
+    )
+    import pytest as _p
+    assert est0 == _p.approx(est100, abs=1e-9)
+    assert est0 == _p.approx(est1e6, abs=1e-9)
+
+
+def test_compute_est_ttft_noop_kv_transfer_term_matches_pre_p4b_formula() -> None:
+    """Under NoopTransferModel the kv_transfer = (tokens * kv_bpt / bw_bps) * 1000 exactly.
+
+    Verified by comparing two runs with different bandwidths: the delta between
+    the two estimates equals (100*1024/bw1 - 100*1024/bw2)*1000, confirming
+    the kv_transfer term is the only thing that changes.
+    """
+    from nano_kvrouter.simulator.transfer_model import NoopTransferModel
+    mc, nc, pnode, dnode, req, no_cache, _ = _make_p4b_base()
+    noop = NoopTransferModel()
+    bw1 = 1e9
+    bw2 = 2e9
+    est1 = compute_est_ttft(
+        pnode, dnode, req, no_cache,
+        kv_bytes_per_token=mc.kv_bytes_per_token,
+        bandwidth_bytes_per_s=bw1,
+        backlog_view=noop,
+        now=0.0,
+    )
+    est2 = compute_est_ttft(
+        pnode, dnode, req, no_cache,
+        kv_bytes_per_token=mc.kv_bytes_per_token,
+        bandwidth_bytes_per_s=bw2,
+        backlog_view=noop,
+        now=0.0,
+    )
+    n_tokens = len(req.token_ids)
+    kv_bpt = mc.kv_bytes_per_token
+    expected_delta = (n_tokens * kv_bpt / bw1 - n_tokens * kv_bpt / bw2) * 1000.0
+    import pytest as _p
+    assert est1 - est2 == _p.approx(expected_delta, abs=1e-9), (
+        f"delta={est1-est2} != expected={expected_delta}; "
+        "kv_transfer term may not match pre-P4-B formula"
     )

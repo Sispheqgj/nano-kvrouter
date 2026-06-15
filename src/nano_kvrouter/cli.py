@@ -36,7 +36,7 @@ from nano_kvrouter.config import (
 from nano_kvrouter.engine.mock_node import MockEngineNode
 from nano_kvrouter.kv_cache.cache_manager import CacheManager
 from nano_kvrouter.metrics.collector import MetricsCollector
-from nano_kvrouter.scheduler.base import SchedulingPolicy
+from nano_kvrouter.scheduler.base import SchedulingPolicy, TransferBacklogView
 from nano_kvrouter.scheduler.conductor import MooncakeConductor
 from nano_kvrouter.scheduler.e2_policy import E2Policy
 from nano_kvrouter.scheduler.least_loaded import LeastLoadedPolicy
@@ -67,6 +67,8 @@ def _build_scheduler(
     params: dict[str, Any],
     model_cfg: ModelConfig,
     bandwidth_cfg: BandwidthConfig | None = None,
+    *,
+    backlog_view: TransferBacklogView,
 ) -> SchedulingPolicy:
     """Construct a scheduler by name.
 
@@ -88,15 +90,16 @@ def _build_scheduler(
     """
     bw = bandwidth_cfg if bandwidth_cfg is not None else BandwidthConfig()
     if name == "round_robin":
-        return RoundRobinPolicy(model_config=model_cfg, bandwidth_config=bw)
+        return RoundRobinPolicy(model_config=model_cfg, bandwidth_config=bw, backlog_view=backlog_view)
     if name == "least_loaded":
-        return LeastLoadedPolicy(model_config=model_cfg, bandwidth_config=bw)
+        return LeastLoadedPolicy(model_config=model_cfg, bandwidth_config=bw, backlog_view=backlog_view)
     if name == "prefix_greedy":
         min_hit_ratio = float(params.get("min_hit_ratio", 0.25))
         return PrefixGreedyPolicy(
             min_hit_ratio=min_hit_ratio,
             model_config=model_cfg,
             bandwidth_config=bw,
+            backlog_view=backlog_view,
         )
     if name == "e2_policy":
         return E2Policy(
@@ -105,6 +108,7 @@ def _build_scheduler(
             w_run=float(params.get("w_run", 1.0)),
             model_config=model_cfg,
             bandwidth_config=bw,
+            backlog_view=backlog_view,
         )
     if name == "conductor":
         return MooncakeConductor(
@@ -113,6 +117,7 @@ def _build_scheduler(
             gamma=float(params.get("gamma", 1.0)),
             model_config=model_cfg,
             bandwidth_config=bw,
+            backlog_view=backlog_view,
         )
     raise ValueError(f"Unknown scheduler {name!r}; valid: {SCHEDULER_NAMES}")
 
@@ -223,7 +228,7 @@ def _wire_simulator(
 
     def on_arrive(event: Event, engine: SimulationEngine) -> None:
         req = event.payload["request"]
-        decision = sched.schedule(req, prefill_nodes, decode_nodes, cm)
+        decision = sched.schedule(req, prefill_nodes, decode_nodes, cm, now=engine.now())
         if decision.is_rejected:
             engine.schedule(Event(
                 time=engine.now(),
@@ -563,7 +568,12 @@ def _run_one(cfg: NanoKVConfig, scheduler_name: str) -> dict:
         bandwidth_config=cfg.bandwidth,
         clock=eng.now,
     )
-    sched = _build_scheduler(scheduler_name, cfg.scheduler.params, cfg.model, cfg.bandwidth)
+    transfer_model: TransferModel = (
+        PerNodeLaneTransferModel()
+        if cfg.bandwidth.contention_model == "per_node_lane"
+        else NoopTransferModel()
+    )
+    sched = _build_scheduler(scheduler_name, cfg.scheduler.params, cfg.model, cfg.bandwidth, backlog_view=transfer_model)
     metrics = MetricsCollector()
     if cfg.trace is not None:
         synthesis_model = None
@@ -585,12 +595,6 @@ def _run_one(cfg: NanoKVConfig, scheduler_name: str) -> dict:
         )
     else:
         gen = RequestGenerator(cfg)
-
-    transfer_model: TransferModel = (
-        PerNodeLaneTransferModel()
-        if cfg.bandwidth.contention_model == "per_node_lane"
-        else NoopTransferModel()
-    )
     _wire_simulator(
         eng, sched, cm, prefill_nodes, decode_nodes,
         logger_=logger, model_cfg=cfg.model, bandwidth_cfg=cfg.bandwidth,

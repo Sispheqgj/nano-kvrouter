@@ -600,13 +600,12 @@ def test_m3_metrics_independent_of_attach_order() -> None:
     bw = BandwidthConfig()
 
     def _run(wire_first: bool) -> dict:
+        from nano_kvrouter.simulator.transfer_model import NoopTransferModel
         eng = SimulationEngine()
         node = MockEngineNode("n0", mc, nc)
         cm = CacheManager(["n0"], mc, nc, bw, clock=eng.now)
-        sched = RoundRobinPolicy(model_config=mc, bandwidth_config=bw)
+        sched = RoundRobinPolicy(model_config=mc, bandwidth_config=bw, backlog_view=NoopTransferModel())
         coll = MetricsCollector()
-
-        from nano_kvrouter.simulator.transfer_model import NoopTransferModel
         if wire_first:
             _wire_simulator(eng, sched, cm, [node], [node],
                             logger_=logging.getLogger("test"),
@@ -774,3 +773,75 @@ def test_cache_hit_by_tier_ratio_zero_when_no_hits(engine, collector):
     summary = collector.summary()
     # No hits → ratio is None (division by zero guard)
     assert summary["cache_hit_by_tier_ratio"] is None
+
+
+# ---------------------------------------------------------------------------
+# P4-B: kv_transfer_queued_avg_ms metric tests
+# ---------------------------------------------------------------------------
+
+
+def _kv_xfer_start_event(transfer_id: str, t: float, service_ms: float, queued_ms: float) -> Event:
+    return Event(
+        time=t,
+        type=EventType.KV_TRANSFER_START,
+        payload={
+            "transfer_id": transfer_id,
+            "service_cost_ms": service_ms,
+            "queued_cost_ms": queued_ms,
+            "cost_ms": service_ms + queued_ms,
+        },
+    )
+
+
+def _kv_xfer_complete_event(transfer_id: str, t: float, service_ms: float, queued_ms: float) -> Event:
+    return Event(
+        time=t,
+        type=EventType.KV_TRANSFER_COMPLETE,
+        payload={
+            "transfer_id": transfer_id,
+            "service_cost_ms": service_ms,
+            "queued_cost_ms": queued_ms,
+            "cost_ms": service_ms + queued_ms,
+        },
+    )
+
+
+def test_kv_transfer_queued_avg_ms_is_zero_under_noop() -> None:
+    """Under NoopTransferModel all queued_cost_ms == 0 → metric == 0.0."""
+    eng = SimulationEngine()
+    coll = MetricsCollector()
+    coll.attach(eng)
+
+    # Simulate two transfers with queued_cost_ms=0 (Noop path)
+    for i in range(3):
+        tid = f"r{i}-xfer-0"
+        eng.schedule(_kv_xfer_start_event(tid, t=float(i), service_ms=10.0, queued_ms=0.0))
+        eng.schedule(_kv_xfer_complete_event(tid, t=float(i) + 10.0, service_ms=10.0, queued_ms=0.0))
+
+    eng.run()
+    s = coll.summary()
+    assert s["kv_transfer_queued_avg_ms"] == 0.0, (
+        f"Expected 0.0 under Noop, got {s['kv_transfer_queued_avg_ms']}"
+    )
+
+
+def test_kv_transfer_queued_avg_ms_ignores_stale_complete() -> None:
+    """Stale KV_TRANSFER_COMPLETE (no prior START) must NOT pollute the new metric."""
+    eng = SimulationEngine()
+    coll = MetricsCollector()
+    coll.attach(eng)
+
+    # Stale event: no matching START was ever emitted
+    stale_event = _kv_xfer_complete_event("stale-xfer-99", t=5.0, service_ms=10.0, queued_ms=999.0)
+    eng.schedule(stale_event)
+
+    # One legitimate transfer with queued_cost_ms=5.0
+    eng.schedule(_kv_xfer_start_event("r0-xfer-0", t=0.0, service_ms=10.0, queued_ms=5.0))
+    eng.schedule(_kv_xfer_complete_event("r0-xfer-0", t=15.0, service_ms=10.0, queued_ms=5.0))
+
+    eng.run()
+    s = coll.summary()
+    # Only the legitimate transfer should be counted → mean == 5.0 (not (5+999)/2 = 502)
+    assert s["kv_transfer_queued_avg_ms"] == pytest.approx(5.0), (
+        f"Expected 5.0 (stale should be dropped), got {s['kv_transfer_queued_avg_ms']}"
+    )

@@ -11,6 +11,7 @@ from nano_kvrouter.kv_cache.cache_manager import CacheManager
 from nano_kvrouter.request import Request
 from nano_kvrouter.scheduler.base import SchedulingPolicy
 from nano_kvrouter.scheduler.conductor import MooncakeConductor
+from nano_kvrouter.simulator.transfer_model import NoopTransferModel
 
 
 # ---------------------------------------------------------------------------
@@ -33,6 +34,7 @@ def _conductor(alpha: float = 1.0, beta: float = 1.0, gamma: float = 1.0) -> Moo
     return MooncakeConductor(
         alpha=alpha, beta=beta, gamma=gamma,
         model_config=_MC, bandwidth_config=BW_INF,
+        backlog_view=NoopTransferModel(),
     )
 
 
@@ -75,7 +77,7 @@ def _req(
 
 
 def test_satisfies_scheduling_policy_protocol() -> None:
-    assert isinstance(MooncakeConductor(), SchedulingPolicy)
+    assert isinstance(MooncakeConductor(backlog_view=NoopTransferModel()), SchedulingPolicy)
 
 
 # ---------------------------------------------------------------------------
@@ -85,11 +87,11 @@ def test_satisfies_scheduling_policy_protocol() -> None:
 
 def test_negative_weight_raises() -> None:
     with pytest.raises(ValueError):
-        MooncakeConductor(gamma=-0.1)
+        MooncakeConductor(gamma=-0.1, backlog_view=NoopTransferModel())
     with pytest.raises(ValueError):
-        MooncakeConductor(alpha=-1.0)
+        MooncakeConductor(alpha=-1.0, backlog_view=NoopTransferModel())
     with pytest.raises(ValueError):
-        MooncakeConductor(beta=-0.5)
+        MooncakeConductor(beta=-0.5, backlog_view=NoopTransferModel())
 
 
 # ---------------------------------------------------------------------------
@@ -102,7 +104,7 @@ def test_cold_start_picks_first_by_index(
 ) -> None:
     """With no cache and no load anywhere, all scores are equal → n0 wins."""
     req = _req(list(range(64)))
-    dec = _conductor().schedule(req, nodes, nodes, cm)
+    dec = _conductor().schedule(req, nodes, nodes, cm, now=0.0)
     assert dec.prefill_node == "n0"
     assert not dec.is_rejected
 
@@ -118,7 +120,7 @@ def test_picks_node_with_highest_cache_benefit(
     """M5a: cache benefit drives decode_node selection (KV lives on decode)."""
     cm.admit(list(range(64)), "n1")  # 4 blocks on n1
     req = _req(list(range(64)))
-    dec = _conductor().schedule(req, nodes[:2], nodes[:2], cm)
+    dec = _conductor().schedule(req, nodes[:2], nodes[:2], cm, now=0.0)
     assert dec.decode_node == "n1"
 
 
@@ -138,7 +140,7 @@ def test_picks_node_with_lowest_load_when_cache_equal(
         nodes[1].admit(f"b{i}")
 
     req = _req(list(range(64)))
-    dec = _conductor().schedule(req, nodes, nodes, cm)
+    dec = _conductor().schedule(req, nodes, nodes, cm, now=0.0)
     assert dec.decode_node == "n2"
 
 
@@ -152,7 +154,7 @@ def test_reject_when_ttft_exceeds_slo(
 ) -> None:
     """A nearly-zero slo_ttft forces a rejection on any cold prefill."""
     req = _req(list(range(64)), slo_ttft=0.001)
-    dec = _conductor().schedule(req, nodes[:1], nodes[:1], cm)
+    dec = _conductor().schedule(req, nodes[:1], nodes[:1], cm, now=0.0)
     assert dec.is_rejected
     assert dec.reject_reason == "ttft_slo_exceeded"
 
@@ -169,7 +171,7 @@ def test_reject_when_tbt_exceeds_slo(
     # slo_ttft large so TTFT check passes; slo_tbt tiny so TBT check fails.
     # est_tbt = decode_base_ms + 1*marginal = 5.0 + 0.5 = 5.5 > 0.001
     req = _req(list(range(64)), slo_ttft=2000.0, slo_tbt=0.001)
-    dec = _conductor().schedule(req, nodes[:1], nodes[:1], cm)
+    dec = _conductor().schedule(req, nodes[:1], nodes[:1], cm, now=0.0)
     assert dec.is_rejected
     assert dec.reject_reason == "tbt_slo_exceeded"
 
@@ -185,7 +187,7 @@ def test_rejection_preserves_estimated_values(
     """Rejected SchedulingDecision must carry non-zero estimated_ttft/tbt
     so MetricsCollector can record the violation magnitude."""
     req = _req(list(range(64)), slo_ttft=0.001)
-    dec = _conductor().schedule(req, nodes[:1], nodes[:1], cm)
+    dec = _conductor().schedule(req, nodes[:1], nodes[:1], cm, now=0.0)
     assert dec.is_rejected
     # M5a: 64 cold tokens, bs_hint=decoding+1=1; n_chunks=1 (64<512)
     # step_per_chunk = 512*0.1+5.0+1*0.5 = 56.7; queue_wait=0; first_tick=5.5
@@ -211,7 +213,7 @@ def test_alpha_zero_ignores_cache(
 
     req = _req(list(range(64)))
     dec = _conductor(alpha=0, beta=1, gamma=0).schedule(
-        req, nodes[:2], nodes[:2], cm
+        req, nodes[:2], nodes[:2], cm, now=0.0
     )
     # n0 has lower load_penalty → higher score (cache doesn't count) → decode = n0
     assert dec.decode_node == "n0"
@@ -242,7 +244,7 @@ def test_beta_zero_ignores_load(
     # first_tick = 5.0 + 9*0.5 = 9.5; est_ttft ≈ 6.4 + 3238.4 + 9.5 = 3254.3 < 5000 → accepted
     req = _req(list(range(64)), slo_ttft=5000.0)
     dec = _conductor(alpha=1, beta=0, gamma=0).schedule(
-        req, nodes[:2], nodes[:2], cm
+        req, nodes[:2], nodes[:2], cm, now=0.0
     )
     # n1 has positive cache_benefit; load doesn't matter → decode_node = n1.
     assert dec.decode_node == "n1"
@@ -269,7 +271,7 @@ def test_transfer_penalty_is_zero_in_v1(cm: CacheManager) -> None:
 
 def test_empty_nodes_returns_no_nodes_available(cm: CacheManager) -> None:
     req = _req(list(range(64)))
-    dec = _conductor().schedule(req, [], [], cm)
+    dec = _conductor().schedule(req, [], [], cm, now=0.0)
     assert dec.is_rejected
     assert dec.reject_reason == "no_nodes_available"
     # Distinguishable from SLO rejection: no estimated time recorded
@@ -294,7 +296,7 @@ def test_ttft_includes_first_batch_tick(
         nodes[0].admit(f"run{i}")   # fill to capacity (capacity=8)
 
     req = _req(list(range(32)), slo_ttft=999999.0)
-    dec = _conductor().schedule(req, nodes[:1], nodes[:1], cm)
+    dec = _conductor().schedule(req, nodes[:1], nodes[:1], cm, now=0.0)
     assert not dec.is_rejected
 
     # M5a: decode_node bs_hint = len(decoding)+1 = 1 (no decoding).
@@ -327,7 +329,7 @@ def test_slo_check_based_on_chosen_node_not_all_nodes(
     # Only one node available — both pools = [nodes[0]] → prefill_node and
     # decode_node both forced to n0.
     dec = _conductor(alpha=30, beta=1, gamma=0).schedule(
-        req, nodes[:1], nodes[:1], cm,
+        req, nodes[:1], nodes[:1], cm, now=0.0,
     )
     assert dec.is_rejected
     assert dec.reject_reason == "ttft_slo_exceeded"
@@ -351,7 +353,7 @@ def test_ttft_includes_chunked_prefill(
     est_ttft       = 0 + 113.4 + 5.5 = 118.9 ms
     """
     req = _req(list(range(1024)), slo_ttft=2000.0)
-    dec = _conductor().schedule(req, nodes[:1], nodes[:1], cm)
+    dec = _conductor().schedule(req, nodes[:1], nodes[:1], cm, now=0.0)
     assert not dec.is_rejected
     chunk = _MC.prefill_chunk_size  # 512
     step_per_chunk = chunk * _MC.prefill_cost_per_token_ms + _MC.decode_base_ms + 1 * _MC.marginal_decode_ms
@@ -414,8 +416,9 @@ def test_transfer_penalty_prefers_gpu_hot_node() -> None:
     conductor = MooncakeConductor(
         alpha=1.0, beta=1.0, gamma=1.0,
         model_config=model_cfg, bandwidth_config=bw_cfg,
+        backlog_view=NoopTransferModel(),
     )
     req = _req(TOKENS, slo_ttft=50000.0)
-    dec = conductor.schedule(req, nodes, nodes, cm)
+    dec = conductor.schedule(req, nodes, nodes, cm, now=0.0)
     assert not dec.is_rejected
     assert dec.decode_node == "n1", f"expected n1 (GPU hot), got {dec.decode_node}"
