@@ -426,11 +426,118 @@ BurstGPT (HPMLL, CC-BY-4.0) 只有长度/时间戳/session_id，没有 prefix �
 - `--output FILE.json` 写结构化报告，行内含 `axis / value / cache_hit /
   uplift_column / uplift_vs_round_robin_pct`，便于后续脚本接续
 
-## 12. 下一步路线
+## 12. TransferModel — per-node KV transfer 争用建模 (P4-A M1)
 
+### 12.1 问题与建模选择
+
+P4-A 之前 KV transfer 是常量公式：
+`cost_ms = kv_bytes / bandwidth.gpu_to_gpu`，10 个同 `(src, dst)` 的并发
+transfer 全部在 `now + cost` 完成。这隐藏了 Mooncake FAST'25 §4.1 明确
+点名的 "per-node KV transfer throughput is the bottleneck"。
+
+候选建模（用户 2026-06-14 拍板）：
+
+- 不做 per-link queue（太接近真实 RDMA topology，不在 simulator 尺度）
+- 不做 shared bandwidth（K 个并发各拿 1/K 带宽——事件模型重算太复杂）
+- 不做 token bucket（per-node throughput cap，复杂度介于其他两者之间）
+- **选 per-node lane**：每个 node 一条 egress lane（它当 src 时）+ 一条
+  ingress lane（它当 dst 时）。一次 transfer 同时占用 src.egress 和
+  dst.ingress；start = max(now, 两条 lane.available_at)，finish = start
+  + cost；两条 lane 都更新到 finish
+
+per-node lane 自然表达：
+- `p0→d0` 和 `p0→d1` 争 `p0.egress`
+- `p0→d0` 和 `p1→d0` 争 `d0.ingress`
+- `p0→d0` 和 `p1→d1` 完全并行
+
+### 12.2 模块结构（统一 Protocol，零 if/else 散布）
+
+`simulator/transfer_model.py`：
+
+```python
+class TransferModel(Protocol):
+    def request_transfer(src, dst, now, cost_ms) -> (start, finish): ...
+    def peek_backlog(node_id) -> {"egress": float, "ingress": float}: ...
+
+class NoopTransferModel:        # 常量 passthrough，byte-identical 旧行为
+class PerNodeLaneTransferModel: # 每节点 egress/ingress 串行
+```
+
+硬约束（防回归）：
+- `cli.py` **只允许一处** `if cfg.bandwidth.contention_model == ...` —
+  `_run_one` 工厂；其它点全走 Protocol 接口
+- `peek_backlog()` 必须 side-effect-free（多次调用不动 `_*_available_at`）—
+  专门有 `test_peek_backlog_is_side_effect_free` 守
+
+### 12.3 Compat：opt-in，默认零漂移
+
+`BandwidthConfig.contention_model: Literal["none", "per_node_lane"] = "none"`。
+默认 `"none"` 走 NoopTransferModel，与 P3-C 末态 byte-identical。
+
+7 个老 yaml（`default / heavy / hicache / pd_split / sensitivity /
+trace_mooncake / trace_burstgpt`）零修改；6 sweep cache_hit、sensitivity
+13/13 PASS、prefix-sensitivity 表全部 byte-identical 通过。
+
+唯一新增 yaml `configs/transfer_contention.yaml`：2p/2d cluster + 合成
+5 MB/s 带宽（**非硬件代表性**，inline comment 说明）让 service_time ≈
+105ms 超过 transfer-producing cadence，争用 measurable。
+
+### 12.4 Event payload — 三字段语义
+
+`KV_TRANSFER_START` / `KV_TRANSFER_COMPLETE` payload 新增两字段：
+
+| 字段 | 含义 | Noop 路径 | PerNodeLane 路径 |
+|------|------|-----------|------------------|
+| `service_cost_ms` | 纯传输时间 = `kv_bytes / bandwidth.gpu_to_gpu` | 同 cost_ms | 单次请求恒定 |
+| `queued_cost_ms` | 等 lane = `start_t - now` | 恒为 0.0 | ≥ 0，争用增长 |
+| `cost_ms` | 端到端 = `finish_t - now` = service + queued | 同 service_cost_ms（backward compat） | service + queued |
+
+`MetricsCollector.kv_transfer_time_avg_ms` 继续采样 `payload["cost_ms"]`，
+但**语义在 `per_node_lane` 下从"纯服务时间"变为"端到端含排队"**——这是
+设计意图不是 bug，collector docstring 同步说明。
+
+未来 v2（backlog #39）会加 `kv_transfer_queued_avg_ms` 单独 metric 让两
+个语义可同时观测。
+
+### 12.5 Scheduler 故意不动（v1 已知 limitation）
+
+5 个 scheduler 的 `compute_est_ttft` 继续用常量 `gpu_to_gpu` 估 TTFT。
+在 `per_node_lane` 下估算与运行时实际 cost 可能 diverge，导致 SLO gate
+（Conductor 早拒）以"乐观估计"决策。
+
+这是 v1 故意 trade-off：
+- **不让 scheduler 看 backlog** = 估算/真值一致性保留 + scheduler 行为
+  不变 + SLO 决策路径不引入新误差源
+- **让 scheduler 看 backlog**（P4-B）= 估算更准但 SLO gate 可能因
+  backlog 抖动导致误拒/接受率漂移，需要单独 plan + sensitivity
+
+P4-B 已在 backlog #39，会让 `MooncakeConductor.compute_est_ttft` 在
+`contention_model == "per_node_lane"` 时把 `peek_backlog(decode_node)
+["ingress"] - now` 加进 `kv_transfer` 项；同时新增
+`kv_transfer_queued_avg_ms` metric。
+
+### 12.6 Hard gate（单元测试隔离，不走 SimulationEngine）
+
+Codex plan v1 review 抓出的 critical：原本 hard gate 走 4 个 request 在
+CLI 同时到达再断言 `max(finish) ≥ 3.5 × min(finish)`，但 chunked prefill
+本身会让 4 个 `KV_TRANSFER_START` 天然错开，断言可能因 prefill
+serialization 假阳通过。
+
+修法（plan v2）：hard gate 直接调
+`PerNodeLaneTransferModel.request_transfer()` 4 次同 `now=0.0`，
+assert 返回 `(0,C)/(C,2C)/(2C,3C)/(3C,4C)`。
+**不许通过 SimulationEngine / CLI**。配套 4 个必备单元测试（disjoint
+并行 / shared egress 串行 / shared ingress 串行 / peek_backlog 零副
+作用）+ Noop 常量验证，全在 `tests/test_transfer_model.py`。
+
+## 13. 下一步路线
+
+- **P4-B**：让 `MooncakeConductor.compute_est_ttft` 看
+  `transfer_model.peek_backlog()`，新增 `kv_transfer_queued_avg_ms`
+  metric（backlog #39）。硬约束仍是 default yaml 行为零漂移
 - P3-D：把 `PrefixSynthesisModel` 提取给 Poisson `RequestGenerator` 也用
   （硬约束：default yaml 行为零漂移，opt-in only）
-- P4 候选：
+- P5 候选：
   - **PagedAttention Tier 2**：让 CPU/Disk 块真正动起来（demote/promote
     路径、HiCache 命中链、prefill cache_miss 不再只看 GPU 命中）
   - Llumnix-style migration / rebalance executor

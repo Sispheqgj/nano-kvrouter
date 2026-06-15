@@ -28,12 +28,14 @@ It also models the KV cache as a first-class cluster resource:
 ## Current status
 
 P2-Infra M1-M6 is implemented and verified. P3-C M1+M2 (real-world trace
-replay + synthetic prefix sharing on length-only traces) is also live.
+replay + synthetic prefix sharing on length-only traces) and P4-A
+(per-node KV transfer lane contention, opt-in) are also live.
 
-- `uv run pytest -q` -> `413 passed`
+- `uv run pytest -q` -> `451 passed`
 - `uv run python -m nano_kvrouter.cli sensitivity --config configs/sensitivity.yaml` -> `13/13 fields PASS`
 - `uv run python -m nano_kvrouter.cli sweep --config configs/trace_mooncake.yaml` -> 5 schedulers on Mooncake FAST'25 real trace, cache-aware ~2× cache_hit vs cache-blind
 - `uv run python -m nano_kvrouter.cli prefix-sensitivity --config configs/trace_burstgpt.yaml` -> 4-axis sweep over prefix-synthesis params on BurstGPT replay, with Mooncake real-trace `cache_hit` shown as informational anchor
+- `uv run python -m nano_kvrouter.cli sweep --config configs/transfer_contention.yaml` -> per-node KV transfer lane queueing exposes ~30× `kv_transfer_time_avg_ms` inflation vs constant-cost baseline on the same 2p/2d cluster
 - repo-outside absolute `--config` sensitivity execution is supported
 
 The repository currently exposes four public CLI workflows:
@@ -150,6 +152,48 @@ Reference: Mooncake real-`hash_ids` `cache_hit` on `configs/trace_mooncake.yaml`
 with conductor is **0.146** (informational; this is what real prefix reuse
 looks like, not what the synthesis is required to match).
 
+### Per-node KV transfer lane contention (P4-A, 2026-06-15)
+
+Until P4-A, simulated KV transfers between prefill and decode nodes paid a
+constant per-request cost `kv_bytes / bandwidth.gpu_to_gpu` — 10 transfers
+sharing the same `(src, dst)` pair all finished at `now + cost`. That hid
+post-prefill transfer queueing, the bottleneck Mooncake FAST'25 calls out
+as "per-node KV transfer throughput".
+
+P4-A introduces a `TransferModel` abstraction with two implementations
+selected via `bandwidth.contention_model`:
+
+| `contention_model` | Implementation | Behavior |
+|--------------------|---------------|----------|
+| `"none"` (**default**) | `NoopTransferModel` | constant cost; byte-identical to pre-P4-A baseline. All 7 existing scenario configs run unchanged. |
+| `"per_node_lane"` | `PerNodeLaneTransferModel` | each node owns one egress + one ingress lane. A transfer reserves both for `[start, finish)`, where `start = max(now, egress.available_at[src], ingress.available_at[dst])`. Disjoint `(src, dst)` pairs run in parallel; transfers sharing a src or dst serialize. |
+
+Demo scenario `configs/transfer_contention.yaml` (2 prefill × 2 decode,
+synthetic 5 MB/s bandwidth so service time exceeds the effective
+transfer-producing cadence):
+
+```bash
+uv run python -m nano_kvrouter.cli sweep --config configs/transfer_contention.yaml
+```
+
+Measured paired diff on the same yaml, only flipping the field:
+
+| `contention_model` | `kv_transfer_time_avg_ms` |
+|--------------------|--------------------------:|
+| `none` | 104.9 |
+| `per_node_lane` | 3137.1 |
+
+A ~30× inflation in observed transfer time when 4 concurrent post-prefill
+transfers queue on shared lanes. `kv_transfer_time_avg_ms` becomes
+"end-to-end transfer time (service + queue wait)" under `per_node_lane` —
+this is the design intent, not a metric regression.
+
+P4-A v1 deliberately does NOT update scheduler `compute_est_ttft` to read
+lane backlog. The estimator keeps the constant `gpu_to_gpu` formula; the
+runtime cost may diverge from the estimate under contention. This is a
+documented v1 limitation (P4-B / backlog `kv_transfer_queued_avg_ms`
+metric + conductor backlog awareness).
+
 ## Quick start
 
 The project uses [`uv`](https://docs.astral.sh/uv/).
@@ -177,6 +221,9 @@ uv run python -m nano_kvrouter.cli sweep --config configs/trace_burstgpt.yaml
 # Scan prefix-synthesis sensitivity on a length-only trace (BurstGPT)
 uv run python -m nano_kvrouter.cli prefix-sensitivity \
   --config configs/trace_burstgpt.yaml --scheduler conductor
+
+# Exercise per-node KV transfer lane contention (P4-A)
+uv run python -m nano_kvrouter.cli sweep --config configs/transfer_contention.yaml
 
 # Run field-level sensitivity acceptance
 uv run python -m nano_kvrouter.cli sensitivity --config configs/sensitivity.yaml
@@ -215,6 +262,7 @@ uv run pytest -q
 | [`configs/sensitivity.yaml`](configs/sensitivity.yaml) | Acceptance matrix describing field experiments, not hard-coded CLI logic |
 | [`configs/trace_mooncake.yaml`](configs/trace_mooncake.yaml) | Mooncake FAST'25 trace replay (real `hash_ids`, block_size=512) |
 | [`configs/trace_burstgpt.yaml`](configs/trace_burstgpt.yaml) | BurstGPT trace replay with synthetic prefix sharing (`PrefixSynthesisModel`) |
+| [`configs/transfer_contention.yaml`](configs/transfer_contention.yaml) | 2p/2d cluster with `bandwidth.contention_model: per_node_lane` to exercise the P4-A `TransferModel` lane queueing |
 
 ## LIVE config matrix
 
@@ -360,7 +408,8 @@ src/nano_kvrouter/
 │   ├── engine.py
 │   ├── generator.py         # Poisson generator
 │   ├── trace_generator.py   # JSONL trace replay (Mooncake / BurstGPT)
-│   └── prefix_synthesis.py  # Zipf+locality+layered prefix model (P3-C M2)
+│   ├── prefix_synthesis.py  # Zipf+locality+layered prefix model (P3-C M2)
+│   └── transfer_model.py    # Noop / per-node lane KV transfer cost models (P4-A)
 └── metrics/
     └── collector.py
 ```
