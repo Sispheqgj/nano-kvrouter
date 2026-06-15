@@ -17,6 +17,7 @@ from nano_kvrouter.config import (
 from nano_kvrouter.scheduler.base import SchedulingPolicy
 from nano_kvrouter.scheduler.conductor import MooncakeConductor
 from nano_kvrouter.cli import SCHEDULER_NAMES, _build_scheduler, _run_one, _wire_simulator
+from nano_kvrouter.simulator.transfer_model import NoopTransferModel
 from nano_kvrouter.engine.mock_node import MockEngineNode
 from nano_kvrouter.kv_cache.cache_manager import CacheManager
 from nano_kvrouter.request import Request
@@ -194,6 +195,7 @@ def test_queued_request_does_not_get_prefill_start_immediately() -> None:
         eng, sched, cm, nodes, nodes,
         logger_=logging.getLogger("test"),
         model_cfg=cfg.model, bandwidth_cfg=cfg.bandwidth,
+        transfer_model=NoopTransferModel(),
     )
 
     # Record (simulated_time, request_id) for every PREFILL_START event.
@@ -273,7 +275,7 @@ def test_m2_batch_decode_all_same_length_complete_together() -> None:
     # PREFILL_COMPLETE fires immediately → all 16 enter decode at t=0.
     cm.admit([0] * 64, "n0")
 
-    _wire_simulator(eng, sched_obj, cm, nodes, nodes, logger_=logging.getLogger("test"), model_cfg=cfg.model, bandwidth_cfg=cfg.bandwidth)
+    _wire_simulator(eng, sched_obj, cm, nodes, nodes, logger_=logging.getLogger("test"), model_cfg=cfg.model, bandwidth_cfg=cfg.bandwidth, transfer_model=NoopTransferModel())
 
     # Record all DECODE_COMPLETE times.
     complete_times: list[float] = []
@@ -383,7 +385,7 @@ def test_lost_wakeup_new_decode_stream_at_same_time_as_batch_completion() -> Non
     nodes = [MockEngineNode("n0", mc, nc)]
     cm = CacheManager(["n0"], mc, nc, BandwidthConfig(), clock=eng.now)
     sched = RoundRobinPolicy()
-    _wire_simulator(eng, sched, cm, nodes, nodes, logger_=logging.getLogger("test"), model_cfg=mc, bandwidth_cfg=BandwidthConfig())
+    _wire_simulator(eng, sched, cm, nodes, nodes, logger_=logging.getLogger("test"), model_cfg=mc, bandwidth_cfg=BandwidthConfig(), transfer_model=NoopTransferModel())
 
     complete_times: dict[str, float] = {}
     eng.on(
@@ -431,7 +433,7 @@ def test_duplicate_completion_prevented_when_wake_during_terminal() -> None:
     nodes = [MockEngineNode("n0", mc, nc)]
     cm = CacheManager(["n0"], mc, nc, BandwidthConfig(), clock=eng.now)
     sched = RoundRobinPolicy()
-    _wire_simulator(eng, sched, cm, nodes, nodes, logger_=logging.getLogger("test"), model_cfg=mc, bandwidth_cfg=BandwidthConfig())
+    _wire_simulator(eng, sched, cm, nodes, nodes, logger_=logging.getLogger("test"), model_cfg=mc, bandwidth_cfg=BandwidthConfig(), transfer_model=NoopTransferModel())
 
     complete_ids: list[str] = []
     eng.on(
@@ -491,7 +493,7 @@ def test_long_prompt_does_not_freeze_decode() -> None:
     nodes = [MockEngineNode("n0", mc, nc)]
     cm = CacheManager(["n0"], mc, nc, BandwidthConfig(), clock=eng.now)
     sched = RoundRobinPolicy()
-    _wire_simulator(eng, sched, cm, nodes, nodes, logger_=logging.getLogger("test"), model_cfg=mc, bandwidth_cfg=BandwidthConfig())
+    _wire_simulator(eng, sched, cm, nodes, nodes, logger_=logging.getLogger("test"), model_cfg=mc, bandwidth_cfg=BandwidthConfig(), transfer_model=NoopTransferModel())
 
     a_token_times: list[float] = []
     b_prefill_complete_time: list[float] = []
@@ -557,7 +559,7 @@ def test_short_prompt_completes_in_one_chunk() -> None:
     nodes = [MockEngineNode("n0", mc, nc)]
     cm = CacheManager(["n0"], mc, nc, BandwidthConfig(), clock=eng.now)
     sched = RoundRobinPolicy()
-    _wire_simulator(eng, sched, cm, nodes, nodes, logger_=logging.getLogger("test"), model_cfg=mc, bandwidth_cfg=BandwidthConfig())
+    _wire_simulator(eng, sched, cm, nodes, nodes, logger_=logging.getLogger("test"), model_cfg=mc, bandwidth_cfg=BandwidthConfig(), transfer_model=NoopTransferModel())
 
     prefill_times: list[float] = []
     eng.on(
@@ -617,6 +619,7 @@ def test_promoted_request_records_n_chunks() -> None:
         eng, sched, cm, prefill_nodes, decode_nodes,
         logger_=logging.getLogger("test"),
         model_cfg=mc, bandwidth_cfg=bw,
+        transfer_model=NoopTransferModel(),
     )
     metrics = MetricsCollector()
     metrics.attach(eng, nodes={n.node_id: n for n in [*prefill_nodes, *decode_nodes]})
@@ -703,6 +706,7 @@ def test_kv_admit_only_on_decode_node() -> None:
         eng, sched, cm, prefill_nodes, decode_nodes,
         logger_=logging.getLogger("test"),
         model_cfg=mc, bandwidth_cfg=bw,
+        transfer_model=NoopTransferModel(),
     )
     metrics = MetricsCollector()
     metrics.attach(eng, nodes={n.node_id: n for n in [*prefill_nodes, *decode_nodes]})
@@ -740,6 +744,7 @@ def test_transfer_id_validation_drops_stale_event() -> None:
         eng, sched, cm, prefill_nodes, decode_nodes,
         logger_=logging.getLogger("test"),
         model_cfg=mc, bandwidth_cfg=bw,
+        transfer_model=NoopTransferModel(),
     )
 
     # Inject a KV_TRANSFER_COMPLETE with a never-registered transfer_id.
@@ -790,6 +795,7 @@ def test_decode_admit_failure_rejects() -> None:
         eng, sched, cm, prefill_nodes, decode_nodes,
         logger_=logging.getLogger("test"),
         model_cfg=mc, bandwidth_cfg=bw,
+        transfer_model=NoopTransferModel(),
     )
     metrics = MetricsCollector()
     metrics.attach(eng, nodes={n.node_id: n for n in [*prefill_nodes, *decode_nodes]})
@@ -861,6 +867,7 @@ def test_decode_admit_during_dual_phase() -> None:
         eng, sched, cm, prefill_nodes, decode_nodes,
         logger_=logging.getLogger("test"),
         model_cfg=mc, bandwidth_cfg=bw,
+        transfer_model=NoopTransferModel(),
     )
     metrics = MetricsCollector()
     metrics.attach(eng, nodes={n.node_id: n for n in [*prefill_nodes, *decode_nodes]})
@@ -882,4 +889,33 @@ def test_decode_admit_during_dual_phase() -> None:
     assert s["dual_phase_tick_count"] > 0, (
         "dual_phase_tick_count must be > 0: r0 decoding while r1 prefilling "
         "(active_prefills and active_decodes both non-empty during BATCH_STEPs)."
+    )
+
+
+# ---------------------------------------------------------------------------
+# P4-A M1: paired CLI smoke test (constraint #7)
+# ---------------------------------------------------------------------------
+
+def test_per_node_lane_increases_kv_transfer_metric_paired():
+    """Same yaml, only contention_model toggled; lane mode must have higher avg KV transfer time."""
+    from nano_kvrouter.config import load_config
+    import os
+
+    yaml_path = os.path.join(
+        os.path.dirname(__file__), "..", "configs", "transfer_contention.yaml"
+    )
+    base = load_config(yaml_path)
+
+    none_cfg = base.model_copy(deep=True)
+    none_cfg.bandwidth.contention_model = "none"
+
+    lane_cfg = base.model_copy(deep=True)
+    lane_cfg.bandwidth.contention_model = "per_node_lane"
+
+    none_summary = _run_one(none_cfg, "conductor")
+    lane_summary = _run_one(lane_cfg, "conductor")
+
+    assert lane_summary["kv_transfer_time_avg_ms"] > none_summary["kv_transfer_time_avg_ms"], (
+        f"per_node_lane ({lane_summary['kv_transfer_time_avg_ms']:.3f} ms) must exceed "
+        f"none ({none_summary['kv_transfer_time_avg_ms']:.3f} ms)"
     )

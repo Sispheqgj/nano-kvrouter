@@ -108,10 +108,11 @@ class ModelConfig(BaseModel):
 class BandwidthConfig(BaseModel):
     """Inter-tier transfer bandwidths in bytes/second.
 
-    All three fields are LIVE:
+    All fields are LIVE:
       - ``gpu_to_gpu`` drives prefill->decode KV transfer cost in split P/D.
       - ``gpu_to_cpu`` drives CPU-tier hit reload cost into GPU HBM.
       - ``cpu_to_disk`` drives the Disk->CPU leg of disk-tier hit reload cost.
+      - ``contention_model`` selects the KV transfer contention model (P4-A M1).
 
     Defaults approximate A100-class hardware: NVLink GPU↔GPU, PCIe Gen4
     GPU↔CPU, NVMe CPU↔Disk.
@@ -131,6 +132,17 @@ class BandwidthConfig(BaseModel):
     cpu_to_disk: float = Field(
         default=5e9, gt=0,
         description="LIVE in M6+. Disk-facing bandwidth used for disk-tier reload cost.",
+    )
+
+    # NEW in P4-A M1
+    contention_model: Literal["none", "per_node_lane"] = Field(
+        default="none",
+        description=(
+            "LIVE in P4-A M1. 'none' = constant-cost transfer (pre-P4-A "
+            "behavior). 'per_node_lane' = each src/dst node has an "
+            "egress/ingress lane that serializes simultaneous transfers; "
+            "raises kv_transfer_time_avg_ms under contention."
+        ),
     )
 
 

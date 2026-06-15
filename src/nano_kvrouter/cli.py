@@ -43,6 +43,11 @@ from nano_kvrouter.scheduler.least_loaded import LeastLoadedPolicy
 from nano_kvrouter.scheduler.prefix_greedy import PrefixGreedyPolicy
 from nano_kvrouter.scheduler.round_robin import RoundRobinPolicy
 from nano_kvrouter.simulator.engine import SimulationEngine
+from nano_kvrouter.simulator.transfer_model import (
+    NoopTransferModel,
+    PerNodeLaneTransferModel,
+    TransferModel,
+)
 from nano_kvrouter.simulator.event import Event, EventType
 from nano_kvrouter.request import Request
 from nano_kvrouter.simulator.generator import RequestGenerator
@@ -124,6 +129,7 @@ def _wire_simulator(
     logger_: logging.Logger,
     model_cfg: ModelConfig,
     bandwidth_cfg: BandwidthConfig,
+    transfer_model: TransferModel,
 ) -> None:
     """Register simulation event handlers on *eng* (M5a split P/D).
 
@@ -136,8 +142,13 @@ def _wire_simulator(
        PREFILL_COMPLETE.
     3. ``DECODE_BATCH_STEP`` on prefill_node ticks chunked prefill.
     4. ``PREFILL_COMPLETE`` → prefill_node.complete() (release slot, possibly
-       promote queued prefill); emit ``KV_TRANSFER_START`` (now) +
-       ``KV_TRANSFER_COMPLETE`` (now + cost).
+       promote queued prefill); ``TransferModel.request_transfer()``
+       returns ``(start_t, finish_t)`` and ``KV_TRANSFER_START`` /
+       ``KV_TRANSFER_COMPLETE`` fire at those times. Under
+       ``NoopTransferModel`` (default) ``start_t == now`` and
+       ``finish_t == now + service_cost_ms`` — byte-identical to
+       pre-P4-A behavior. Under ``PerNodeLaneTransferModel`` ``start_t``
+       may be delayed by src.egress / dst.ingress lane backlog.
     5. ``KV_TRANSFER_COMPLETE`` → if decode_node at capacity, REJECT
        (M5a B1); else cm.admit() on decode_node + decode_node.admit() +
        start_decode + wake batch step.
@@ -332,37 +343,42 @@ def _wire_simulator(
 
         # Emit KV transfer event pair (Mooncake one-shot post-prefill).
         kv_bytes = len(req.token_ids) * model_cfg.kv_bytes_per_token
-        cost_ms = (kv_bytes / bandwidth_cfg.gpu_to_gpu) * 1000.0
+        service_cost_ms = (kv_bytes / bandwidth_cfg.gpu_to_gpu) * 1000.0
+        start_t, finish_t = transfer_model.request_transfer(
+            decision.prefill_node,
+            decision.decode_node,
+            engine.now(),
+            service_cost_ms,
+        )
+        queued_cost_ms = start_t - engine.now()
+        total_cost_ms = finish_t - engine.now()  # == queued + service
+
         transfer_id = _next_transfer_id(request_id)
         _pending_transfers[transfer_id] = {
             "request_id": request_id,
             "src": decision.prefill_node,
             "dst": decision.decode_node,
-            "cost_ms": cost_ms,
+            "cost_ms": total_cost_ms,
             "request": req,
         }
+        payload_base = {
+            "request_id": request_id,
+            "transfer_id": transfer_id,
+            "src_node_id": decision.prefill_node,
+            "dst_node_id": decision.decode_node,
+            "service_cost_ms": service_cost_ms,
+            "queued_cost_ms": queued_cost_ms,
+            "cost_ms": total_cost_ms,
+        }
         engine.schedule(Event(
-            time=engine.now(),
+            time=start_t,
             type=EventType.KV_TRANSFER_START,
-            payload={
-                "request_id": request_id,
-                "transfer_id": transfer_id,
-                "src_node_id": decision.prefill_node,
-                "dst_node_id": decision.decode_node,
-                "cost_ms": cost_ms,
-            },
+            payload={**payload_base},
         ))
         engine.schedule(Event(
-            time=engine.now() + cost_ms,
+            time=finish_t,
             type=EventType.KV_TRANSFER_COMPLETE,
-            payload={
-                "request_id": request_id,
-                "transfer_id": transfer_id,
-                "src_node_id": decision.prefill_node,
-                "dst_node_id": decision.decode_node,
-                "request": req,
-                "cost_ms": cost_ms,
-            },
+            payload={**payload_base, "request": req},
         ))
 
     def on_kv_transfer_start(event: Event, engine: SimulationEngine) -> None:
@@ -570,9 +586,15 @@ def _run_one(cfg: NanoKVConfig, scheduler_name: str) -> dict:
     else:
         gen = RequestGenerator(cfg)
 
+    transfer_model: TransferModel = (
+        PerNodeLaneTransferModel()
+        if cfg.bandwidth.contention_model == "per_node_lane"
+        else NoopTransferModel()
+    )
     _wire_simulator(
         eng, sched, cm, prefill_nodes, decode_nodes,
         logger_=logger, model_cfg=cfg.model, bandwidth_cfg=cfg.bandwidth,
+        transfer_model=transfer_model,
     )
     all_nodes = {n.node_id: n for n in [*prefill_nodes, *decode_nodes]}
     metrics.attach(eng, nodes=all_nodes)

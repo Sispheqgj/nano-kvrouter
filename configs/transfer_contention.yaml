@@ -1,0 +1,51 @@
+cluster:
+  prefill_nodes: 2
+  decode_nodes: 2
+
+node:
+  gpu_blocks: 800
+  cpu_blocks: 0
+  disk_blocks: 0
+  capacity: 8
+
+model:
+  block_size: 16
+  kv_bytes_per_token: 512
+  prefill_cost_per_token_ms: 0.1
+  decode_base_ms: 5.0
+  marginal_decode_ms: 1.0
+  prefill_chunk_size: 512
+
+bandwidth:
+  # Synthetic demo bandwidth (~5 MB/s, NOT hardware-representative).
+  # Default 30 GB/s makes service_time ≈ 0.017 ms — far below the
+  # effective transfer-producing cadence on this 2p/2d setup, so lane
+  # contention is invisible. 5 MB/s pushes service_time ≈ 105 ms,
+  # exceeding that cadence and exposing measurable contention.
+  gpu_to_gpu: 5000000.0
+  gpu_to_cpu: 32000000000.0
+  cpu_to_disk: 5000000000.0
+  contention_model: per_node_lane
+
+slo:
+  ttft_target_ms: 2000.0
+  tbt_target_ms: 100.0
+
+workload:
+  request_rate: 50.0
+  duration_s: 5.0
+  prefix_sharing_ratio: 0.5
+  avg_prompt_len: 1024
+  avg_output_len: 128
+
+generator:
+  num_buckets: 8
+  vocab_size: 32000
+  seed: 42
+
+scheduler:
+  name: conductor
+  params:
+    alpha: 1.0
+    beta: 1.0
+    gamma: 1.0

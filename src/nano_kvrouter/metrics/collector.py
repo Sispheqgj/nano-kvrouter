@@ -28,7 +28,9 @@ class MetricsCollector:
     M5a metrics
     -----------
     * ``kv_transfer_time_avg_ms``: mean of the ``cost_ms`` carried by every
-      ``KV_TRANSFER_COMPLETE`` event. Drives ``bandwidth.gpu_to_gpu`` /
+      ``KV_TRANSFER_COMPLETE`` event. Under per_node_lane contention model,
+      ``cost_ms`` == service_cost_ms + queued_cost_ms (includes queue wait);
+      under ``none``, equals pure transfer time. Drives ``bandwidth.gpu_to_gpu`` /
       ``model.kv_bytes_per_token`` sensitivity analysis.
     * ``dual_phase_tick_count``: number of ``DECODE_BATCH_STEP`` events
       that fired while at least one request anywhere in the cluster was in
@@ -43,8 +45,10 @@ class MetricsCollector:
         REQUEST_REJECTED:  {"request_id": str, "reason": str}
         PREFILL_START:     {"request_id": str, "n_chunks": int}
         PREFILL_COMPLETE:  {"request_id": str}
-        KV_TRANSFER_START: {"transfer_id": str, "cost_ms": float, ...}  # debug only
-        KV_TRANSFER_COMPLETE: {"transfer_id": str, "cost_ms": float, ...}
+        KV_TRANSFER_START: {"transfer_id": str, "service_cost_ms": float,
+                            "queued_cost_ms": float, "cost_ms": float, ...}  # debug only
+        KV_TRANSFER_COMPLETE: {"transfer_id": str, "service_cost_ms": float,
+                               "queued_cost_ms": float, "cost_ms": float, ...}
         TOKEN_GENERATED:   {"request_id": str, "step_index": int}
         DECODE_BATCH_STEP: {"node_id": str, "batch_size": int}
         DECODE_COMPLETE:   {"request_id": str}
@@ -64,8 +68,9 @@ class MetricsCollector:
       actually starts at KV_TRANSFER_COMPLETE but ``_active_decodes``
       joins only at first TOKEN_GENERATED — single-token decode requests
       with prefill overlap may undercount. Deferred to P3.
-    - ``kv_transfer_time_avg_ms``: Sample-mean of KV_TRANSFER costs from
-      payload ``cost_ms``. Stale (unknown ``transfer_id``) events are
+    - ``kv_transfer_time_avg_ms``: Sample-mean of ``cost_ms`` from
+      KV_TRANSFER_COMPLETE events (= service + queue wait under per_node_lane;
+      = service only under none). Stale (unknown ``transfer_id``) events are
       silently dropped via ``_seen_transfer_ids`` guard.
     """
 

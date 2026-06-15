@@ -236,3 +236,27 @@ def test_trace_config_rejects_max_requests_zero():
 def test_trace_config_rejects_max_requests_negative():
     with pytest.raises(ValidationError):
         TraceConfig(path="x.jsonl", max_requests=-1)
+
+
+# ---------------------------------------------------------------------------
+# BandwidthConfig.contention_model field tests (P4-A M1)
+# ---------------------------------------------------------------------------
+
+
+def test_contention_model_default_is_none():
+    cfg = NanoKVConfig()
+    assert cfg.bandwidth.contention_model == "none"
+
+
+def test_contention_model_per_node_lane_accepted():
+    cfg = NanoKVConfig.model_validate(
+        {"bandwidth": {"contention_model": "per_node_lane"}}
+    )
+    assert cfg.bandwidth.contention_model == "per_node_lane"
+
+
+def test_contention_model_invalid_value_rejected():
+    with pytest.raises(ValidationError):
+        NanoKVConfig.model_validate(
+            {"bandwidth": {"contention_model": "shared_bus"}}
+        )

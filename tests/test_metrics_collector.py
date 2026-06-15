@@ -606,16 +606,19 @@ def test_m3_metrics_independent_of_attach_order() -> None:
         sched = RoundRobinPolicy(model_config=mc, bandwidth_config=bw)
         coll = MetricsCollector()
 
+        from nano_kvrouter.simulator.transfer_model import NoopTransferModel
         if wire_first:
             _wire_simulator(eng, sched, cm, [node], [node],
                             logger_=logging.getLogger("test"),
-                            model_cfg=mc, bandwidth_cfg=bw)
+                            model_cfg=mc, bandwidth_cfg=bw,
+                            transfer_model=NoopTransferModel())
             coll.attach(eng, nodes={"n0": node})
         else:
             coll.attach(eng, nodes={"n0": node})
             _wire_simulator(eng, sched, cm, [node], [node],
                             logger_=logging.getLogger("test"),
-                            model_cfg=mc, bandwidth_cfg=bw)
+                            model_cfg=mc, bandwidth_cfg=bw,
+                            transfer_model=NoopTransferModel())
 
         # req_a: 0 uncached (cache pre-warmed) → enters decode immediately
         cm.admit([0] * 32, "n0")
