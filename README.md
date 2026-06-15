@@ -28,10 +28,11 @@ It also models the KV cache as a first-class cluster resource:
 ## Current status
 
 P2-Infra M1-M6 is implemented and verified. P3-C M1+M2 (real-world trace
-replay + synthetic prefix sharing on length-only traces) and P4-A
-(per-node KV transfer lane contention, opt-in) are also live.
+replay + synthetic prefix sharing on length-only traces), P4-A (per-node
+KV transfer lane contention, opt-in), and P4-B (schedulers see
+transfer-lane backlog + `kv_transfer_queued_avg_ms` metric) are also live.
 
-- `uv run pytest -q` -> `451 passed`
+- `uv run pytest -q` -> `460 passed`
 - `uv run python -m nano_kvrouter.cli sensitivity --config configs/sensitivity.yaml` -> `13/13 fields PASS`
 - `uv run python -m nano_kvrouter.cli sweep --config configs/trace_mooncake.yaml` -> 5 schedulers on Mooncake FAST'25 real trace, cache-aware ~2× cache_hit vs cache-blind
 - `uv run python -m nano_kvrouter.cli prefix-sensitivity --config configs/trace_burstgpt.yaml` -> 4-axis sweep over prefix-synthesis params on BurstGPT replay, with Mooncake real-trace `cache_hit` shown as informational anchor
@@ -188,11 +189,67 @@ transfers queue on shared lanes. `kv_transfer_time_avg_ms` becomes
 "end-to-end transfer time (service + queue wait)" under `per_node_lane` —
 this is the design intent, not a metric regression.
 
-P4-A v1 deliberately does NOT update scheduler `compute_est_ttft` to read
-lane backlog. The estimator keeps the constant `gpu_to_gpu` formula; the
-runtime cost may diverge from the estimate under contention. This is a
-documented v1 limitation (P4-B / backlog `kv_transfer_queued_avg_ms`
-metric + conductor backlog awareness).
+### Schedulers see transfer-lane backlog (P4-B, 2026-06-15)
+
+P4-A left a deliberate divergence: under `per_node_lane`, runtime KV
+transfer cost included queue wait, but `compute_est_ttft` returned only
+service time, so `MooncakeConductor`'s SLO gate and `E2Policy`'s
+`run_cost` were oblivious to lane queueing. P4-B closes the loop.
+
+A new narrow read-only Protocol `TransferBacklogView` exposes only
+`peek_backlog(node_id) -> {"egress", "ingress"}`. All five scheduler
+constructors now take a `backlog_view`; `compute_est_ttft` includes lane
+wait in its estimate:
+
+```
+service        = (kv_bytes / bandwidth.gpu_to_gpu) * 1000
+src_egress_w   = max(0, peek_backlog(prefill_node)["egress"] - now)
+dst_ingress_w  = max(0, peek_backlog(decode_node)["ingress"] - now)
+queue_wait     = max(src_egress_w, dst_ingress_w)
+kv_transfer    = service + queue_wait
+```
+
+`max` (not sum) mirrors the runtime model: a transfer occupies both
+lanes simultaneously, so its wait equals the LATER of the two
+availabilities. `max(0, ...)` clamps past-backlog to zero. The new
+narrow Protocol intentionally hides `request_transfer` from the
+estimator so an estimation path can never reserve a lane and corrupt
+the simulation (`rg "request_transfer\(" src/nano_kvrouter/scheduler/`
+→ 0 hits, enforced by hard guard).
+
+A new metric `kv_transfer_queued_avg_ms` exposes the queue wait
+component separately from `kv_transfer_time_avg_ms = service + queued`:
+
+| `contention_model` | `kv_transfer_queued_avg_ms` |
+|--------------------|----------------------------:|
+| `none` (default)   | `0.000` |
+| `per_node_lane`    | `> 0`, scheduler-dependent |
+
+Paired toggle on `configs/transfer_contention.yaml` (same yaml, only
+`contention_model` flipped; conductor scheduler):
+
+| metric | `none` | `per_node_lane` |
+|--------|------:|----------------:|
+| `kv_transfer_time_avg_ms`   | 104.86 | 1507.84 |
+| `kv_transfer_queued_avg_ms` |   0.00 | 1402.98 |
+| `rejection_rate`            |  0.751 |   0.809 |
+
+Decomposition invariant holds exactly for all 5 schedulers on this
+yaml: `lane.total - lane.queued = none.total = 104.86 ms` (service
+component is invariant because `avg_prompt_len` is fixed).
+
+Conductor's rejection rises under lane (the **intended primary
+effect**: SLO gate sees queue wait → admits less). The other four
+schedulers' rejection rates actually fall (about 0.62 → 0.45) — this
+is a **second-order side effect**, not scheduler intelligence: lane
+queueing delays `KV_TRANSFER_COMPLETE`, giving decode nodes more time
+to free slots before B1 (decode-capacity) rejection fires. Only
+Conductor's SLO gate actually consumes the new estimate. See DESIGN
+§12.5 for the full breakdown.
+
+Default `bandwidth.contention_model: "none"` still keeps every old
+config and regression number byte-identical — `NoopTransferModel.peek_backlog`
+returns zeros, `max(0, 0 - now) = 0`, and `kv_transfer` is unchanged.
 
 ## Quick start
 

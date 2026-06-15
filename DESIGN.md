@@ -499,22 +499,75 @@ trace_mooncake / trace_burstgpt`）零修改；6 sweep cache_hit、sensitivity
 未来 v2（backlog #39）会加 `kv_transfer_queued_avg_ms` 单独 metric 让两
 个语义可同时观测。
 
-### 12.5 Scheduler 故意不动（v1 已知 limitation）
+### 12.5 Scheduler 看 backlog（P4-B M1 已实现）
 
-5 个 scheduler 的 `compute_est_ttft` 继续用常量 `gpu_to_gpu` 估 TTFT。
-在 `per_node_lane` 下估算与运行时实际 cost 可能 diverge，导致 SLO gate
-（Conductor 早拒）以"乐观估计"决策。
+P4-A v1 故意没动 scheduler；P4-B（commit `244345d`）把估算闭环了。
+新增 narrow Protocol `TransferBacklogView`（仅暴露 `peek_backlog`）在
+`scheduler/base.py`，5 个 scheduler ctor 都吃 `backlog_view`，
+`compute_est_ttft` 加 required keyword-only `backlog_view` + `now`：
 
-这是 v1 故意 trade-off：
-- **不让 scheduler 看 backlog** = 估算/真值一致性保留 + scheduler 行为
-  不变 + SLO 决策路径不引入新误差源
-- **让 scheduler 看 backlog**（P4-B）= 估算更准但 SLO gate 可能因
-  backlog 抖动导致误拒/接受率漂移，需要单独 plan + sensitivity
+```
+service        = (kv_bytes / bandwidth.gpu_to_gpu) * 1000.0
+src_egress_w   = max(0, peek_backlog(prefill_node)["egress"] - now)
+dst_ingress_w  = max(0, peek_backlog(decode_node)["ingress"] - now)
+queue_wait     = max(src_egress_w, dst_ingress_w)
+kv_transfer    = service + queue_wait
+```
 
-P4-B 已在 backlog #39，会让 `MooncakeConductor.compute_est_ttft` 在
-`contention_model == "per_node_lane"` 时把 `peek_backlog(decode_node)
-["ingress"] - now` 加进 `kv_transfer` 项；同时新增
-`kv_transfer_queued_avg_ms` metric。
+`max` 不是 `sum`——一次 transfer 同时占用 src.egress + dst.ingress，
+wait 等于两者**较晚**那个，sum 会双计。`max(0, ...)` clamp 让历史 backlog
+不产生负贡献。
+
+**`TransferBacklogView` 故意窄**：仅 `peek_backlog`，不暴露
+`request_transfer`。估算阶段不可能误调写接口去 reserve lane 破坏仿真
+决定性。硬 grep guard `rg "request_transfer\(" src/nano_kvrouter/scheduler/`
+必须为 0（M1 验过）。
+
+新 metric `kv_transfer_queued_avg_ms`：采样 `payload["queued_cost_ms"]`
+**在 `_on_kv_transfer_complete` 现有 `transfer_id` stale guard 同一
+if-block 内**，与 `cost_ms` 采样路径对齐——stale 事件不污染。
+空样本 `summary()` 返回 `0.0`（不是 `None`），让 feature 在零 transfer
+场景也可见。
+
+#### 12.5.1 实际效果：5 scheduler 上 paired toggle 结果
+
+同一份 `configs/transfer_contention.yaml`，仅翻 `bandwidth.contention_model`
+字段：
+
+| scheduler | `none` reject | `per_node_lane` reject | 方向 |
+|-----------|-------------:|----------------------:|------|
+| `round_robin`   | 0.644 | 0.484 | **DOWN** |
+| `least_loaded`  | 0.627 | 0.458 | **DOWN** |
+| `prefix_greedy` | 0.596 | 0.293 | **DOWN** |
+| `e2_policy`     | 0.627 | 0.373 | **DOWN** |
+| `conductor`     | 0.751 | **0.809** | **UP** |
+
+Decomposition invariant 所有 5 个 scheduler 都 EXACT：
+`lane.kv_transfer_time_avg_ms - lane.kv_transfer_queued_avg_ms`
+= `none.kv_transfer_time_avg_ms` = **104.86 ms**（service 项不变，因为
+`transfer_contention.yaml` 用固定 `avg_prompt_len`）。
+
+#### 12.5.2 ⚠️ 关键解读：non-conductor rejection DOWN 是 B1 timing 副作用
+
+**不要把 non-conductor 4 个 scheduler 的 rejection 下降误读成 routing 改善。**
+
+- **Conductor reject UP**（0.751→0.809）是**设计意图**：SLO gate 看到
+  queue wait → `est_ttft > ttft_target_ms` 命中更多 → admit less
+- **其他 4 个 scheduler reject DOWN** 是**二阶 timing 副作用**：它们的
+  routing 决策不读 `peek_backlog`，rejection 唯一来源是 M5a B1（KV
+  transfer 完成时 decode_node 满 → 拒绝）。Lane queueing 把
+  `KV_TRANSFER_COMPLETE` 往后推，给 decode_node 更多时间释放 slot，
+  B1 拒绝次数自然减少
+
+换句话说：lane queue 在这 4 个 scheduler 上充当了**意外的 admission
+throttle**，不是 scheduler 变聪明。如果换种 workload（decode 节点不饱
+和、B1 几乎不触发），这个 DOWN 效应会消失。
+
+Codex review 强调要文档化此点防止 operator 误读；这一节就是答案。
+
+未来若让其他 scheduler 也吃 backlog（让它们在 `compute_est_ttft` 之外
+也参考 `peek_backlog` 做 routing 决策），需要单独 plan + sensitivity。
+不在 P4-B M1 scope。
 
 ### 12.6 Hard gate（单元测试隔离，不走 SimulationEngine）
 
@@ -532,13 +585,18 @@ assert 返回 `(0,C)/(C,2C)/(2C,3C)/(3C,4C)`。
 
 ## 13. 下一步路线
 
-- **P4-B**：让 `MooncakeConductor.compute_est_ttft` 看
-  `transfer_model.peek_backlog()`，新增 `kv_transfer_queued_avg_ms`
-  metric（backlog #39）。硬约束仍是 default yaml 行为零漂移
+- ✅ **P4-B**（done, commit `244345d`）：5 scheduler 的
+  `compute_est_ttft` 已通过 `TransferBacklogView` 看 lane backlog；新
+  metric `kv_transfer_queued_avg_ms` 已上。详见 §12.5。
 - P3-D：把 `PrefixSynthesisModel` 提取给 Poisson `RequestGenerator` 也用
   （硬约束：default yaml 行为零漂移，opt-in only）
 - P5 候选：
   - **PagedAttention Tier 2**：让 CPU/Disk 块真正动起来（demote/promote
     路径、HiCache 命中链、prefill cache_miss 不再只看 GPU 命中）
+  - **让 non-Conductor scheduler 主动用 backlog 做 routing**：当前 4 个
+    scheduler 仅"被动接收" backlog（compute_est_ttft 估算更准），但 routing
+    决策本身不参考 `peek_backlog`。是否值得让 prefix_greedy / e2_policy
+    在评分中加入 backlog 项，需要单独 plan + sensitivity（避免 §12.5.2
+    描述的副作用变成主效应）
   - Llumnix-style migration / rebalance executor
   - Speculative decoding（必须用 Leviathan 等式，不能线性近似）
