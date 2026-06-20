@@ -241,11 +241,22 @@ component is invariant because `avg_prompt_len` is fixed).
 Conductor's rejection rises under lane (the **intended primary
 effect**: SLO gate sees queue wait → admits less). The other four
 schedulers' rejection rates actually fall (about 0.62 → 0.45) — this
-is a **second-order side effect**, not scheduler intelligence: lane
-queueing delays `KV_TRANSFER_COMPLETE`, giving decode nodes more time
-to free slots before B1 (decode-capacity) rejection fires. Only
-Conductor's SLO gate actually consumes the new estimate. See DESIGN
-§12.5 for the full breakdown.
+is mostly a **second-order side effect**, not scheduler intelligence:
+lane queueing delays `KV_TRANSFER_COMPLETE`, giving decode nodes more
+time to free slots before B1 (decode-capacity) rejection fires.
+
+How much of `compute_est_ttft` each scheduler actually consumes:
+
+- `conductor`: uses it for both 3-objective scoring AND SLO admission
+  gate — full backlog awareness.
+- `e2_policy`: uses it as the `run_cost` term in its 3-objective
+  score (`w_h*hist + w_e*evict + w_r*run`), so its routing decisions
+  ARE shifted by backlog (small but real). No SLO gate.
+- `round_robin` / `least_loaded` / `prefix_greedy`: compute the
+  estimate and embed it in `SchedulingDecision.estimated_ttft_ms`,
+  but routing logic does not branch on it. Informational only.
+
+See DESIGN §12.5 for the full breakdown.
 
 Default `bandwidth.contention_model: "none"` still keeps every old
 config and regression number byte-identical — `NoopTransferModel.peek_backlog`

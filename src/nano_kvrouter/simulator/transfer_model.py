@@ -50,8 +50,14 @@ class TransferModel(Protocol):
 
         MUST be side-effect-free: repeated calls before any
         request_transfer between them return identical results.
-        Used by future schedulers (out of M1 scope) to factor backlog
-        into compute_est_ttft.
+
+        Consumed by ``scheduler.base.compute_est_ttft`` (called by all
+        5 schedulers since P4-B M1) to include current lane queue wait
+        in the KV-transfer cost estimate. Conductor uses the estimate
+        for its SLO gate; E2 uses it as its ``run_cost`` term in the
+        3-objective score; the other three schedulers embed it in
+        ``SchedulingDecision.estimated_ttft_ms`` but do not gate
+        routing on it.
         """
 
 

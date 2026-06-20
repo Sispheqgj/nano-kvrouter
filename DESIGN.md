@@ -547,26 +547,44 @@ Decomposition invariant 所有 5 个 scheduler 都 EXACT：
 = `none.kv_transfer_time_avg_ms` = **104.86 ms**（service 项不变，因为
 `transfer_contention.yaml` 用固定 `avg_prompt_len`）。
 
-#### 12.5.2 ⚠️ 关键解读：non-conductor rejection DOWN 是 B1 timing 副作用
+#### 12.5.2 ⚠️ 关键解读：non-conductor rejection DOWN 主要是 B1 timing 副作用
 
-**不要把 non-conductor 4 个 scheduler 的 rejection 下降误读成 routing 改善。**
+**不要把 non-conductor 4 个 scheduler 的 rejection 下降全部误读成 routing 改善。**
 
-- **Conductor reject UP**（0.751→0.809）是**设计意图**：SLO gate 看到
-  queue wait → `est_ttft > ttft_target_ms` 命中更多 → admit less
-- **其他 4 个 scheduler reject DOWN** 是**二阶 timing 副作用**：它们的
-  routing 决策不读 `peek_backlog`，rejection 唯一来源是 M5a B1（KV
-  transfer 完成时 decode_node 满 → 拒绝）。Lane queueing 把
-  `KV_TRANSFER_COMPLETE` 往后推，给 decode_node 更多时间释放 slot，
-  B1 拒绝次数自然减少
+`compute_est_ttft` 5 个 scheduler 都调用，但**返回值在 routing 决策
+中的角色不同**：
 
-换句话说：lane queue 在这 4 个 scheduler 上充当了**意外的 admission
-throttle**，不是 scheduler 变聪明。如果换种 workload（decode 节点不饱
-和、B1 几乎不触发），这个 DOWN 效应会消失。
+| scheduler | 是否进 routing 决策 | 是否进 SLO gate |
+|-----------|------------------|----------------|
+| `conductor` | ✅ 3-objective scoring 一项 | ✅ `est_ttft > ttft_target_ms` → reject |
+| `e2_policy` | ✅ `run_cost` 是 3-objective 一项 | ❌（E2 无 SLO gate） |
+| `prefix_greedy` | ❌（只填 SchedulingDecision） | ❌ |
+| `least_loaded` | ❌（只填 SchedulingDecision） | ❌ |
+| `round_robin` | ❌（只填 SchedulingDecision） | ❌ |
+
+实际 rejection 方向分析：
+
+- **Conductor reject UP**（0.751→0.809）：**设计意图**。SLO gate 看到
+  queue wait → `est_ttft > ttft_target_ms` 命中更多 → admit less。
+- **E2 reject DOWN**：**两个效应叠加**——(a) `run_cost` 里看到 backlog
+  让 E2 微调 routing 倾向少 backlog 节点（一阶 routing 改善，幅度小）；
+  (b) 主导效应仍是下面那条 B1 timing 副作用。
+- **prefix_greedy / least_loaded / round_robin reject DOWN**：**纯
+  二阶 timing 副作用**。它们的 routing 不读 backlog；rejection 唯一来
+  源是 M5a B1（KV transfer 完成时 decode_node 满 → 拒绝）。Lane queueing
+  把 `KV_TRANSFER_COMPLETE` 往后推，给 decode_node 更多时间释放 slot，
+  B1 拒绝次数自然减少。
+
+换句话说：lane queue 在 3 个 cache-blind/cache-greedy scheduler 上充当
+了**意外的 admission throttle**，不是 scheduler 变聪明。如果换种 workload
+（decode 节点不饱和、B1 几乎不触发），这个 DOWN 效应会消失。E2 上则会
+留下小但真实的 routing-shift 贡献。
 
 Codex review 强调要文档化此点防止 operator 误读；这一节就是答案。
 
-未来若让其他 scheduler 也吃 backlog（让它们在 `compute_est_ttft` 之外
-也参考 `peek_backlog` 做 routing 决策），需要单独 plan + sensitivity。
+未来若想强化非 conductor scheduler 的 backlog 利用（比如让 prefix_greedy
+显式偏向少 backlog 节点 / 让 E2 加 backlog 显式项 / 给 round_robin /
+least_loaded 也吃 backlog 做 routing 决策），需要单独 plan + sensitivity。
 不在 P4-B M1 scope。
 
 ### 12.6 Hard gate（单元测试隔离，不走 SimulationEngine）
