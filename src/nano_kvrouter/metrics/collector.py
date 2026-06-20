@@ -55,6 +55,11 @@ class MetricsCollector:
         TOKEN_GENERATED:   {"request_id": str, "step_index": int}
         DECODE_BATCH_STEP: {"node_id": str, "batch_size": int}
         DECODE_COMPLETE:   {"request_id": str}
+        KV_LOAD_START:     {"request_id": str, "decode_node_id": str,
+                            "disk_blocks": int, "load_service_ms": float,
+                            "preparing_wait_ms": float}
+        KV_LOAD_COMPLETE:  {"request_id": str, "decode_node_id": str,
+                            "promoted_count": int, "skipped_count": int}
 
     Metric semantics
     ----------------
@@ -118,6 +123,14 @@ class MetricsCollector:
         self._active_decodes: set[str] = set()
         self._dual_phase_tick_count: int = 0
 
+        # P5-Bidaw M1 metrics (all default to empty/0 so non-Bidaw runs
+        # see zeroed fields rather than None in summary()).
+        self._bidaw_preparing_wait_samples: list[float] = []
+        self._bidaw_load_service_samples: list[float] = []
+        self._bidaw_promotions_count: int = 0
+        # Stale-guard: mirrors _seen_transfer_ids for KV_LOAD events.
+        self._seen_load_req_ids: set[str] = set()
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -147,6 +160,8 @@ class MetricsCollector:
         engine.on(EventType.TOKEN_GENERATED, self._on_decode_step)
         engine.on(EventType.DECODE_BATCH_STEP, self._on_decode_batch_step)
         engine.on(EventType.DECODE_COMPLETE, self._on_decode_complete)
+        engine.on(EventType.KV_LOAD_START, self._on_kv_load_start)
+        engine.on(EventType.KV_LOAD_COMPLETE, self._on_kv_load_complete)
 
     def summary(self) -> dict:
         """Return aggregated metrics dict.  Safe to call at any point."""
@@ -188,6 +203,20 @@ class MetricsCollector:
             # M6 tier-hit metrics
             "cache_hit_by_tier_blocks": dict(self._cache_hit_by_tier),
             "cache_hit_by_tier_ratio": self._cache_hit_by_tier_ratio(),
+            # P5-Bidaw M1 metrics (0.0 / 0 on non-Bidaw runs, never None)
+            "bidaw_preparing_wait_avg_ms": (
+                statistics.mean(self._bidaw_preparing_wait_samples)
+                if self._bidaw_preparing_wait_samples else 0.0
+            ),
+            "bidaw_preparing_wait_p99_ms": (
+                (self._p99(self._bidaw_preparing_wait_samples) or 0.0)
+                if self._bidaw_preparing_wait_samples else 0.0
+            ),
+            "bidaw_disk_load_service_avg_ms": (
+                statistics.mean(self._bidaw_load_service_samples)
+                if self._bidaw_load_service_samples else 0.0
+            ),
+            "bidaw_preparing_promotions": self._bidaw_promotions_count,
         }
 
     # ------------------------------------------------------------------
@@ -359,6 +388,33 @@ class MetricsCollector:
 
         if self._active_prefills and self._active_decodes:
             self._dual_phase_tick_count += 1
+
+    def _on_kv_load_start(self, event: Event, engine: SimulationEngine) -> None:
+        """Sample preparing_wait_ms and load_service_ms; register stale guard."""
+        req_id = event.payload.get("request_id")
+        if req_id is not None:
+            self._seen_load_req_ids.add(req_id)
+        wait_ms = event.payload.get("preparing_wait_ms")
+        if wait_ms is not None:
+            self._bidaw_preparing_wait_samples.append(float(wait_ms))
+        service_ms = event.payload.get("load_service_ms")
+        if service_ms is not None:
+            self._bidaw_load_service_samples.append(float(service_ms))
+        logger.debug(
+            "KV_LOAD_START request_id=%s disk_blocks=%d service_ms=%.3f wait_ms=%.3f",
+            req_id,
+            event.payload.get("disk_blocks", 0),
+            service_ms or 0.0,
+            wait_ms or 0.0,
+        )
+
+    def _on_kv_load_complete(self, event: Event, engine: SimulationEngine) -> None:
+        """Count promotions; stale guard mirrors KV_TRANSFER_COMPLETE pattern."""
+        req_id = event.payload.get("request_id")
+        if req_id is None or req_id not in self._seen_load_req_ids:
+            return  # stale / unknown — silently drop
+        self._seen_load_req_ids.discard(req_id)
+        self._bidaw_promotions_count += 1
 
     def _on_decode_complete(self, event: Event, engine: SimulationEngine) -> None:
         request_id = event.payload.get("request_id")

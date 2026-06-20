@@ -263,6 +263,8 @@ def test_attach_registers_all_handlers(engine, collector):
         EventType.TOKEN_GENERATED,
         EventType.DECODE_BATCH_STEP,
         EventType.DECODE_COMPLETE,
+        EventType.KV_LOAD_START,
+        EventType.KV_LOAD_COMPLETE,
     }
     assert set(engine._handlers.keys()) == expected
     for et in expected:

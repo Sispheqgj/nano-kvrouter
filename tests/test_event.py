@@ -14,7 +14,7 @@ from nano_kvrouter.simulator.event import Event, EventType
 
 
 def test_event_type_has_m5a_set() -> None:
-    """M5a event set: 10 types — adds KV_TRANSFER_START/COMPLETE for split P/D."""
+    """P5-Bidaw M1 event set: 12 types — adds KV_LOAD_START/COMPLETE for Bidaw disk gating."""
     assert {e.name for e in EventType} == {
         "REQUEST_ARRIVE",
         "SCHEDULED",
@@ -26,6 +26,8 @@ def test_event_type_has_m5a_set() -> None:
         "DECODE_BATCH_STEP",
         "DECODE_COMPLETE",
         "REQUEST_REJECTED",
+        "KV_LOAD_START",
+        "KV_LOAD_COMPLETE",
     }
 
 

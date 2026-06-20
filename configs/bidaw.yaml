@@ -1,0 +1,56 @@
+# nano-kvrouter — Bidaw I/O-aware scheduling demo (P5-Bidaw M1)
+#
+# Candidate J (M0 §3): cpu_blocks=0 makes disk hits visible without
+# physical disk->cpu promotion (M1.5 only). gpu_blocks=80 keeps a mix of
+# GPU and disk hits. prefix_sharing_ratio=0.88 + num_buckets=4 provide
+# enough prefix reuse to exercise both cache-aware and cache-blind policies.
+#
+# scheduler.name is conductor (default sweep). Use --scheduler bidaw to
+# exercise Bidaw's dual-queue path.
+
+cluster:
+  prefill_nodes: 2
+  decode_nodes: 4
+
+node:
+  capacity: 16
+  gpu_blocks: 80
+  cpu_blocks: 0
+  disk_blocks: 4000
+
+model:
+  block_size: 16
+  kv_bytes_per_token: 4096
+  prefill_cost_per_token_ms: 0.04
+  decode_base_ms: 5.0
+  marginal_decode_ms: 0.5
+  prefill_chunk_size: 512
+
+bandwidth:
+  gpu_to_gpu: 3.0e11
+  gpu_to_cpu: 3.2e10
+  cpu_to_disk: 5.0e9
+  contention_model: none
+
+slo:
+  ttft_target_ms: 600.0
+  tbt_target_ms: 50.0
+
+workload:
+  request_rate: 15.0
+  duration_s: 20.0
+  prefix_sharing_ratio: 0.88
+  avg_prompt_len: 512
+  avg_output_len: 64
+
+generator:
+  num_buckets: 4
+  vocab_size: 32000
+  seed: 42
+
+scheduler:
+  name: conductor
+  params:
+    alpha: 1.0
+    beta: 1.0
+    gamma: 1.0

@@ -13,10 +13,11 @@ nodes, and metrics collectors at startup.
 
 Design notes
 ------------
-* **Event set (10 types, M5a).** P/D split adds two new types —
+* **Event set (12 types, P5-Bidaw M1).** P/D split adds two new types —
   ``KV_TRANSFER_START`` and ``KV_TRANSFER_COMPLETE`` — that bracket the
   Mooncake-style KV transfer from prefill_node to decode_node after prefill
-  finishes. Cross-tier transfers and rebalance ticks remain future work.
+  finishes. Bidaw M1 adds ``KV_LOAD_START`` / ``KV_LOAD_COMPLETE`` for
+  disk-tier request gating. Cross-tier rebalance ticks remain future work.
 * **dict payload, not per-event dataclasses.** Handlers reach into
   ``ev.payload["request_id"]`` etc. We trade type-safety for the
   ability to evolve a payload shape without breaking the Event class.
@@ -64,6 +65,19 @@ class EventType(Enum):
     ``KV_TRANSFER_COMPLETE`` if the decode_node has no capacity at admit
     time (M5a decode-side back-pressure) — decode-full rejection happens
     BEFORE cm.admit so no release is needed; ``REQUEST_REJECTED`` fires.
+
+    Bidaw branch (P5-Bidaw M1, scheduler="bidaw" only):
+
+    Requests with ≥ 1 matched disk-tier block enter the preparing queue
+    instead of going straight to ``PREFILL_START``:
+
+    ``REQUEST_ARRIVE`` → ``SCHEDULED`` → [preparing queue] →
+    ``KV_LOAD_START`` (disk load begins; single slot per decode node) →
+    ``KV_LOAD_COMPLETE`` (request promoted to ready) →
+    ``PREFILL_START`` → … (normal path resumes)
+
+    Requests with 0 disk-tier blocks skip the Bidaw preparing queue and
+    follow the normal path immediately (ready path).
     """
 
     REQUEST_ARRIVE = "request_arrive"
@@ -76,6 +90,9 @@ class EventType(Enum):
     DECODE_BATCH_STEP = "decode_batch_step"
     DECODE_COMPLETE = "decode_complete"
     REQUEST_REJECTED = "request_rejected"
+    # P5-Bidaw M1: disk-tier request gating (scheduler="bidaw" only).
+    KV_LOAD_START = "kv_load_start"
+    KV_LOAD_COMPLETE = "kv_load_complete"
 
 
 @dataclass(slots=True, order=True)

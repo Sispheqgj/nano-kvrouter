@@ -37,11 +37,13 @@ from nano_kvrouter.engine.mock_node import MockEngineNode
 from nano_kvrouter.kv_cache.cache_manager import CacheManager
 from nano_kvrouter.metrics.collector import MetricsCollector
 from nano_kvrouter.scheduler.base import SchedulingPolicy, TransferBacklogView
+from nano_kvrouter.scheduler.bidaw import BidawPolicy
 from nano_kvrouter.scheduler.conductor import MooncakeConductor
 from nano_kvrouter.scheduler.e2_policy import E2Policy
 from nano_kvrouter.scheduler.least_loaded import LeastLoadedPolicy
 from nano_kvrouter.scheduler.prefix_greedy import PrefixGreedyPolicy
 from nano_kvrouter.scheduler.round_robin import RoundRobinPolicy
+from nano_kvrouter.simulator.bidaw_controller import BidawAdmissionController
 from nano_kvrouter.simulator.engine import SimulationEngine
 from nano_kvrouter.simulator.transfer_model import (
     NoopTransferModel,
@@ -57,7 +59,7 @@ from nano_kvrouter.simulator.trace_generator import TraceGenerator
 logger = logging.getLogger(__name__)
 console = Console()
 
-SCHEDULER_NAMES = ["round_robin", "least_loaded", "prefix_greedy", "e2_policy", "conductor"]
+SCHEDULER_NAMES = ["round_robin", "least_loaded", "prefix_greedy", "e2_policy", "conductor", "bidaw"]
 
 
 # ----------------- scheduler factory -----------------
@@ -119,6 +121,8 @@ def _build_scheduler(
             bandwidth_config=bw,
             backlog_view=backlog_view,
         )
+    if name == "bidaw":
+        return BidawPolicy(model_config=model_cfg, bandwidth_config=bw, backlog_view=backlog_view)
     raise ValueError(f"Unknown scheduler {name!r}; valid: {SCHEDULER_NAMES}")
 
 
@@ -135,6 +139,7 @@ def _wire_simulator(
     model_cfg: ModelConfig,
     bandwidth_cfg: BandwidthConfig,
     transfer_model: TransferModel,
+    bidaw_mode: bool = False,
 ) -> None:
     """Register simulation event handlers on *eng* (M5a split P/D).
 
@@ -528,13 +533,222 @@ def _wire_simulator(
 
         _wake_batch_step(node, node_id, engine)
 
-    eng.on(EventType.REQUEST_ARRIVE, on_arrive)
+    if bidaw_mode:
+        _wire_bidaw_branch(
+            eng, sched, cm, prefill_nodes_by_id, decode_nodes_by_id,
+            _decisions, _requests, _compute_n_chunks, _wake_batch_step,
+            controller=BidawAdmissionController([n.node_id for n in decode_nodes]),
+            logger_=logger_,
+            model_cfg=model_cfg,
+            bandwidth_cfg=bandwidth_cfg,
+        )
+    else:
+        eng.on(EventType.REQUEST_ARRIVE, on_arrive)
+
     eng.on(EventType.PREFILL_START, on_prefill_start)
     eng.on(EventType.PREFILL_COMPLETE, on_prefill_complete)
     eng.on(EventType.KV_TRANSFER_START, on_kv_transfer_start)
     eng.on(EventType.KV_TRANSFER_COMPLETE, on_kv_transfer_complete)
     eng.on(EventType.DECODE_BATCH_STEP, on_decode_batch_step)
     eng.on(EventType.DECODE_COMPLETE, on_decode_complete)
+
+
+# ----------------- Bidaw wiring branch -----------------
+
+def _wire_bidaw_branch(
+    eng: SimulationEngine,
+    sched: SchedulingPolicy,
+    cm: CacheManager,
+    prefill_nodes_by_id: dict[str, MockEngineNode],
+    decode_nodes_by_id: dict[str, MockEngineNode],
+    _decisions: dict[str, Any],
+    _requests: dict[str, Any],
+    _compute_n_chunks: Any,
+    _wake_batch_step: Any,
+    *,
+    controller: BidawAdmissionController,
+    logger_: logging.Logger,
+    model_cfg: ModelConfig,
+    bandwidth_cfg: BandwidthConfig,
+) -> None:
+    """Register Bidaw-specific event handlers on *eng*.
+
+    Called from _wire_simulator when bidaw_mode=True. Replaces the normal
+    on_arrive handler with a Bidaw-aware one that classifies requests into
+    ready vs preparing queues. Adds on_kv_load_start / on_kv_load_complete
+    handlers that drive the single-load-slot state machine.
+
+    The 5 existing scheduler handlers (on_prefill_start, on_prefill_complete,
+    etc.) are registered by _wire_simulator regardless of bidaw_mode —
+    they are not duplicated here.
+    """
+    prefill_nodes = list(prefill_nodes_by_id.values())
+
+    def _try_schedule_kv_load(decode_node_id: str, engine: SimulationEngine) -> None:
+        """Pick next HRRN candidate from preparing queue and schedule KV_LOAD events."""
+        req = controller.pick_next_to_load(decode_node_id, engine.now())
+        if req is None:
+            return
+        decision = _decisions.get(req.request_id)
+        if decision is None:
+            return
+        try:
+            decode_lookup = cm.lookup(req, decode_node_id)
+        except KeyError:
+            return
+        disk_blocks = decode_lookup.matched_blocks_by_tier.get("disk", 0)
+        block_bytes = model_cfg.block_size * model_cfg.kv_bytes_per_token
+        load_service_ms = disk_blocks * block_bytes / bandwidth_cfg.cpu_to_disk * 1000.0
+        preparing_wait_ms = controller.get_waiting_ms(req.request_id, engine.now())
+
+        # Claim the slot before scheduling events to prevent double-scheduling.
+        controller.mark_load_started(decode_node_id, req.request_id, engine.now())
+
+        now = engine.now()
+        engine.schedule(Event(
+            time=now,
+            type=EventType.KV_LOAD_START,
+            payload={
+                "request_id": req.request_id,
+                "decode_node_id": decode_node_id,
+                "disk_blocks": disk_blocks,
+                "load_service_ms": load_service_ms,
+                "preparing_wait_ms": preparing_wait_ms,
+            },
+        ))
+        engine.schedule(Event(
+            time=now + load_service_ms,
+            type=EventType.KV_LOAD_COMPLETE,
+            payload={
+                "request_id": req.request_id,
+                "decode_node_id": decode_node_id,
+                "promoted_count": 0,   # M1 is logical gating only
+                "skipped_count": 0,
+            },
+        ))
+
+    def on_arrive_bidaw(event: Event, engine: SimulationEngine) -> None:
+        req = event.payload["request"]
+        decision = sched.schedule(req, prefill_nodes, list(decode_nodes_by_id.values()), cm, now=engine.now())
+        if decision.is_rejected:
+            engine.schedule(Event(
+                time=engine.now(),
+                type=EventType.REQUEST_REJECTED,
+                payload={"request_id": req.request_id, "reason": decision.reject_reason},
+            ))
+            return
+
+        decode_lookup = cm.lookup(req, decision.decode_node)
+        engine.schedule(Event(
+            time=engine.now(),
+            type=EventType.SCHEDULED,
+            payload={
+                "request_id": req.request_id,
+                "decision": decision,
+                "matched_tokens": decode_lookup.matched_tokens,
+                "matched_blocks_by_tier": decode_lookup.matched_blocks_by_tier,
+            },
+        ))
+
+        _decisions[req.request_id] = decision
+        _requests[req.request_id] = req
+
+        disk_blocks = decode_lookup.matched_blocks_by_tier.get("disk", 0)
+        verdict = controller.on_arrive(req, decision.decode_node, disk_blocks, engine.now())
+
+        if verdict == "ready":
+            # Same admission flow as the normal on_arrive path.
+            prefill_node = prefill_nodes_by_id[decision.prefill_node]
+            uncached = max(0, len(req.token_ids) - decode_lookup.matched_tokens)
+            is_running = prefill_node.admit(
+                req.request_id,
+                expected_output_len=req.expected_output_len,
+                prompt_len=len(req.token_ids),
+                uncached_tokens=uncached,
+            )
+            if is_running:
+                chunk_size = prefill_node.model_config.prefill_chunk_size
+                engine.schedule(Event(
+                    time=engine.now(),
+                    type=EventType.PREFILL_START,
+                    payload={
+                        "request_id": req.request_id,
+                        "node_id": decision.prefill_node,
+                        "request": req,
+                        "n_chunks": _compute_n_chunks(req, decision.decode_node, chunk_size),
+                    },
+                ))
+        else:
+            # "preparing": disk hit — defer prefill until KV_LOAD_COMPLETE.
+            # Try to kick off a disk load if the node's slot is idle.
+            _try_schedule_kv_load(decision.decode_node, engine)
+
+    def on_kv_load_start(event: Event, engine: SimulationEngine) -> None:
+        """Metrics hook only — controller state already updated by _try_schedule_kv_load."""
+        logger_.debug(
+            "KV_LOAD_START: request_id=%s decode_node=%s disk_blocks=%d service_ms=%.3f",
+            event.payload.get("request_id"),
+            event.payload.get("decode_node_id"),
+            event.payload.get("disk_blocks", 0),
+            event.payload.get("load_service_ms", 0.0),
+        )
+
+    def on_kv_load_complete(event: Event, engine: SimulationEngine) -> None:
+        req_id = event.payload.get("request_id")
+        decode_node_id = event.payload.get("decode_node_id")
+        if req_id is None or decode_node_id is None:
+            return
+
+        try:
+            req, _preparing_wait_ms = controller.mark_load_completed(
+                decode_node_id, req_id, engine.now()
+            )
+        except StopIteration:
+            logger_.warning(
+                "on_kv_load_complete: no preparing entry for %s on %s", req_id, decode_node_id
+            )
+            _try_schedule_kv_load(decode_node_id, engine)
+            return
+
+        decision = _decisions.get(req_id)
+        if decision is None:
+            logger_.warning("on_kv_load_complete: no decision for %s", req_id)
+            _try_schedule_kv_load(decode_node_id, engine)
+            return
+
+        # Admit request to prefill now that its disk load is done.
+        prefill_node = prefill_nodes_by_id[decision.prefill_node]
+        try:
+            decode_lookup = cm.lookup(req, decode_node_id)
+            matched = decode_lookup.matched_tokens
+        except KeyError:
+            matched = 0
+        uncached = max(0, len(req.token_ids) - matched)
+        is_running = prefill_node.admit(
+            req.request_id,
+            expected_output_len=req.expected_output_len,
+            prompt_len=len(req.token_ids),
+            uncached_tokens=uncached,
+        )
+        if is_running:
+            chunk_size = prefill_node.model_config.prefill_chunk_size
+            engine.schedule(Event(
+                time=engine.now(),
+                type=EventType.PREFILL_START,
+                payload={
+                    "request_id": req.request_id,
+                    "node_id": decision.prefill_node,
+                    "request": req,
+                    "n_chunks": _compute_n_chunks(req, decode_node_id, chunk_size),
+                },
+            ))
+
+        # Free slot done; pick next preparing request on this node.
+        _try_schedule_kv_load(decode_node_id, engine)
+
+    eng.on(EventType.REQUEST_ARRIVE, on_arrive_bidaw)
+    eng.on(EventType.KV_LOAD_START, on_kv_load_start)
+    eng.on(EventType.KV_LOAD_COMPLETE, on_kv_load_complete)
 
 
 # ----------------- run one simulation -----------------
@@ -599,6 +813,7 @@ def _run_one(cfg: NanoKVConfig, scheduler_name: str) -> dict:
         eng, sched, cm, prefill_nodes, decode_nodes,
         logger_=logger, model_cfg=cfg.model, bandwidth_cfg=cfg.bandwidth,
         transfer_model=transfer_model,
+        bidaw_mode=(scheduler_name == "bidaw"),
     )
     all_nodes = {n.node_id: n for n in [*prefill_nodes, *decode_nodes]}
     metrics.attach(eng, nodes=all_nodes)
@@ -632,6 +847,10 @@ _TABLE_KEYS = [
     "avg_chunked_prefill_steps_per_request",
     "dual_phase_tick_count",
     "kv_transfer_time_avg_ms",
+    "bidaw_preparing_wait_avg_ms",
+    "bidaw_preparing_wait_p99_ms",
+    "bidaw_disk_load_service_avg_ms",
+    "bidaw_preparing_promotions",
 ]
 
 _SWEEP_KEYS = [
@@ -868,7 +1087,7 @@ def _print_single_table(summary: dict, scheduler_name: str) -> None:
 
 
 def _print_comparison_table(results: dict[str, dict]) -> None:
-    table = Table(title="nano-kvrouter — 5-scheduler comparison")
+    table = Table(title=f"nano-kvrouter — {len(SCHEDULER_NAMES)}-scheduler comparison")
     table.add_column("Scheduler", style="cyan")
     for k in _SWEEP_KEYS:
         table.add_column(k.replace("_", " "), justify="right")
@@ -1016,7 +1235,7 @@ def cmd_run(args: argparse.Namespace) -> None:
 
 
 def cmd_sweep(args: argparse.Namespace) -> None:
-    """Run all 5 schedulers sequentially and print a comparison table."""
+    """Run all schedulers sequentially and print a comparison table."""
     cfg = load_config(args.config)
     if cfg.trace is not None:
         abs_path = _resolve_related_config_path(args.config, cfg.trace.path)
@@ -1251,7 +1470,7 @@ def main() -> None:
     )
     p_run.set_defaults(func=cmd_run)
 
-    p_sweep = sub.add_parser("sweep", help="Run all 5 schedulers and compare")
+    p_sweep = sub.add_parser("sweep", help="Run all schedulers and compare")
     p_sweep.add_argument("--config", required=True, help="path to YAML config file")
     p_sweep.add_argument(
         "--output",
