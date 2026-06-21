@@ -29,20 +29,23 @@ It also models the KV cache as a first-class cluster resource:
 
 P2-Infra M1-M6 is implemented and verified. P3-C M1+M2 (real-world trace
 replay + synthetic prefix sharing on length-only traces), P4-A (per-node
-KV transfer lane contention, opt-in), and P4-B (schedulers see
-transfer-lane backlog + `kv_transfer_queued_avg_ms` metric) are also live.
+KV transfer lane contention, opt-in), P4-B (schedulers see transfer-lane
+backlog + `kv_transfer_queued_avg_ms` metric), and P5-Bidaw M1 (FAST'26
+I/O-aware dual-queue scheduling, `bidaw` as the 6th scheduler) are all
+live.
 
-- `uv run pytest -q` -> `460 passed`
+- `uv run pytest -q` -> `488 passed`
 - `uv run python -m nano_kvrouter.cli sensitivity --config configs/sensitivity.yaml` -> `13/13 fields PASS`
-- `uv run python -m nano_kvrouter.cli sweep --config configs/trace_mooncake.yaml` -> 5 schedulers on Mooncake FAST'25 real trace, cache-aware ~2× cache_hit vs cache-blind
+- `uv run python -m nano_kvrouter.cli sweep --config configs/trace_mooncake.yaml` -> 6 schedulers on Mooncake FAST'25 real trace, cache-aware ~2× cache_hit vs cache-blind
 - `uv run python -m nano_kvrouter.cli prefix-sensitivity --config configs/trace_burstgpt.yaml` -> 4-axis sweep over prefix-synthesis params on BurstGPT replay, with Mooncake real-trace `cache_hit` shown as informational anchor
 - `uv run python -m nano_kvrouter.cli sweep --config configs/transfer_contention.yaml` -> per-node KV transfer lane queueing exposes ~30× `kv_transfer_time_avg_ms` inflation vs constant-cost baseline on the same 2p/2d cluster
+- `uv run python -m nano_kvrouter.cli sweep --config configs/bidaw.yaml` -> 6-row table with Bidaw `KV_LOAD_*` event path on disk-hit requests; `bidaw_preparing_promotions ≈ disk-hit request count`
 - repo-outside absolute `--config` sensitivity execution is supported
 
 The repository currently exposes four public CLI workflows:
 
 - `run`: run one scheduler on one config
-- `sweep`: run all five schedulers and print a comparison table
+- `sweep`: run all six schedulers and print a comparison table
 - `sensitivity`: run config-driven LIVE field experiments and emit a field-level PASS/FAIL punch list
 - `prefix-sensitivity`: scan prefix-synthesis params on a trace and report cache_hit sensitivity (Mooncake real-trace `cache_hit` shown as informational reference, **NOT** a fitting target)
 
@@ -262,6 +265,76 @@ Default `bandwidth.contention_model: "none"` still keeps every old
 config and regression number byte-identical — `NoopTransferModel.peek_backlog`
 returns zeros, `max(0, 0 - now) = 0`, and `kv_transfer` is unchanged.
 
+### Bidaw I/O-aware dual-queue scheduling (P5-Bidaw M1, 2026-06-21)
+
+P5 adds a sixth scheduler `bidaw` that simulates the **I/O-aware
+request scheduling layer** of Bidaw (FAST'26). Until P5, requests
+whose matched prefix lived on the disk tier got "magic"
+zero-latency disk hits — `cache_manager.lookup()` reported the disk
+hit and `compute_est_ttft` charged a `transfer_cost_ms` estimate,
+but `PREFILL_START` did not actually wait for any disk-to-GPU
+load. Bidaw treats those disk loads as **real events on the
+critical path**:
+
+| state | when | next event |
+|-------|------|------------|
+| `ready` | matched prefix has 0 disk blocks | `PREFILL_START` immediately |
+| `preparing` | matched prefix has ≥ 1 disk block | enqueue + wait for the node's load slot |
+
+Inside each decode node's preparing queue, ordering uses **disk-HRRN**:
+`response_ratio = 1 + waiting_ms / max(1, disk_blocks)`. Small KV first
+(higher ratio at zero wait), but waiting_ms compensates for large KV
+to bound starvation. A **single in-flight load slot per decode node**
+serializes the disk loads on that node; cross-node loads run in
+parallel. When `KV_LOAD_COMPLETE` fires, the controller marks the
+request "ready" and it can proceed to `PREFILL_START` —
+**request-local gating only**, the underlying BlockPool tier state
+is NOT mutated (physical disk→cpu promotion is deferred to M1.5).
+
+The Bidaw branch lives in two new modules
+(`scheduler/bidaw.py` + `simulator/bidaw_controller.py`) plus a cli
+wiring branch. The five existing schedulers, all eight existing
+yamls, `CacheManager`, `BlockPool`, and `TransferModel` are
+**byte-identical** — Bidaw is purely additive.
+
+Run the demo:
+
+```bash
+uv run python -m nano_kvrouter.cli run --config configs/bidaw.yaml \
+    --scheduler bidaw
+uv run python -m nano_kvrouter.cli sweep --config configs/bidaw.yaml
+```
+
+Five new metrics surface in the summary (all default to `0.0`/`0`
+on non-bidaw runs):
+
+- `bidaw_preparing_wait_avg_ms` / `_p99_ms` — wait between arriving
+  in the preparing queue and `KV_LOAD_START`.
+- `bidaw_disk_load_service_avg_ms` — per-request disk load service
+  time (the `KV_LOAD_*` interval).
+- `bidaw_preparing_promotions` — count of requests that traversed
+  the preparing path (≈ disk-hit request count).
+
+See `doc/bidaw-deliverable.md` for the full Chinese deliverable
+summary (mechanism mapping, simulator approximations, what is NOT
+implemented, comparison table, ship verdict) and DESIGN §13 for
+the design write-up.
+
+**Known M1 caveats** (documented in DESIGN §13):
+1. `configs/bidaw.yaml` is a minimal-stress demo — disk load (~0.37 ms)
+   is much faster than the request arrival interval (~67 ms), so the
+   preparing queue never backs up and `bidaw_preparing_wait_avg_ms = 0`.
+   HRRN ordering is exercised by unit tests, not by the demo run. A
+   `bidaw-stress.yaml` variant for HRRN under real contention is
+   future work.
+2. Bidaw's routing mirrors `least_loaded` for decode-node choice.
+   On `bidaw.yaml` this produces lower `cache_hit_ratio` than
+   `conductor` (0.69 vs 0.82), but **`bidaw` ends up with lower
+   `e2e_avg_ms` (386 vs 413)** because the cache_hit advantage of
+   conductor is on paper only — conductor does not pay the real
+   disk-load latency that bidaw does. Same-semantics comparison
+   would require all schedulers to pay real disk-load time.
+
 ## Quick start
 
 The project uses [`uv`](https://docs.astral.sh/uv/).
@@ -331,6 +404,7 @@ uv run pytest -q
 | [`configs/trace_mooncake.yaml`](configs/trace_mooncake.yaml) | Mooncake FAST'25 trace replay (real `hash_ids`, block_size=512) |
 | [`configs/trace_burstgpt.yaml`](configs/trace_burstgpt.yaml) | BurstGPT trace replay with synthetic prefix sharing (`PrefixSynthesisModel`) |
 | [`configs/transfer_contention.yaml`](configs/transfer_contention.yaml) | 2p/2d cluster with `bandwidth.contention_model: per_node_lane` to exercise the P4-A `TransferModel` lane queueing |
+| [`configs/bidaw.yaml`](configs/bidaw.yaml) | 2p/4d cluster with `cpu_blocks=0` + `disk_blocks=4000` so disk-tier hits are visible; exercises the P5-Bidaw `KV_LOAD_*` event path on the new `bidaw` scheduler |
 
 ## LIVE config matrix
 
@@ -405,6 +479,7 @@ algorithm should be readable in one sitting alongside the matching paper.
 | `PrefixGreedyPolicy`| SGLang (NeurIPS'24)            | Pick the node with the longest cached prefix. Maximises cache reuse, ignores load.    |
 | `E2Policy`          | Preble (ICLR'25)               | Score = historical_load + eviction_cost + run_cost. Trades cache hit against pressure.|
 | `MooncakeConductor` | Mooncake (FAST'25 Best Paper)  | Three-objective scoring + SLO early rejection. Rejects when no node can hit the SLO.  |
+| `BidawPolicy`       | Bidaw (FAST'26)                | Routes like `least_loaded`; the contribution is the dual-queue admission controller + disk-HRRN + real `KV_LOAD_*` event path on disk-hit requests. See DESIGN §13. |
 
 Selecting a scheduler is a one-line YAML change:
 
@@ -470,14 +545,16 @@ src/nano_kvrouter/
 │   ├── least_loaded.py
 │   ├── prefix_greedy.py
 │   ├── e2_policy.py
-│   └── conductor.py
+│   ├── conductor.py
+│   └── bidaw.py            # Bidaw I/O-aware routing + disk-HRRN (P5-Bidaw M1)
 ├── simulator/
 │   ├── event.py
 │   ├── engine.py
 │   ├── generator.py         # Poisson generator
 │   ├── trace_generator.py   # JSONL trace replay (Mooncake / BurstGPT)
 │   ├── prefix_synthesis.py  # Zipf+locality+layered prefix model (P3-C M2)
-│   └── transfer_model.py    # Noop / per-node lane KV transfer cost models (P4-A)
+│   ├── transfer_model.py    # Noop / per-node lane KV transfer cost models (P4-A)
+│   └── bidaw_controller.py  # Bidaw dual-queue admission controller (P5-Bidaw M1)
 └── metrics/
     └── collector.py
 ```
@@ -498,6 +575,7 @@ the following systems:
 - **Mooncake** — *Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving*, FAST'25 Best Paper.
 - **Preble** — *Preble: Efficient Distributed Prompt Scheduling for LLM Serving*, ICLR'25.
 - **SGLang** — *Efficiently Programming Large Language Models using SGLang* (RadixAttention), NeurIPS'24.
+- **Bidaw** — *Bidaw: Interactive LLM Serving with Two-Tier KV Storage*, FAST'26 (I/O-aware dual-queue request scheduling; storage engine + previous-answer eviction + tensor caching are explicitly NOT in scope, see `doc/bidaw-deliverable.md`).
 - **Llumnix** — *Llumnix: Dynamic Scheduling for Large Language Model Serving*, OSDI'24 (migration logic — roadmap).
 - **vLLM** — *Efficient Memory Management for Large Language Model Serving with PagedAttention*, SOSP'23.
 

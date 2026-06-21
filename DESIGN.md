@@ -601,16 +601,168 @@ assert 返回 `(0,C)/(C,2C)/(2C,3C)/(3C,4C)`。
 并行 / shared egress 串行 / shared ingress 串行 / peek_backlog 零副
 作用）+ Noop 常量验证，全在 `tests/test_transfer_model.py`。
 
-## 13. 下一步路线
+## 13. Bidaw — I/O-aware dual-queue scheduling (P5-Bidaw M1)
+
+### 13.1 问题与建模选择
+
+P4-B 之前所有 scheduler 都假设 disk-tier 命中是"瞬完成"——`cache_manager.
+lookup()` 报告 disk hit、`compute_est_ttft.cache_load_ms` 估算 transfer
+cost，但 `PREFILL_START` **不真的等** disk-to-GPU load 发生。这让 disk
+hit 看起来比真实情况更便宜。
+
+Bidaw (FAST'26) 论文核心：把 disk load 从估算项升级为 **关键路径上的真实
+事件**，并用 dual-queue admission controller + disk-HRRN 智能排序来调度
+load 顺序。
+
+**本次只做 I/O-aware scheduling 这一块**；论文里的 storage-efficient
+tensor caching、previous-answer eviction、CUDA stream overlap 都
+**不实现**（详见 `doc/bidaw-deliverable.md`）。
+
+### 13.2 模块结构（separate from 5 existing schedulers）
+
+- `scheduler/bidaw.py`：`BidawPolicy` + 纯函数 `hrrn_priority(waiting_ms,
+  kv_size_blocks)`。`BidawPolicy.schedule()` 满足 `SchedulingPolicy`
+  Protocol，但**routing 决策很简单**——decode_node 用 `min(current_load)`
+  （类似 least_loaded），prefill_node 用 round-robin。"聪明"在 controller 路径里。
+- `simulator/bidaw_controller.py`：`BidawAdmissionController` 纯状态机，
+  持有 `_preparing: dict[node_id, list[PreparingEntry]]` + `_in_flight_load:
+  dict[node_id, request_id | None]`。**不调度 event**——cli wiring 在
+  controller 决策后 schedule `KV_LOAD_START` / `KV_LOAD_COMPLETE`。
+- `cli.py`：在 `_wire_simulator` 中加 `bidaw_mode: bool = False` 关键字
+  参数（默认 False 保持 13 个 hidden caller 兼容）。`scheduler.name ==
+  "bidaw"` 时 `_run_one` 传 `True`，激活 Bidaw 专用 wiring 分支。
+
+### 13.3 事件路径（新增 2 个 EventType）
+
+```
+普通 scheduler:
+REQUEST_ARRIVE → SCHEDULED → PREFILL_START → ...
+
+Bidaw:
+REQUEST_ARRIVE → SCHEDULED → BidawController.on_arrive
+  ├─ matched_disk_blocks == 0  → "ready"     → PREFILL_START
+  └─ matched_disk_blocks > 0   → "preparing" → enqueue
+                                  HRRN pick when slot idle
+                                  → KV_LOAD_START
+                                  → KV_LOAD_COMPLETE
+                                  → mark ready, free slot
+                                  → PREFILL_START
+                                  → ...
+```
+
+每个 decode node **一个 in-flight load slot**——同节点多个 disk-hit 请求
+serialize；跨节点并行。HRRN 公式：
+
+```
+response_ratio = 1 + waiting_ms / max(1, disk_blocks)
+```
+
+Controller 取 `max(response_ratio)`——小 KV 起始 ratio 高（denominator 小），
+等待时间补偿大 KV 防 starvation。
+
+### 13.4 关键 commitments
+
+1. **Request-local gating (M1)**：`KV_LOAD_COMPLETE` 只让 *该请求* 进入
+   `PREFILL_START`；**不动 `BlockPool` tier 状态**。同 prefix 后续请求
+   仍会看到 disk hit，这是已知 fidelity gap。物理 disk→cpu promotion 是
+   M1.5（后续独立 commit）。
+2. **Double-charging guard**：`BidawPolicy.schedule()` 把 `CacheLookup.
+   transfer_cost_ms` 中的 disk 部分清零（cpu 部分保留——KV_LOAD 只 replay
+   disk 不 replay cpu reload）后传 `compute_est_ttft`。事件路径自然付出
+   真实 disk load 时间。其他 5 scheduler 看到完整 `transfer_cost_ms`，
+   行为不变。
+   ```python
+   block_bytes = block_size * kv_bytes_per_token
+   disk_load_ms = disk_n * block_bytes * (1/cpu_to_disk + 1/gpu_to_cpu) * 1000
+   transfer_cost_ms -= disk_load_ms   # 保留 cpu_load_ms
+   ```
+3. **Compat byte-identical**：bidaw 是**第 6 个 scheduler**，纯增量。
+   5 老 scheduler / 8 老 yaml / CacheManager / TransferModel 零修改；
+   `bidaw_mode=False` 默认值让 `_wire_simulator` 13 个 hidden caller 全部
+   不需改。
+4. **HRRN 单元测试覆盖**：4 个独立单测（同 waiting / 长 waiting 反超 /
+   single slot 序列化 / promotion-on-load-complete）证明算法正确性。
+   实际 `bidaw.yaml` demo 上 preparing wait = 0（load 0.37ms ≪ 67ms 到
+   达间隔），HRRN 在该 yaml 上是 dead code——见 §13.6 caveat。
+
+### 13.5 Metrics（4 个新字段）
+
+```python
+bidaw_preparing_wait_avg_ms     # 在 preparing 队列等了多久才 KV_LOAD_START
+bidaw_preparing_wait_p99_ms     # 同上 p99
+bidaw_disk_load_service_avg_ms  # 单次 disk load 服务时间（KV_LOAD interval）
+bidaw_preparing_promotions      # 进过 preparing 队列的请求数
+```
+
+5 老 scheduler 上这些字段值为 `0.0` / `0`（不是 `None`），让 sweep JSON
+schema 统一。MetricsCollector 复用现有 `_seen_transfer_ids` stale-guard
+模式来 guard `KV_LOAD_*` 事件。
+
+**第 5 个 metric `bidaw_ready_queue_wait_avg_ms` 在 M1 review 阶段删了**：
+原 dispatch §3 over-spec，实际所有请求（ready 路径和 preparing 路径完成
+load 后）都立即进 `PREFILL_START`，没有"ready queue wait"语义。
+
+### 13.6 ⚠️ 关键解读：bidaw.yaml demo 的两个 caveat
+
+**Caveat 1：`bidaw_preparing_wait_avg_ms = 0` 是预期但不直观**
+
+`configs/bidaw.yaml` 用 `request_rate=15`（67ms 到达间隔），单次 disk
+load 服务时间 0.37ms，slot 几乎永远 idle。preparing 队列从不积压，HRRN
+排序在 demo 上是 dead code。这**不是 bug**——HRRN 正确性由单元测试守。
+要在 demo 里展示 HRRN under contention，需要单独 `bidaw-stress.yaml`
+（更慢 `cpu_to_disk` 或更高 request_rate），M1.5 / 后续工作。
+
+**Caveat 2：cache_hit_ratio 比 conductor 低，但 e2e_avg_ms 比 conductor 短**
+
+`bidaw.yaml` 上 conductor cache_hit=0.823 / bidaw cache_hit=0.693；
+看起来 conductor 赢。**但 e2e_avg_ms 反过来**：bidaw 386ms vs conductor
+413ms。原因：conductor 的 cache_hit 优势是 *估算层面的*——它不付出真实
+disk load 时间；bidaw 付出真实 load 时间但 routing 像 least_loaded
+让 decode queue 更短。**不是同语义对比**。要真正比较，需要让所有 6 个
+scheduler 都走 `KV_LOAD_*` 事件路径——这是 P6 候选（"让所有 scheduler
+共享 I/O-aware 真实路径"），不在 M1 scope。
+
+### 13.7 Hard gates（10 条全过）
+
+- pytest 488 passed（460 + 28 new = 26 net new tests; 1 dead metric
+  test removed）
+- 5 老 scheduler 在 6 老 yaml 上 byte-identical
+- bidaw.yaml sweep 6 行，5 老行匹配 M0 Candidate J baseline
+- 任意 disk-hit 请求 `KV_LOAD_COMPLETE.time ≤ PREFILL_START.time`
+- 同 decode node 第 2 次 `KV_LOAD_START.time ≥` 第 1 次 `KV_LOAD_COMPLETE.time`
+- ready 小请求不被 large preparing 阻塞（test 真实 timestamp 断言）
+- `bidaw_preparing_promotions ≈ disk-hit 请求数`（200 ≈ 200）
+
+详见 `doc/bidaw-deliverable.md` ship 判定段。
+
+### 13.8 未来工作
+
+- **M1.5**：物理 disk→cpu promotion via `CacheManager.
+  promote_matched_disk_blocks_to_cpu()`，需要 cpu_blocks > 0 的新 yaml
+- **bidaw-stress.yaml**：让 preparing wait > 0 + HRRN 在 demo 里活起来
+- **P6**：让 5 老 scheduler 也共享 `KV_LOAD_*` 真实事件路径，从而能真
+  对比 cache_hit / e2e（破解 §13.6 caveat 2）
+- **完整 Bidaw 论文**：storage-efficient tensor caching / previous-
+  answer eviction / CUDA stream overlap 都不在范围
+
+## 14. 下一步路线
 
 - ✅ **P4-B**（done, commit `244345d`）：5 scheduler 的
   `compute_est_ttft` 已通过 `TransferBacklogView` 看 lane backlog；新
   metric `kv_transfer_queued_avg_ms` 已上。详见 §12.5。
+- ✅ **P5-Bidaw M1**（done, commit `6d1cf50` on `feat/bidaw-io-aware-
+  scheduling`）：I/O-aware dual-queue scheduling、disk-HRRN、KV_LOAD_*
+  事件路径、4 个新 metrics、6 scheduler sweep table。详见 §13。
 - P3-D：把 `PrefixSynthesisModel` 提取给 Poisson `RequestGenerator` 也用
   （硬约束：default yaml 行为零漂移，opt-in only）
-- P5 候选：
+- P5-Bidaw 后续：
+  - **M1.5**：物理 disk→cpu promotion + cpu_blocks > 0 的 bidaw 变体
+  - **bidaw-stress.yaml**：让 preparing queue 真的积压、HRRN 在 demo 活
+- P6 候选：
   - **PagedAttention Tier 2**：让 CPU/Disk 块真正动起来（demote/promote
     路径、HiCache 命中链、prefill cache_miss 不再只看 GPU 命中）
+  - **5 老 scheduler 共享 `KV_LOAD_*` 真实路径**：让 cache_hit / e2e 在
+    所有 scheduler 上能真对比（破 §13.6 caveat 2）
   - **让 non-Conductor scheduler 主动用 backlog 做 routing**：当前 4 个
     scheduler 仅"被动接收" backlog（compute_est_ttft 估算更准），但 routing
     决策本身不参考 `peek_backlog`。是否值得让 prefix_greedy / e2_policy
