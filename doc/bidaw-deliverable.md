@@ -185,9 +185,80 @@ uv run python -m nano_kvrouter.cli sensitivity --config configs/sensitivity.yaml
 新增字段；answer eviction 默认关闭，只有 `scheduler="bidaw"` 且
 `enable_answer_eviction: true` 时才注入 `AnswerEvictionPolicy`。
 
-## 9. 后续 milestones
+## 9. M3 — routing intelligence (A1 + A2 + A3, 2026-06-22)
 
-- **P6 候选**：让 5 老 scheduler 也共享 `KV_LOAD_*` 真实路径（同语义对比）；PagedAttention Tier 2；Llumnix migration；speculative decoding
-- **Bidaw 论文其他模块**（如果用户要做）：storage-efficient tensor caching（需要真实 tensor format 支持，超出 metadata 模拟器范围）
+M3 在 M1/M2 基础上加 3 个可选机制，全部默认 off，开启时通过新的
+`BidawControllerView` 只读 Protocol 从 controller 取信号。
 
-详见 DESIGN §14 路线表。
+### 9.1 三个机制
+
+| Flag | 机制 | 公式 / 行为 |
+|---|---|---|
+| `enable_routing_aware` (A1) | 缓存感知 decode 路由 | `cost = β·load + γ·preparing_disk_blocks + δ·in_flight_disk_blocks − α·matched_blocks`，min cost wins |
+| `enable_ttft_slo_gate` (A2) | storage-aware SLO 早拒 | `est_ttft + projected_preparing_wait > slo_ttft` → reject(`ttft_slo_exceeded`) |
+| `enable_session_affinity` (A3) | session 粘 decode 节点 | 命中且 pin 未明显过载 → 走 pin；否则 fall back A1 / least-loaded |
+
+### 9.2 与 plan v4 的两个 ratified drift（更贴近实际）
+
+| 维度 | Plan v4 | 实现（ratified） | 理由 |
+|---|---|---|---|
+| A1 routing penalty 单位 | queue depth / slot count | **disk block 总数** | 队列里一个 50-block 大请求和五个 1-block 小请求在 depth=2 下评分相同（错），块加权下 50 vs 5（对）；单 slot 下 count 信息量太低 |
+| A3 overload threshold 锚点 | `factor · avg_load + abs_floor` | **`max(factor · min_load, min_load + abs_floor)`** | min 锚定直接回答"有没有明显更好的节点"；hybrid factor + abs_floor 同时覆盖高低负载场景 |
+
+两点都在 docstring、`doc/code-review/p5-bidaw-m3-routing-m0-preflight.md`
+post-ratification section、DESIGN §13.10 中明确记录。
+
+### 9.3 P/D-split 适配（论文 vs 我们的简化）
+
+Bidaw 论文是单节点架构；我们的 M5a split P/D 把 Bidaw 所有 I/O 机制
+（dual queue、KV_LOAD slot、HRRN、A1 score、A3 affinity）**scope 到 decode
+池**（cache 只在 decode 池）。prefill 仍 round-robin。代价：prefill 节点
+必须等 decode-side KV_LOAD 完才 PREFILL_START，是论文没有的上游 stall。
+本 milestone 接受；M4 multi-stream + 论文偏离（允许 LOAD/PREFILL 并行）
+是未来候选。
+
+### 9.4 Ship gates met（实测）
+
+| Gate | Config | 数字 | 阈值 |
+|---|---|---|---|
+| A1 cache_hit gap → conductor | `bidaw.yaml`（A1 only） | 0.823 vs 0.823 = **0.000** | ≤ 0.05 ✅ |
+| A2 SLO 拒绝触发且不过激 | `bidaw-m3-stress.yaml` | rejections=6, rate=0.194 | rate ≤ 0.252 ✅ |
+| A3 session 粘性 | `bidaw-affinity.yaml`（A3 only） | 40/60 = **0.667** | ≥ 0.4 ✅ |
+
+2-of-3 即可 ship，三项全过。Tests: 497 → **515 pass**。
+
+### 9.5 文件清单 / metrics
+
+新增模块 `scheduler/bidaw_view.py` (`BidawControllerView` Protocol)。
+`SchedulingDecision` 加两个可选字段 `routing_score`、`affinity_hit`，5 老
+scheduler 全部不设，回归 byte-identical。新增 yaml
+`configs/bidaw-affinity.yaml`、`configs/bidaw-m3-stress.yaml`。
+新增 fixture `tests/fixtures/affinity_workload.jsonl`（20 sessions ×
+3 rounds）。
+
+3 个新 metric（通过 SCHEDULED / REQUEST_REJECTED payload 被动采样）：
+- `bidaw_routing_score_avg`（A1 cost 均值，可负）
+- `bidaw_session_affinity_hits`（A3 命中计数）
+- `ttft_slo_rejections`（**通用**字段，Conductor 早拒路径也计入）
+
+### 9.6 预存 backlog（M3 没修）
+
+`cli.py:641` 的 KV_LOAD service 公式漏了 cpu→gpu 那一跳：
+`cache_manager` 双跳估算、`bidaw.py:149` guard 双跳，但 cli.py 只付一跳，
+导致 bidaw observed TTFT 低估 ~0.03%。**M3 故意保持这个 mismatch**
+因为 A2 的 `peek_projected_preparing_wait_ms` 公式必须与 event 实际付的
+一致；修这个 bug 是独立 PR，需要重新锁基线。详见 DESIGN §13.10.7 +
+M0 preflight §7。
+
+## 10. 后续 milestones
+
+- **M4**：multi-stream load model（B1，单 slot → K 并发，HRRN 真有意义）
+- **M5**：GPU-only performance mode（A4，CPU 命中也走 KV_LOAD）
+- **M6**：online ghost cache（B2，把 M2 静态 3-bucket 升级到在线反馈）
+- **独立 backlog**：cli.py:641 单跳 → 两跳修正
+- **更长远**：让 5 老 scheduler 也共享 `KV_LOAD_*` 真实路径（同语义对比）；
+  PagedAttention Tier 2；Llumnix migration；Bidaw 论文 storage-efficient
+  tensor caching（需要真实 tensor 支持，超出 metadata 模拟器范围）
+
+详见 DESIGN §14 路线表与
+`.claude/plans/p5-bidaw-followups-roadmap.md`。

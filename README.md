@@ -266,7 +266,7 @@ Default `bandwidth.contention_model: "none"` still keeps every old
 config and regression number byte-identical — `NoopTransferModel.peek_backlog`
 returns zeros, `max(0, 0 - now) = 0`, and `kv_transfer` is unchanged.
 
-### Bidaw I/O-aware scheduling + answer eviction (P5-Bidaw M1/M2, 2026-06-21)
+### Bidaw I/O-aware scheduling + answer eviction + routing intelligence (P5-Bidaw M1/M2/M3, 2026-06-22)
 
 P5 adds a sixth scheduler `bidaw` that simulates the **I/O-aware
 request scheduling layer** of Bidaw (FAST'26). Until P5, requests
@@ -310,16 +310,48 @@ space, low-potential CPU blocks are demoted before high-potential ones. The
 profile can be generated from the public Interactive-conversation-workload CSV
 with `scripts/convert_interactive_workload.py`.
 
+**P5-Bidaw M3** adds three opt-in routing enhancements on top of
+M1/M2, all default off so existing yamls remain byte-identical:
+
+- **A1 routing-aware** (`enable_routing_aware`) — decode-node
+  selection score `cost = β·load + γ·preparing_disk_blocks +
+  δ·in_flight_disk_blocks − α·matched_blocks`. Block-weighted (not
+  queue-depth) so a 50-block load is correctly penalized heavier
+  than five 1-block loads. On `bidaw.yaml` this closes the
+  cache-hit gap to `conductor` (bidaw 0.823 == conductor 0.823).
+- **A2 TTFT SLO gate** (`enable_ttft_slo_gate`) — pre-admission
+  rejection when `est_ttft + projected_preparing_wait_ms >
+  request.slo_ttft`. The projected wait is a deterministic
+  single-slot FIFO estimate matching the M1 `KV_LOAD` event service
+  formula exactly, plus an in-flight residual when a load is in
+  progress. Generic `ttft_slo_rejections` metric (Conductor's
+  early-rejection path counts here too).
+- **A3 session affinity** (`enable_session_affinity`) — pin a
+  `session_id` to its first-round decode node, fall back to A1 / load
+  routing when the pinned node is meaningfully more loaded than the
+  best alternative (`threshold = max(factor · min_load, min_load +
+  abs_floor)` — hybrid, anchored on min not avg so it answers "is
+  there a clearly better node?" directly). Commit happens in the
+  shared `on_kv_transfer_complete` handler after the decode-capacity
+  check AND after `materialize_request` succeeds, so rejected /
+  failed admissions do not pollute the affinity table.
+
+Two new configs exercise the M3 ship gates:
+
+- `configs/bidaw-affinity.yaml` — 20 sessions × 3 rounds, A3 only,
+  M2 answer-eviction off so the affinity signal is isolated.
+- `configs/bidaw-m3-stress.yaml` — clone of `bidaw-stress.yaml`
+  with `slo.ttft_target_ms=100` and all three M3 flags on,
+  designed to force A2 rejections without becoming pathological.
+
 Run the demo:
 
 ```bash
-uv run python -m nano_kvrouter.cli run --config configs/bidaw.yaml \
-    --scheduler bidaw
 uv run python -m nano_kvrouter.cli sweep --config configs/bidaw.yaml
-uv run python -m nano_kvrouter.cli run --config configs/bidaw-stress.yaml \
-    --scheduler bidaw
-uv run python -m nano_kvrouter.cli run --config configs/bidaw-interactive.yaml \
-    --scheduler bidaw
+uv run python -m nano_kvrouter.cli sweep --config configs/bidaw-stress.yaml
+uv run python -m nano_kvrouter.cli sweep --config configs/bidaw-interactive.yaml
+uv run python -m nano_kvrouter.cli sweep --config configs/bidaw-affinity.yaml
+uv run python -m nano_kvrouter.cli sweep --config configs/bidaw-m3-stress.yaml
 ```
 
 Bidaw metrics surface in the summary (all default to `0.0`/`0`
@@ -338,11 +370,28 @@ on non-bidaw runs):
 - `bidaw_answer_eviction_hit_potential_avg` — average hit potential of
   answer-aware evicted blocks.
 - `bidaw_answer_eviction_cpu_hit_rate` — CPU hits over CPU+Disk session hits.
+- `bidaw_routing_score_avg` (M3) — mean of A1 routing cost for
+  admitted decisions. Cost; can be negative when cache benefit
+  dominates.
+- `bidaw_session_affinity_hits` (M3) — count of admissions that
+  took A3's pinned-node fast path.
+- `ttft_slo_rejections` (M3, generic) — rejections with reason
+  `ttft_slo_exceeded`. Counts both `MooncakeConductor` (existing
+  early-rejection path) and Bidaw A2 (new).
 
 See `doc/bidaw-deliverable.md` for the full Chinese deliverable
 summary (mechanism mapping, simulator approximations, what is NOT
 implemented, comparison table, ship verdict) and DESIGN §13 for
 the design write-up.
+
+**P/D-split adaptation note**: Bidaw paper assumes a single-node
+architecture; nano-kvrouter is M5a split P/D. We scope all Bidaw
+I/O mechanisms (dual queue, KV_LOAD slot, HRRN, A1 routing score,
+A3 affinity) to the **decode pool** because that's where
+`CacheManager` lives. Prefill stays round-robin. Trade-off: in
+P/D split the prefill node must wait for decode-side KV_LOAD to
+complete before `PREFILL_START` fires, an upstream stall the
+paper does not have. Accepted for this milestone.
 
 **Known caveats** (documented in DESIGN §13):
 1. `configs/bidaw.yaml` is a minimal-stress demo — disk load (~0.37 ms)
@@ -350,13 +399,20 @@ the design write-up.
    preparing queue never backs up and `bidaw_preparing_wait_avg_ms = 0`.
    HRRN ordering is covered by unit tests and exercised by
    `configs/bidaw-stress.yaml`.
-2. Bidaw's routing mirrors `least_loaded` for decode-node choice.
-   On `bidaw.yaml` this produces lower `cache_hit_ratio` than
-   `conductor` (0.69 vs 0.82), but **`bidaw` ends up with lower
+2. Bidaw's **default** routing mirrors `least_loaded` for decode-node
+   choice. On `bidaw.yaml` this produces lower `cache_hit_ratio` than
+   `conductor` (0.69 vs 0.82), but **`bidaw` still ends up with lower
    `e2e_avg_ms` (386 vs 413)** because the cache_hit advantage of
    conductor is on paper only — conductor does not pay the real
-   disk-load latency that bidaw does. Same-semantics comparison
-   would require all schedulers to pay real disk-load time.
+   disk-load latency that bidaw does. With M3 A1 enabled
+   (`enable_routing_aware=true`) bidaw cache_hit reaches 0.823,
+   matching conductor exactly while still paying real disk-load
+   time. Same-semantics comparison across all schedulers would still
+   require them to pay real disk-load time.
+3. A2's projected preparing wait is a **deterministic FIFO
+   single-slot estimate** — HRRN reordering and in-flight residual
+   from concurrent decode nodes are not modeled. Sufficient for
+   the M3 ship gate but not a perfect proxy of realized wait.
 
 ## Quick start
 

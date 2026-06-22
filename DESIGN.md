@@ -768,12 +768,178 @@ scheduler 都走 `KV_LOAD_*` 事件路径——这是 P6 候选（"让所有 sch
 - 语义边界：M2 只改变 CPU-tier victim selection，不改变老 scheduler routing，
   不改变 `CacheManager.lookup()` 的 tier-cost 公式。
 
-### 13.9 未来工作
+### 13.9 未来工作（M1/M2 视角，已被 M3 部分覆盖）
 
-- **P6**：让 5 老 scheduler 也共享 `KV_LOAD_*` 真实事件路径，从而能真
-  对比 cache_hit / e2e（破解 §13.6 caveat 2）
-- **完整 Bidaw 论文**：storage-efficient tensor caching / CUDA stream overlap
-  仍不在范围
+- ~~**P6**：让 5 老 scheduler 也共享 `KV_LOAD_*` 真实事件路径~~ —
+  仍是开放问题；M3 没有改这条
+- **完整 Bidaw 论文**：storage-efficient tensor caching / CUDA stream
+  overlap 仍不在范围
+- M3 之后还剩：B1 multi-stream load model、B2 online ghost cache、A4
+  GPU-only performance mode；见 §14 路线表
+
+### 13.10 Bidaw M3 — routing intelligence (A1 + A2 + A3, 2026-06-22)
+
+M3 在 M1/M2 基础上加 3 个可选机制，全部默认 off，从 yaml 通过
+`scheduler.params.enable_*` 开关，开启时通过新的 `BidawControllerView`
+只读 Protocol 从 controller 取信号：
+
+```
+scheduler.params:
+  enable_routing_aware: false      # A1
+  enable_ttft_slo_gate: false      # A2
+  enable_session_affinity: false   # A3
+  routing_weight_matched_blocks: 1.0   # α
+  routing_weight_load: 1.0             # β
+  routing_weight_preparing: 1.0        # γ
+  routing_weight_in_flight: 2.0        # δ
+  affinity_overload_factor: 1.5
+  affinity_overload_abs_floor: 2.0
+```
+
+#### 13.10.1 A1 — routing-aware decode 节点选择
+
+代价函数（min wins，按 node_id 字典序破并列）：
+
+```
+cost(decode) = β · current_load(decode)
+             + γ · preparing_disk_blocks(decode)
+             + δ · in_flight_disk_blocks(decode)
+             − α · matched_blocks(request, decode)
+```
+
+**所有惩罚项按 disk block 数加权**，不是按队列深度 / slot 计数。原因：
+queue 中一个 50-block 大请求和五个 1-block 小请求在 `preparing_depth=2`
+下评分相同（错），但块加权下分别是 50 和 5（对）。单 slot 下
+`in_flight_count ∈ {0,1}` 信息量太低，块加权下能反映剩余 service。
+
+A1 closes the cache_hit gap in §13.6 caveat 2：开启时
+`bidaw.yaml` 上 bidaw 行 cache_hit = **0.823**（与 conductor 完全相同），
+ttft_p99 = 30.72ms（不退化）。详见 `doc/code-review/p5-bidaw-m3-routing-m0-preflight.md` 的 grid search 数据。
+
+#### 13.10.2 A2 — storage-aware TTFT SLO gate
+
+`schedule()` 在 `compute_est_ttft` 之后加一个 projected preparing wait：
+
+```
+projected = view.peek_projected_preparing_wait_ms(decode, my_disk_blocks, now)
+est_total = est_ttft + projected
+if est_total > request.slo_ttft:
+    reject(reason="ttft_slo_exceeded")
+```
+
+`peek_projected_preparing_wait_ms` 是单 slot **deterministic FIFO** 估计：
+
+```
+block_service_ms = block_bytes / cpu_to_disk * 1000  # 严格匹配 cli.py:641
+in_flight_residual = max(0, finish_ms − now)  if slot busy else 0
+queued_service     = sum(entry.disk_blocks for entry in preparing) * block_service_ms
+own_service        = my_disk_blocks * block_service_ms
+projected          = in_flight_residual + queued_service + own_service
+```
+
+`my_disk_blocks == 0` 时短路返回 0.0（ready 请求不进 preparing 队列，
+也不等 load slot）。
+
+⚠️ **已知近似**：HRRN reordering 和跨 decode node 的并行 KV_LOAD 都不建模。
+M4 multi-stream load model 时考虑改进。Metric `ttft_slo_rejections` 是
+**通用**字段（Conductor 已有的 `ttft_slo_exceeded` 早拒路径也计入），
+不是 Bidaw 独占。
+
+#### 13.10.3 A3 — session affinity
+
+`BidawAdmissionController` 维护 `_session_to_decode: dict[session_id, str]`。
+`schedule()` 查表，命中且 pin 节点未明显过载就走 pin 路径；否则 fall back
+到 A1 / least-loaded。
+
+**Overload 阈值（hybrid，按 min 锚定不是 avg 锚定）**：
+
+```
+threshold = max(factor · min_load,  min_load + abs_floor)
+overloaded = pinned_load > threshold
+```
+
+直接回答"有没有明显更好的节点"。`factor · min_load` 在高负载下生效
+（按比例留余量），`min_load + abs_floor` 在低负载下生效（绝对余量防止
+集群空闲时震荡）。
+
+**Commit 时点关键**：affinity commit 不在 `_wire_bidaw_branch` 加 chained
+handler（会比 shared `on_kv_transfer_complete` 先 fire，污染表），而是
+**直接写进 shared handler**，位置在 decode capacity check 通过 **且**
+`materialize_request` 成功之后：
+
+```python
+materialized_ok = True
+try:
+    cm.materialize_request(...)
+except MemoryError:
+    materialized_ok = False
+# ... admit & start_decode ...
+if (bidaw_controller is not None
+        and bidaw_controller.affinity_enabled
+        and req.session_id is not None
+        and materialized_ok):
+    bidaw_controller.commit_session_affinity(req.session_id, decision.decode_node)
+```
+
+这样 capacity-rejected 或 materialize-failed 的请求都不污染 affinity。
+
+#### 13.10.4 P/D-split 适配
+
+Bidaw 原文是单节点架构。在 M5a split P/D 下，所有 Bidaw 状态都 scope 到
+**decode 池**（因为 `CacheManager` 只在 decode 池存在）：
+
+| Bidaw 论文概念 | 我们的映射 |
+|---|---|
+| Node-level dual queue | decode-pool dual queue (preparing 按 decode_node_id 分桶) |
+| KV_LOAD 等 disk 加载 | decode 侧 disk → memory |
+| Disk-HRRN 排序 | 只排 decode 节点 KV_LOAD 候选 |
+| A1 routing score | 仅看 decode 侧信号（preparing_blocks、in_flight_blocks、matched_blocks）；prefill 不进路由 |
+| A3 session affinity | 绑定 decode_node；prefill 仍 RR |
+| A2 SLO gate | `est_ttft` 已跨 prefill + transfer + decode，A2 在其基础上加 decode 侧 projected_preparing_wait |
+
+代价：prefill 节点必须等 decode-side KV_LOAD 完才能 PREFILL_START，
+是论文没有的上游 stall。本 milestone 接受。
+
+#### 13.10.5 SchedulingDecision 扩展 + Metrics
+
+`SchedulingDecision` 加两个可选字段（默认 None/False，5 老 scheduler
+全部不设，保持回归）：
+
+```python
+routing_score: float | None = None
+affinity_hit: bool = False
+```
+
+3 新 metric 通过 `SCHEDULED` / `REQUEST_REJECTED` payload 被动采样（不
+违反 collector passive observer 规则）：
+
+- `bidaw_routing_score_avg` — 平均 A1 cost（仅采样 routing_score 非 None
+  的 SCHEDULED 事件）
+- `bidaw_session_affinity_hits` — `affinity_hit=True` 计数
+- `ttft_slo_rejections` — REQUEST_REJECTED 中 `reason=="ttft_slo_exceeded"`
+  计数，通用（含 Conductor）
+
+#### 13.10.6 Ship gates met（实测）
+
+| Gate | Config | 数字 | 阈值 | 结果 |
+|---|---|---|---|---|
+| A1 cache_hit gap to conductor ≤ 0.05 | `bidaw.yaml`（A1 only） | 0.823 vs 0.823 = **0.000** | ≤ 0.05 | ✅ |
+| A2 ttft_slo_rejections > 0 且 rejection_rate ≤ conductor | `bidaw-m3-stress.yaml` | 6 rejections, rate 0.194 | ≤ 0.252 | ✅ |
+| A3 affinity_hits / completed ≥ 0.4 | `bidaw-affinity.yaml`（A3 only） | 40 / 60 = **0.667** | ≥ 0.4 | ✅ |
+
+2-of-3 即可 ship，三项全过。详见 `doc/code-review/p5-bidaw-m3-routing-m0-preflight.md` §4–§6。
+
+#### 13.10.7 cli.py:641 单跳公式 mismatch（预存 backlog）
+
+M3 M0 preflight §7 公开了一个 M1 留下的预存问题：
+- `cache_manager.transfer_cost_ms` 估算 disk 命中走两跳
+  `(1/cpu_to_disk + 1/gpu_to_cpu)` ✓ 物理正确
+- `bidaw.py:149` double-charging guard 减两跳 ✓ 匹配 cache_manager
+- **`cli.py:641` KV_LOAD event service 只付一跳**（cpu_to_disk）← 漏 cpu_to_gpu leg
+
+净影响：bidaw 观测 TTFT 低估 cpu→gpu 那一跳（数量级 0.03% 在
+`bidaw-stress.yaml` 参数下）。**M3 不修**，故意让 A2 的 projected_wait 用
+单跳与 event 实际付的一致。修该 bug 是独立小 PR，需要重新锁基线。
 
 ## 14. 下一步路线
 
@@ -788,6 +954,19 @@ scheduler 都走 `KV_LOAD_*` 事件路径——这是 P6 候选（"让所有 sch
   在系统 demo 中真实积压。
 - ✅ **P5-Bidaw M2**：metadata-only previous-answer-based eviction +
   session-history trace replay + Interactive-conversation workload converter。
+- ✅ **P5-Bidaw M3**（done, commits `5e7b578` + `87cfb79` on
+  `feat/bidaw-io-aware-scheduling`）：A1 routing-aware + A2 TTFT SLO
+  gate + A3 session affinity，3 个可选 flag 默认 off，6-scheduler
+  字节级回归保持；详见 §13.10。Ship gates 三项全过。
+- **P5-Bidaw 后续候选**（roadmap in `.claude/plans/p5-bidaw-followups-roadmap.md`）：
+  - **M4**：multi-stream load model（B1），把单 slot 扩展成 K 并发，
+    mirror P4-A `TransferModel` 模式；HRRN 在 K>1 下才真有意义
+  - **M5**：GPU-only performance mode（A4），yaml flag 让 CPU 命中
+    也走 KV_LOAD（贴 paper "GPU-only performance layer" 语义）
+  - **M6**：online ghost cache（B2），把 M2 静态 3-bucket
+    `AnswerEvictionPolicy` 升级到在线反馈
+- **独立 backlog**：cli.py:641 KV_LOAD service 公式单跳 → 两跳修正
+  （§13.10.7 已 disclose）。独立小 PR，需要重锁基线。
 - P3-D：把 `PrefixSynthesisModel` 提取给 Poisson `RequestGenerator` 也用
   （硬约束：default yaml 行为零漂移，opt-in only）
 - P6 候选：
