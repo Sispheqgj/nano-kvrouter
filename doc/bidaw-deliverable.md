@@ -241,21 +241,25 @@ scheduler 全部不设，回归 byte-identical。新增 yaml
 - `bidaw_session_affinity_hits`（A3 命中计数）
 - `ttft_slo_rejections`（**通用**字段，Conductor 早拒路径也计入）
 
-### 9.6 预存 backlog（M3 没修）
+### 9.6 cli.py KV_LOAD 两跳 — 已修
 
-`cli.py:641` 的 KV_LOAD service 公式漏了 cpu→gpu 那一跳：
-`cache_manager` 双跳估算、`bidaw.py:149` guard 双跳，但 cli.py 只付一跳，
-导致 bidaw observed TTFT 低估 ~0.03%。**M3 故意保持这个 mismatch**
-因为 A2 的 `peek_projected_preparing_wait_ms` 公式必须与 event 实际付的
-一致；修这个 bug 是独立 PR，需要重新锁基线。详见 DESIGN §13.10.7 +
-M0 preflight §7。
+M3 之后独立 `fix(bidaw)` commit 修了 M1 留下的 `cli.py:675` 单跳
+service 公式（只付 cpu_to_disk，漏 cpu_to_gpu）。同步把
+`bidaw_controller.py:287` 的 A2 projected wait 公式改成两跳，保持与
+event path 一致。
+
+数字影响：`bidaw.yaml` bidaw 行 ttft 上移 ~0.03ms（修正方向正确），
+其他 bidaw-family yaml 在报告精度下无可见变化。M3 ship gates 修复后
+重验全过：A2 rejections=6 rate=0.194, A3 hits 40/60=0.667。
+
+详见 DESIGN §13.10.7 + M0 preflight §7（两处均已标 RESOLVED）。
 
 ## 10. 后续 milestones
 
 - **M4**：multi-stream load model（B1，单 slot → K 并发，HRRN 真有意义）
 - **M5**：GPU-only performance mode（A4，CPU 命中也走 KV_LOAD）
 - **M6**：online ghost cache（B2，把 M2 静态 3-bucket 升级到在线反馈）
-- **独立 backlog**：cli.py:641 单跳 → 两跳修正
+- ~~**独立 backlog**：cli.py 单跳 → 两跳修正~~（已在独立 fix commit 完成；§9.6）
 - **更长远**：让 5 老 scheduler 也共享 `KV_LOAD_*` 真实路径（同语义对比）；
   PagedAttention Tier 2；Llumnix migration；Bidaw 论文 storage-efficient
   tensor caching（需要真实 tensor 支持，超出 metadata 模拟器范围）

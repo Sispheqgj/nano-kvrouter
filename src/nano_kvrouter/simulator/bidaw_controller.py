@@ -268,9 +268,10 @@ class BidawAdmissionController:
     ) -> float:
         """Estimate single-slot wait plus own load service for a disk-hit request.
 
-        The formula intentionally mirrors the actual cli.py KV_LOAD service
-        path: ``disk_blocks * block_bytes / cpu_to_disk * 1000``. It does not
-        use CacheManager's two-hop disk transfer estimate.
+        The formula mirrors the cli.py KV_LOAD service path exactly:
+        ``disk_blocks * block_bytes * (1/cpu_to_disk + 1/gpu_to_cpu) * 1000``
+        — both hops Disk→CPU and CPU→GPU, matching CacheManager's
+        transfer_cost_ms estimate.
         """
         if my_disk_blocks == 0:
             return 0.0
@@ -284,7 +285,11 @@ class BidawAdmissionController:
         residual_ms = 0.0 if finish_ms is None else max(0.0, finish_ms - now_ms)
         queued_disk_blocks = self.peek_preparing_disk_blocks(decode_node_id)
         block_bytes = self._model_cfg.block_size * self._model_cfg.kv_bytes_per_token
-        service_ms_per_block = block_bytes / self._bw_cfg.cpu_to_disk * 1000.0
+        service_ms_per_block = (
+            block_bytes
+            * (1.0 / self._bw_cfg.cpu_to_disk + 1.0 / self._bw_cfg.gpu_to_cpu)
+            * 1000.0
+        )
         return residual_ms + (queued_disk_blocks + my_disk_blocks) * service_ms_per_block
 
     def peek_session_affinity(self, session_id: str) -> str | None:

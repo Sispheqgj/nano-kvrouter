@@ -195,36 +195,32 @@ Acceptance for A3 ship gate:
 Use the existing `tests/fixtures/interactive_conversation.jsonl` as
 a template; expand to ≥ 60 requests across ≥ 20 sessions.
 
-## 7. Pre-existing backlog item: cli.py:641 formula mismatch
+## 7. Pre-existing formula mismatch — RESOLVED
 
-**Status**: NOT fixed in M3. Recorded for separate small PR.
+**Original problem** (M1 era): cli.py KV_LOAD service formula only
+charged the Disk→CPU hop, missing the CPU→GPU leg that
+`cache_manager.transfer_cost_ms` (and the bidaw double-charging
+guard) already counted.
 
-```
-cache_manager.py:25 disk-hit transfer_cost_ms
-  = block_bytes * (1/cpu_to_disk + 1/gpu_to_cpu) * 1000   [two-hop]
+**Resolution**: fixed post-M3 in a dedicated `fix(bidaw)` commit:
+- `cli.py:675` `load_service_ms` now uses
+  `block_bytes * (1/cpu_to_disk + 1/gpu_to_cpu) * 1000.0` (two-hop)
+- `simulator/bidaw_controller.py:287` `peek_projected_preparing_wait_ms`
+  per-block service updated to two-hop to stay consistent with the
+  event path (plan v4 invariant: A2's projected wait must match
+  realized wait)
+- `tests/test_bidaw_slo_gate.py:126` formula assertion updated
 
-bidaw.py:149 double-charging guard subtracts
-  = block_bytes * (1/cpu_to_disk + 1/gpu_to_cpu) * 1000   [two-hop]
-  (correctly mirrors cache_manager's estimate)
-
-cli.py:641 KV_LOAD_START.load_service_ms
-  = block_bytes / cpu_to_disk * 1000                       [one-hop]
-  (missing the gpu_to_cpu leg)
-```
-
-Net impact: with bidaw on disk-hit requests, the simulator
-**undercounts** the cpu→gpu leg of disk-tier loads. With
-`bidaw-stress.yaml` parameters (`cpu_to_disk=1e7`,
-`gpu_to_cpu=3.2e10`), the missing leg is ~0.03% of the dominant
-one-hop term — quantitatively small but qualitatively wrong.
-
-**M3 plan v4 explicit decision**: A2's
-`peek_projected_preparing_wait_ms` formula MUST match the
-**actual event-path one-hop formula at cli.py:641**, NOT the
-cache_manager two-hop estimate, so that A2's projected wait
-matches realized wait. Fixing cli.py:641 to two-hop is left as a
-separate PR after M3 lands (touches event-path baselines on
-bidaw-stress.yaml, requires its own M0 re-lock).
+**Post-fix baseline drift** (verified empirically):
+- `bidaw.yaml` bidaw row: ttft_p50 +0.03ms, e2e_avg +0.04ms
+  (cache_hit unchanged, no rejections)
+- `bidaw-interactive.yaml`, `bidaw-stress.yaml` bidaw rows: no
+  measurable change at the reported precision (gpu_to_cpu=3.2e10
+  is 3200× faster than cpu_to_disk=1e7; second hop contributes
+  ~0.03% to service time, smaller than the rounding floor of these
+  configs)
+- M3 ship gates re-verified post-fix: A2 ttft_slo_rejections=6
+  rate=0.194, A3 hits=40/60=0.667; both still pass.
 
 ## 8. Re-lock baseline commands (reproducible)
 

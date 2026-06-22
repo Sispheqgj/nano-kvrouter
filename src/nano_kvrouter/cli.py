@@ -672,7 +672,16 @@ def _wire_bidaw_branch(
             return
         disk_blocks = decode_lookup.matched_blocks_by_tier.get("disk", 0)
         block_bytes = model_cfg.block_size * model_cfg.kv_bytes_per_token
-        load_service_ms = disk_blocks * block_bytes / bandwidth_cfg.cpu_to_disk * 1000.0
+        # Disk-hit pays both serial hops: Disk→CPU (1/cpu_to_disk) + CPU→GPU
+        # (1/gpu_to_cpu). Matches cache_manager.py's transfer_cost_ms estimate
+        # (see cache_manager.py:25, 365) so the bidaw double-charging guard at
+        # scheduler/bidaw.py:281 stays balanced.
+        load_service_ms = (
+            disk_blocks
+            * block_bytes
+            * (1.0 / bandwidth_cfg.cpu_to_disk + 1.0 / bandwidth_cfg.gpu_to_cpu)
+            * 1000.0
+        )
         preparing_wait_ms = controller.get_waiting_ms(req.request_id, engine.now())
 
         # Claim the slot before scheduling events to prevent double-scheduling.

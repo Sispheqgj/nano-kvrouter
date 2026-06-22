@@ -929,17 +929,26 @@ affinity_hit: bool = False
 
 2-of-3 即可 ship，三项全过。详见 `doc/code-review/p5-bidaw-m3-routing-m0-preflight.md` §4–§6。
 
-#### 13.10.7 cli.py:641 单跳公式 mismatch（预存 backlog）
+#### 13.10.7 cli.py KV_LOAD 单跳公式 mismatch — RESOLVED
 
 M3 M0 preflight §7 公开了一个 M1 留下的预存问题：
 - `cache_manager.transfer_cost_ms` 估算 disk 命中走两跳
   `(1/cpu_to_disk + 1/gpu_to_cpu)` ✓ 物理正确
-- `bidaw.py:149` double-charging guard 减两跳 ✓ 匹配 cache_manager
-- **`cli.py:641` KV_LOAD event service 只付一跳**（cpu_to_disk）← 漏 cpu_to_gpu leg
+- `bidaw.py:281` double-charging guard 减两跳 ✓ 匹配 cache_manager
+- **`cli.py:675` KV_LOAD event service** 之前只付一跳，漏 cpu→gpu leg
 
-净影响：bidaw 观测 TTFT 低估 cpu→gpu 那一跳（数量级 0.03% 在
-`bidaw-stress.yaml` 参数下）。**M3 不修**，故意让 A2 的 projected_wait 用
-单跳与 event 实际付的一致。修该 bug 是独立小 PR，需要重新锁基线。
+**已修复**（独立 `fix(bidaw)` commit on `feat/bidaw-io-aware-scheduling`）：
+
+- `cli.py:675` `load_service_ms` 改成
+  `disk_blocks * block_bytes * (1/cpu_to_disk + 1/gpu_to_cpu) * 1000.0`
+- `bidaw_controller.py:287` `peek_projected_preparing_wait_ms` per-block
+  service 同步改成两跳（保持 plan v4 invariant：A2 projected wait 必须
+  与 event 实际付的一致）
+- `tests/test_bidaw_slo_gate.py:126` 测试常数公式同步
+
+数字漂移实测：`bidaw.yaml` bidaw 行 ttft_p50 +0.03ms、e2e_avg +0.04ms，
+cache_hit 不变；其他 bidaw-family yaml 在报告精度下无可见变化（第二跳
+贡献 ~0.03%，小于这些 config 的舍入精度）。M3 ship gates 修复后重验全过。
 
 ## 14. 下一步路线
 
@@ -965,8 +974,8 @@ M3 M0 preflight §7 公开了一个 M1 留下的预存问题：
     也走 KV_LOAD（贴 paper "GPU-only performance layer" 语义）
   - **M6**：online ghost cache（B2），把 M2 静态 3-bucket
     `AnswerEvictionPolicy` 升级到在线反馈
-- **独立 backlog**：cli.py:641 KV_LOAD service 公式单跳 → 两跳修正
-  （§13.10.7 已 disclose）。独立小 PR，需要重锁基线。
+- ~~**独立 backlog**：cli.py KV_LOAD service 公式单跳 → 两跳修正~~ —
+  已在独立 `fix(bidaw)` commit 中完成；详见 §13.10.7。
 - P3-D：把 `PrefixSynthesisModel` 提取给 Poisson `RequestGenerator` 也用
   （硬约束：default yaml 行为零漂移，opt-in only）
 - P6 候选：

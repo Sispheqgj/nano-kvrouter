@@ -123,7 +123,11 @@ def test_projected_wait_includes_in_flight_residual_and_queued_blocks() -> None:
     ctrl.on_arrive(r1, "d0", matched_disk_blocks=3, now_ms=1.0)
 
     block_bytes = model.block_size * model.kv_bytes_per_token
-    per_block_ms = block_bytes / bandwidth.cpu_to_disk * 1000.0
+    per_block_ms = (
+        block_bytes
+        * (1.0 / bandwidth.cpu_to_disk + 1.0 / bandwidth.gpu_to_cpu)
+        * 1000.0
+    )
     expected = 25.0 + (3 + 2) * per_block_ms
 
     assert ctrl.peek_projected_preparing_wait_ms("d0", 2, now_ms=5.0) == pytest.approx(
