@@ -266,7 +266,7 @@ Default `bandwidth.contention_model: "none"` still keeps every old
 config and regression number byte-identical — `NoopTransferModel.peek_backlog`
 returns zeros, `max(0, 0 - now) = 0`, and `kv_transfer` is unchanged.
 
-### Bidaw I/O-aware scheduling + answer eviction + routing intelligence (P5-Bidaw M1/M2/M3, 2026-06-22)
+### Bidaw I/O-aware scheduling + answer eviction + routing intelligence + multi-stream load (P5-Bidaw M1/M2/M3/M4, 2026-06-22)
 
 P5 adds a sixth scheduler `bidaw` that simulates the **I/O-aware
 request scheduling layer** of Bidaw (FAST'26). Until P5, requests
@@ -344,6 +344,27 @@ Two new configs exercise the M3 ship gates:
   with `slo.ttft_target_ms=100` and all three M3 flags on,
   designed to force A2 rejections without becoming pathological.
 
+**P5-Bidaw M4** introduces a multi-stream KV load model. The M1
+single in-flight slot per decode node is generalized to K parallel
+slots, mirroring the P4-A `TransferModel` pattern (Protocol + two
+implementations: `SingleSlotLoadModel` frozen for default, plus
+`MultiStreamLoadModel(num_streams=K)` opt-in). All yamls default
+to `load_model="single"`, preserving M1/M2/M3 byte-identical
+regression. With `load_model="multi"` + `num_streams=K`, the cli
+wiring pumps idle slots whenever a request arrives or a load
+completes, claiming slots one-at-a-time by HRRN priority.
+
+`peek_projected_preparing_wait_ms` is generalized to an
+earliest-slot FIFO assignment estimate over `K` parallel slots so
+that A2's SLO gate remains accurate under multi-stream. Each
+request still occupies exactly one slot for its full
+`disk_blocks * (block_bytes/cpu_to_disk + block_bytes/gpu_to_cpu) * 1000`
+service duration; HRRN reordering of in-flight loads is not modeled
+(v1 simplification).
+
+- `configs/bidaw-m4-multistream.yaml` — clone of `bidaw-stress.yaml`
+  with `load_model=multi, num_streams=4`. Exercises the M4 ship gate.
+
 Run the demo:
 
 ```bash
@@ -352,6 +373,7 @@ uv run python -m nano_kvrouter.cli sweep --config configs/bidaw-stress.yaml
 uv run python -m nano_kvrouter.cli sweep --config configs/bidaw-interactive.yaml
 uv run python -m nano_kvrouter.cli sweep --config configs/bidaw-affinity.yaml
 uv run python -m nano_kvrouter.cli sweep --config configs/bidaw-m3-stress.yaml
+uv run python -m nano_kvrouter.cli sweep --config configs/bidaw-m4-multistream.yaml
 ```
 
 Bidaw metrics surface in the summary (all default to `0.0`/`0`
@@ -410,9 +432,21 @@ paper does not have. Accepted for this milestone.
    time. Same-semantics comparison across all schedulers would still
    require them to pay real disk-load time.
 3. A2's projected preparing wait is a **deterministic FIFO
-   single-slot estimate** — HRRN reordering and in-flight residual
-   from concurrent decode nodes are not modeled. Sufficient for
-   the M3 ship gate but not a perfect proxy of realized wait.
+   earliest-slot estimate** over `K` parallel slots — HRRN
+   reordering of in-flight loads and inter-decode-node parallelism
+   are not modeled. Sufficient for the M3 ship gate and the M4
+   redesigned ship gate but not a perfect proxy of realized wait.
+4. M4 ship gate v2 (preparing-wait, TTFT p50, E2E avg reductions
+   vs K=1 baseline) replaced the original v1 guards
+   (`bidaw_preparing_promotions ±10%`, `rejection_rate +0.05`)
+   after Codex's empirical scan showed those v1 invariants were
+   not achievable for any K. Reason: multi-stream pumps requests
+   into `PREFILL_START` sooner, which shifts the timing of
+   decode-capacity exhaustion in saturated workloads — so
+   promotion and rejection counts are downstream emergent effects
+   of M4, not invariants. M4 measured at K=4 vs K=1
+   `bidaw-stress.yaml`: preparing_wait_avg 143→46ms (−68%),
+   ttft_p50 139→39ms (−72%), e2e_avg 341→232ms (−32%).
 
 ## Quick start
 

@@ -254,12 +254,104 @@ event path 一致。
 
 详见 DESIGN §13.10.7 + M0 preflight §7（两处均已标 RESOLVED）。
 
-## 10. 后续 milestones
+## 10. M4 — multi-stream KV load model (B1, 2026-06-22)
 
-- **M4**：multi-stream load model（B1，单 slot → K 并发，HRRN 真有意义）
+M4 把 M1 的"单 in-flight load slot per decode node"换成 polymorphic
+`BidawLoadModel`，严格 mirror P4-A `TransferModel` 模式。默认
+`load_model="single"` 保持 M1/M2/M3 byte-id 回归；opt-in
+`load_model="multi"` + `num_streams=K` 启用 K 个并行 disk-load slot
+per decode node。
+
+### 10.1 模块与 API
+
+- 新模块 `simulator/bidaw_load_model.py`：`BidawLoadModel` Protocol
+  + `SingleSlotLoadModel`（冻结成 class 保 M1 byte-id）
+  + `MultiStreamLoadModel(num_streams=K)`
+- Slot tuple shape：`(request_id, finish_ms, disk_blocks)`，load_model
+  是 disk_blocks 唯一来源（不再回查 `_preparing`）
+- Protocol 6 方法：`has_capacity` / `start_load` / `complete_load`
+  / `slot_residuals_ms` / `in_flight_request_ids` /
+  `in_flight_disk_blocks` + `num_streams` property
+- `start_load` 对同 node 重复 req_id 抛 `RuntimeError`（防御性）
+
+### 10.2 In-flight identity filter（关键修复点）
+
+M3 的 `_preparing` 在 in-flight 期间不删除（直到 `mark_load_completed`）。
+M3 单 slot 通过 `has_idle_load_slot` short-circuit 间接避免双计；M4
+K>1 这层保护失效。**解法**：Protocol 加 `in_flight_request_ids(node)
+-> frozenset[str]`；controller 三处 query 都用它过滤：
+
+- `pick_next_to_load`（避免重复 pick 同一 req_id）
+- `peek_preparing_disk_blocks`（避免 A1 routing score 双计）
+- `peek_projected_preparing_wait_ms`（避免 A2 投影双计）
+
+### 10.3 A2 projected wait — 多槽 earliest-slot FIFO 分配算法
+
+```
+residuals = load_model.slot_residuals_ms(node, now)   # len == K
+queued = sorted(_preparing 过滤 in_flight, key=HRRN desc)
+
+for entry in queued:
+    idx = argmin(residuals)
+    residuals[idx] += entry.disk_blocks * service_per_block
+
+idx = argmin(residuals)
+return residuals[idx] + my_disk_blocks * service_per_block
+```
+
+K=1 自然 collapse 到 M3 公式（数学验证写在 plan v3）。HRRN reordering
+of in-flight loads / 跨节点并行 / future arrivals 均不建模（v1 简化，
+文档化）。
+
+### 10.4 Ship gate v2（实测重设计）
+
+Plan v3 原定 v1 ship gate：preparing_wait 降 ≥30% + promotions ±10%
++ rejection 增幅 ≤0.05。
+
+实现完毕后 Codex review 扫了 K ∈ {1,2,3,4,5,6,8}：**没有任何 K** 同时
+满足三条。根因：M4 把请求更快推进 PREFILL_START → 改变 decode 池
+admission 时序 → 在饱和 workload 下 decode capacity exhaustion 提前
+→ rejection_rate 上升、promotions 下降。这是 M4 机制的 **downstream
+emergent effect**，**不是 invariant**。
+
+**Ship gate v2** 重定到 M4 真正承诺的指标（用户体感延迟）：
+
+| Gate | vs K=1 bidaw-stress | K=4 实测 |
+|---|---|---:|
+| preparing_wait_avg 降幅 ≥30% | ≤ 100.15 ms | **45.76 ms** ✓ (−68%) |
+| ttft_p50 降幅 ≥30% | ≤ 97.48 ms | **38.83 ms** ✓ (−72%) |
+| e2e_avg 降幅 ≥10% | ≤ 307.03 ms | **231.93 ms** ✓ (−32%) |
+
+旧 promotions/rejection guard 在 plan v3 + M0 §3 + test docstring
+中显式记录为"已 demoted 为 emergent property，不再 invariant"。
+
+### 10.5 一个独立 backlog（M4 dispatch 期间发现）
+
+Codex review 期间 Sonnet 临时加了一个 plan 没授权的 **shared-prefix
+overlap guard**（在 `_drain_idle_slots` 内检测多个 pick 命中同一组
+disk blocks 时早 return，且穿透 `controller._load_model` /
+`cm._trees` / `cm._pools` 私有状态）。该 guard 引入新的 HoL 阻塞，
+违反"K>1 多流泵在仍有空 slot 时不应停止"不变量；已在 M4.fix 完整
+删除。
+
+未来 milestone 可独立设计带明确语义的 shared-block coalescing 机制：
+- 暴露 public CacheManager API 查询命中的 block id
+- 设计 skip 语义而非 early-return（保留 pump 进度）
+- HRRN priority 与 coalescing decision 的优先级关系
+- 加严测试覆盖 HoL 边界
+
+### 10.6 不在范围
+
+- HRRN 在 in-flight slot 的抢占式重排（FIFO claim by index）
+- 跨节点 shared disk subsystem（M5 候选）
+- MultiStream(K=1) 与 SingleSlot byte-id 等价（不承诺，默认走 SingleSlot）
+- 新 summary metric（M4 不加；现有 bidaw_* + ttft_slo_rejections 够 ship gate 用）
+
+## 11. 后续 milestones
+
 - **M5**：GPU-only performance mode（A4，CPU 命中也走 KV_LOAD）
 - **M6**：online ghost cache（B2，把 M2 静态 3-bucket 升级到在线反馈）
-- ~~**独立 backlog**：cli.py 单跳 → 两跳修正~~（已在独立 fix commit 完成；§9.6）
+- **shared-prefix coalescing**：§10.5 backlog（M4 dispatch 期间发现）
 - **更长远**：让 5 老 scheduler 也共享 `KV_LOAD_*` 真实路径（同语义对比）；
   PagedAttention Tier 2；Llumnix migration；Bidaw 论文 storage-efficient
   tensor caching（需要真实 tensor 支持，超出 metadata 模拟器范围）

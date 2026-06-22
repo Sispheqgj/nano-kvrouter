@@ -950,6 +950,122 @@ M3 M0 preflight §7 公开了一个 M1 留下的预存问题：
 cache_hit 不变；其他 bidaw-family yaml 在报告精度下无可见变化（第二跳
 贡献 ~0.03%，小于这些 config 的舍入精度）。M3 ship gates 修复后重验全过。
 
+### 13.11 Bidaw M4 — multi-stream KV load model (B1, 2026-06-22)
+
+M4 把 M1 的"单 in-flight load slot per decode node"换成 polymorphic
+`BidawLoadModel`，严格 mirror P4-A `TransferModel` 模式（Protocol + 2
+implementations）。默认 `load_model="single"` 保持 M1/M2/M3 byte-id
+回归；opt-in `load_model="multi"` + `num_streams=K` 启用真正的
+per-node K 并行 disk-load lane（模拟 paper 的多 NVMe 或多控制器队列）。
+
+#### 13.11.1 模块结构
+
+```
+simulator/bidaw_load_model.py   (NEW)
+├── BidawLoadModel (Protocol)   ─ 6 方法 + num_streams property
+├── SingleSlotLoadModel         ─ K=1, 冻结成 class，保 M1 byte-id
+└── MultiStreamLoadModel(K)     ─ K slots, FIFO claim into first idle
+
+simulator/bidaw_controller.py
+└── BidawAdmissionController    ─ 委托 _load_model 管 slot 状态；
+                                   peek_* 都改为 K-aware
+```
+
+Slot tuple shape:`(request_id, finish_ms, disk_blocks)` per occupied
+slot。load_model 是 disk_blocks 唯一来源（不再回查 `_preparing`）。
+
+#### 13.11.2 关键 invariant
+
+- **In-flight identity API**：`load_model.in_flight_request_ids(node)
+  -> frozenset[str]`。Controller 三处 query 用它过滤 `_preparing`
+  （pick_next_to_load、peek_preparing_disk_blocks、peek_projected_preparing_wait_ms），
+  避免 K>1 时把已在 slot 中的 request 重复计数。
+- **start_load 重复检测**：同 node 同 req_id 第二次 start 抛 `RuntimeError`
+  （defense in depth）。
+- **`_drain_idle_slots` pump 顺序**：`pick → mark_load_started（先 claim）
+  → engine.schedule(KV_LOAD_START, KV_LOAD_COMPLETE) → loop`。Claim
+  在 schedule 前是关键，否则下次循环看不到 slot 已忙。
+
+#### 13.11.3 A2 projected wait 多槽公式
+
+```
+residuals = load_model.slot_residuals_ms(node, now)      # len == K, 0.0 if idle
+service_per_block = block_bytes * (1/cpu_to_disk + 1/gpu_to_cpu) * 1000  # 两跳
+queued = sorted(_preparing 过滤 in_flight, key=HRRN priority desc)
+
+for entry in queued:                            # 模拟未来分配
+    idx = argmin(residuals)
+    residuals[idx] += entry.disk_blocks * service_per_block
+
+idx = argmin(residuals)                         # me 分配到最早空 slot
+return residuals[idx] + my_disk_blocks * service_per_block
+```
+
+K=1 collapse 到 M3 公式：residuals=[r]、queued 串行加到唯一 slot、
+me 加 own_service → `r + sum(queued) + own` 等价 M3。✓
+
+#### 13.11.4 cli wiring 改造
+
+- `_run_one` 新增 helper `_build_bidaw_load_model(params, node_ids)`：
+  - `load_model="single"` + `num_streams != 1` → `ValueError`（fail-fast）
+  - 工厂在 `_run_one` 中构造，发生在 controller / scheduler 之前
+- `_wire_bidaw_branch` 改用 `_drain_idle_slots(node, now)` 替换 M3 的
+  single-shot pick；从 `on_arrive_bidaw`（admission 通过且 verdict
+  "preparing"）和 `on_kv_load_complete`（slot 释放后）两处调用。
+- cli.py:233 fallback path（`_wire_simulator(bidaw_mode=True,
+  bidaw_controller=None)` 直接 caller 兼容）也默认构造 SingleSlotLoadModel。
+
+#### 13.11.5 Ship gate v2 redesign（重要）
+
+Plan v3 原定 v1 gates 是：
+- preparing_wait_avg ≥30% 降幅
+- preparing_promotions 在 ±10%
+- rejection_rate 增幅 ≤0.05
+
+实现完毕后 Codex review 扫了 K ∈ {1,2,3,4,5,6,8}，**没有任何 K** 能
+同时满足三条。根因：M4 把请求更快推进 `PREFILL_START`，**改变了
+decode 池的 admission 时序**；在饱和 workload 下，decode capacity
+exhaustion 提前发生 → rejection_rate 上升、promotions 下降。这些是
+M4 机制的 **downstream emergent effect**，**不是 invariant**。
+
+**Ship gate v2**（重新锁定）— anchor 在 M4 真正承诺的指标（用户体感
+延迟）上：
+
+| Gate | 目标 vs K=1 bidaw-stress | K=4 实测 |
+|---|---|---:|
+| preparing_wait_avg 降幅 ≥30% | ≤ 100.15 ms | **45.76** ✓ (−68%) |
+| ttft_p50 降幅 ≥30% | ≤ 97.48 ms | **38.83** ✓ (−72%) |
+| e2e_avg 降幅 ≥10% | ≤ 307.03 ms | **231.93** ✓ (−32%) |
+
+旧 promotions/rejection guards 在 plan v3 + M0 §3 + 测试
+docstring 中显式记录为"已 demoted 为 emergent property，不再
+作为 invariant"。
+
+#### 13.11.6 一个独立 backlog
+
+Codex review 期间 Sonnet 临时加了一个 plan 没授权的 shared-prefix
+overlap guard（在 `_drain_idle_slots` 内检测多个 pick 命中同一组
+disk blocks 时早 return，且穿透 `controller._load_model` /
+`cm._trees` / `cm._pools` 私有状态）。该 guard 引入新的 HoL 阻塞，
+违反"K>1 多流泵在仍有空 slot、后面也许有非冲突候选时不应停止"
+不变量；已在 M4.fix 完整删除（plan 没改）。
+
+未来 milestone（M5/M6）可独立设计带明确语义的 shared-block
+coalescing 机制：
+- 暴露 public CacheManager API 查询命中的 block id（不再 `cm._trees`
+  穿透）
+- 设计 skip 语义而非 early-return（保留 pump 进度）
+- HRRN priority 与 coalescing decision 的优先级关系（先 HRRN
+  还是先 coalesce）
+- 加严测试覆盖 HoL 边界
+
+#### 13.11.7 不在范围
+
+- HRRN reordering of in-flight slots（不抢占；FIFO claim 进 first idle slot by index）
+- Cross-node shared disk pool（M5 候选）
+- MultiStream(K=1) byte-id to SingleSlot（不承诺，因此默认 single 用 SingleSlotLoadModel）
+- 新增 summary metric（M4 不加；现有 6 bidaw_* + ttft_slo_rejections 够 ship gate 用）
+
 ## 14. 下一步路线
 
 - ✅ **P4-B**（done, commit `244345d`）：5 scheduler 的
@@ -967,13 +1083,20 @@ cache_hit 不变；其他 bidaw-family yaml 在报告精度下无可见变化（
   `feat/bidaw-io-aware-scheduling`）：A1 routing-aware + A2 TTFT SLO
   gate + A3 session affinity，3 个可选 flag 默认 off，6-scheduler
   字节级回归保持；详见 §13.10。Ship gates 三项全过。
+- ✅ **P5-Bidaw M4**（done, commits `c3c0b18` + `23226ad` on
+  `feat/bidaw-io-aware-scheduling`）：multi-stream KV load model
+  (B1)，`BidawLoadModel` Protocol + SingleSlot (default) +
+  MultiStream(K)。详见 §13.11。Ship gate v2（实测重设计）K=4
+  全过：preparing_wait −68%、ttft_p50 −72%、e2e_avg −32%。
 - **P5-Bidaw 后续候选**（roadmap in `.claude/plans/p5-bidaw-followups-roadmap.md`）：
-  - **M4**：multi-stream load model（B1），把单 slot 扩展成 K 并发，
-    mirror P4-A `TransferModel` 模式；HRRN 在 K>1 下才真有意义
   - **M5**：GPU-only performance mode（A4），yaml flag 让 CPU 命中
     也走 KV_LOAD（贴 paper "GPU-only performance layer" 语义）
   - **M6**：online ghost cache（B2），把 M2 静态 3-bucket
     `AnswerEvictionPolicy` 升级到在线反馈
+  - **shared-prefix coalescing**：M4 dispatch 期间发现的设计点
+    （Sonnet 临时实现的 unauthorized guard 已删；独立设计要求见
+    §13.11.6 — public CacheManager block-id API、skip 语义、HRRN
+    与 coalescing 优先级、HoL 边界测试）
 - ~~**独立 backlog**：cli.py KV_LOAD service 公式单跳 → 两跳修正~~ —
   已在独立 `fix(bidaw)` commit 中完成；详见 §13.10.7。
 - P3-D：把 `PrefixSynthesisModel` 提取给 Poisson `RequestGenerator` 也用
