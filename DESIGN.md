@@ -5,7 +5,7 @@
 
 ## 1. 当前实现边界
 
-截至当前 checkout，P2-Infra M1-M6 + P3-C M1 已经落地：
+截至当前 checkout，P2-Infra M1-M6 + P3-C + P4 + P5-Bidaw M1/M2 已经落地：
 
 - M2: continuous batching
 - M3: chunked prefill
@@ -15,6 +15,9 @@
 - acceptance: config-driven `sensitivity` CLI
 - P3-C M1: real-world trace replay (Mooncake FAST'25, streaming JSONL),
   per-request `output_length` truthfully drives decode pressure
+- P4-A/B: per-node KV transfer contention + scheduler backlog-aware TTFT
+- P5-Bidaw M1/M2: I/O-aware dual queue, disk-HRRN, metadata-only
+  previous-answer-based eviction
 
 这个仓库故意不做的事情：
 
@@ -601,7 +604,7 @@ assert 返回 `(0,C)/(C,2C)/(2C,3C)/(3C,4C)`。
 并行 / shared egress 串行 / shared ingress 串行 / peek_backlog 零副
 作用）+ Noop 常量验证，全在 `tests/test_transfer_model.py`。
 
-## 13. Bidaw — I/O-aware dual-queue scheduling (P5-Bidaw M1)
+## 13. Bidaw — I/O-aware scheduling + answer eviction (P5-Bidaw M1/M2)
 
 ### 13.1 问题与建模选择
 
@@ -614,9 +617,9 @@ Bidaw (FAST'26) 论文核心：把 disk load 从估算项升级为 **关键路�
 事件**，并用 dual-queue admission controller + disk-HRRN 智能排序来调度
 load 顺序。
 
-**本次只做 I/O-aware scheduling 这一块**；论文里的 storage-efficient
-tensor caching、previous-answer eviction、CUDA stream overlap 都
-**不实现**（详见 `doc/bidaw-deliverable.md`）。
+M1 做 I/O-aware scheduling；M2 增加 previous-answer-based eviction 的
+metadata-only 近似。论文里的 storage-efficient tensor caching、真实 storage
+engine、CUDA stream overlap 仍 **不实现**（详见 `doc/bidaw-deliverable.md`）。
 
 ### 13.2 模块结构（separate from 5 existing schedulers）
 
@@ -631,6 +634,12 @@ tensor caching、previous-answer eviction、CUDA stream overlap 都
 - `cli.py`：在 `_wire_simulator` 中加 `bidaw_mode: bool = False` 关键字
   参数（默认 False 保持 13 个 hidden caller 兼容）。`scheduler.name ==
   "bidaw"` 时 `_run_one` 传 `True`，激活 Bidaw 专用 wiring 分支。
+- `kv_cache/answer_eviction.py`：M2 answer-length bucket profile，把
+  `previous_answer_length` 映射成 hit potential。
+- `simulator/trace_generator.py`：`prefix_mode="session_history"`，根据
+  session 历史 query+answer 合成交互式 prompt prefix。
+- `scripts/convert_interactive_workload.py`：把 Bidaw public workload CSV
+  schema 转成内部 JSONL，并可导出 bucket potential profile。
 
 ### 13.3 事件路径（新增 2 个 EventType）
 
@@ -662,10 +671,12 @@ Controller 取 `max(response_ratio)`——小 KV 起始 ratio 高（denominator 
 
 ### 13.4 关键 commitments
 
-1. **Request-local gating (M1)**：`KV_LOAD_COMPLETE` 只让 *该请求* 进入
-   `PREFILL_START`；**不动 `BlockPool` tier 状态**。同 prefix 后续请求
-   仍会看到 disk hit，这是已知 fidelity gap。物理 disk→cpu promotion 是
-   M1.5（后续独立 commit）。
+1. **Dual-queue gating + metadata promotion**：`KV_LOAD_COMPLETE` 先让
+   *该请求* 从 preparing 变成 ready，再通过 `CacheManager.
+   promote_matched_disk_blocks_to_cpu()` 尝试把匹配前缀中的 disk blocks
+   移到 CPU tier。promotion 仍是 metadata-only：没有真实 tensor copy；
+   CPU/GPU 都被视为 Bidaw 的 performance/ready layer。若 CPU 无容量或
+   block 被 pin，则记录 skipped，不阻塞该请求进入 `PREFILL_START`。
 2. **Double-charging guard**：`BidawPolicy.schedule()` 把 `CacheLookup.
    transfer_cost_ms` 中的 disk 部分清零（cpu 部分保留——KV_LOAD 只 replay
    disk 不 replay cpu reload）后传 `compute_est_ttft`。事件路径自然付出
@@ -684,19 +695,32 @@ Controller 取 `max(response_ratio)`——小 KV 起始 ratio 高（denominator 
    single slot 序列化 / promotion-on-load-complete）证明算法正确性。
    实际 `bidaw.yaml` demo 上 preparing wait = 0（load 0.37ms ≪ 67ms 到
    达间隔），HRRN 在该 yaml 上是 dead code——见 §13.6 caveat。
+5. **Previous-answer-based eviction 是 opt-in**：只有 `scheduler="bidaw"`
+   且 `scheduler.params.enable_answer_eviction=true` 时，`CacheManager`
+   才注入 `AnswerEvictionPolicy`。Block metadata 记录 session id、上一轮
+   answer length 和 hit potential；CPU promotion 需要腾空间时优先 demote
+   低 potential CPU block。没有真实 tensor，也没有在线 ghost cache。
 
-### 13.5 Metrics（4 个新字段）
+### 13.5 Metrics（Bidaw 字段）
 
 ```python
 bidaw_preparing_wait_avg_ms     # 在 preparing 队列等了多久才 KV_LOAD_START
 bidaw_preparing_wait_p99_ms     # 同上 p99
 bidaw_disk_load_service_avg_ms  # 单次 disk load 服务时间（KV_LOAD interval）
 bidaw_preparing_promotions      # 进过 preparing 队列的请求数
+bidaw_physical_promoted_blocks  # KV_LOAD_COMPLETE 后实际 disk→CPU 的块数
+bidaw_physical_skipped_blocks   # CPU 无容量 / pinned 导致未 promote 的块数
+bidaw_answer_eviction_count     # answer-aware CPU demotion 次数
+bidaw_answer_evicted_blocks     # answer-aware demote 的 block 数
+bidaw_answer_eviction_cpu_saved_blocks  # 为 incoming promotion 腾出的 CPU slots
+bidaw_answer_eviction_hit_potential_avg # 被逐出 block 的平均 hit potential
+bidaw_answer_eviction_cpu_hit_rate      # session hits 中 CPU / (CPU + Disk)
 ```
 
 5 老 scheduler 上这些字段值为 `0.0` / `0`（不是 `None`），让 sweep JSON
 schema 统一。MetricsCollector 复用现有 `_seen_transfer_ids` stale-guard
-模式来 guard `KV_LOAD_*` 事件。
+模式来 guard `KV_LOAD_*` 事件。Answer eviction counters 由 `CacheManager`
+统计，`cli._run_one()` 在返回 summary 前 merge。
 
 **第 5 个 metric `bidaw_ready_queue_wait_avg_ms` 在 M1 review 阶段删了**：
 原 dispatch §3 over-spec，实际所有请求（ready 路径和 preparing 路径完成
@@ -709,8 +733,8 @@ load 后）都立即进 `PREFILL_START`，没有"ready queue wait"语义。
 `configs/bidaw.yaml` 用 `request_rate=15`（67ms 到达间隔），单次 disk
 load 服务时间 0.37ms，slot 几乎永远 idle。preparing 队列从不积压，HRRN
 排序在 demo 上是 dead code。这**不是 bug**——HRRN 正确性由单元测试守。
-要在 demo 里展示 HRRN under contention，需要单独 `bidaw-stress.yaml`
-（更慢 `cpu_to_disk` 或更高 request_rate），M1.5 / 后续工作。
+要在 demo 里展示 HRRN under contention，使用 `configs/bidaw-stress.yaml`
+（更慢 `cpu_to_disk` + 更高 request_rate）。
 
 **Caveat 2：cache_hit_ratio 比 conductor 低，但 e2e_avg_ms 比 conductor 短**
 
@@ -724,8 +748,7 @@ scheduler 都走 `KV_LOAD_*` 事件路径——这是 P6 候选（"让所有 sch
 
 ### 13.7 Hard gates（10 条全过）
 
-- pytest 488 passed（460 + 28 new = 26 net new tests; 1 dead metric
-  test removed）
+- pytest 497 passed
 - 5 老 scheduler 在 6 老 yaml 上 byte-identical
 - bidaw.yaml sweep 6 行，5 老行匹配 M0 Candidate J baseline
 - 任意 disk-hit 请求 `KV_LOAD_COMPLETE.time ≤ PREFILL_START.time`
@@ -735,15 +758,22 @@ scheduler 都走 `KV_LOAD_*` 事件路径——这是 P6 候选（"让所有 sch
 
 详见 `doc/bidaw-deliverable.md` ship 判定段。
 
-### 13.8 未来工作
+### 13.8 Previous-answer eviction fidelity
 
-- **M1.5**：物理 disk→cpu promotion via `CacheManager.
-  promote_matched_disk_blocks_to_cpu()`，需要 cpu_blocks > 0 的新 yaml
-- **bidaw-stress.yaml**：让 preparing wait > 0 + HRRN 在 demo 里活起来
+- 已实现：`Request.session_id / round_index / query_len /
+  previous_answer_len` 元数据；session-history trace replay；profile-driven
+  bucket potential；CPU 满时低 potential block 优先让位；metrics。
+- 未实现：真实 storage-efficient tensor caching；真实 KV tensor eviction；
+  在线 ghost cache residency；CUDA stream overlap。
+- 语义边界：M2 只改变 CPU-tier victim selection，不改变老 scheduler routing，
+  不改变 `CacheManager.lookup()` 的 tier-cost 公式。
+
+### 13.9 未来工作
+
 - **P6**：让 5 老 scheduler 也共享 `KV_LOAD_*` 真实事件路径，从而能真
   对比 cache_hit / e2e（破解 §13.6 caveat 2）
-- **完整 Bidaw 论文**：storage-efficient tensor caching / previous-
-  answer eviction / CUDA stream overlap 都不在范围
+- **完整 Bidaw 论文**：storage-efficient tensor caching / CUDA stream overlap
+  仍不在范围
 
 ## 14. 下一步路线
 
@@ -752,12 +782,14 @@ scheduler 都走 `KV_LOAD_*` 事件路径——这是 P6 候选（"让所有 sch
   metric `kv_transfer_queued_avg_ms` 已上。详见 §12.5。
 - ✅ **P5-Bidaw M1**（done, commit `6d1cf50` on `feat/bidaw-io-aware-
   scheduling`）：I/O-aware dual-queue scheduling、disk-HRRN、KV_LOAD_*
-  事件路径、4 个新 metrics、6 scheduler sweep table。详见 §13。
+  事件路径、6 个 Bidaw metrics、6 scheduler sweep table。详见 §13。
+- ✅ **P5-Bidaw M1.5**：`KV_LOAD_COMPLETE` 后 metadata-only
+  disk→CPU promotion + `configs/bidaw-stress.yaml`，让 preparing queue
+  在系统 demo 中真实积压。
+- ✅ **P5-Bidaw M2**：metadata-only previous-answer-based eviction +
+  session-history trace replay + Interactive-conversation workload converter。
 - P3-D：把 `PrefixSynthesisModel` 提取给 Poisson `RequestGenerator` 也用
   （硬约束：default yaml 行为零漂移，opt-in only）
-- P5-Bidaw 后续：
-  - **M1.5**：物理 disk→cpu promotion + cpu_blocks > 0 的 bidaw 变体
-  - **bidaw-stress.yaml**：让 preparing queue 真的积压、HRRN 在 demo 活
 - P6 候选：
   - **PagedAttention Tier 2**：让 CPU/Disk 块真正动起来（demote/promote
     路径、HiCache 命中链、prefill cache_miss 不再只看 GPU 命中）

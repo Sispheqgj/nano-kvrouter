@@ -1,0 +1,56 @@
+# nano-kvrouter — Bidaw previous-answer eviction fixture demo
+#
+# Uses a tiny synthetic fixture in the Interactive-conversation-workload schema.
+# For real experiments, convert the upstream CSV with:
+#   python scripts/convert_interactive_workload.py input.csv trace.jsonl --profile-json profile.json
+
+cluster:
+  prefill_nodes: 1
+  decode_nodes: 1
+
+node:
+  capacity: 16
+  gpu_blocks: 10
+  cpu_blocks: 3
+  disk_blocks: 4000
+
+model:
+  block_size: 16
+  kv_bytes_per_token: 4096
+  prefill_cost_per_token_ms: 0.04
+  decode_base_ms: 5.0
+  marginal_decode_ms: 0.5
+  prefill_chunk_size: 512
+
+bandwidth:
+  gpu_to_gpu: 3.0e11
+  gpu_to_cpu: 3.2e10
+  cpu_to_disk: 1.0e7
+  contention_model: none
+
+slo:
+  ttft_target_ms: 5000.0
+  tbt_target_ms: 100.0
+
+workload:
+  request_rate: 10.0
+  duration_s: 1.0
+  prefix_sharing_ratio: 0.0
+  avg_prompt_len: 64
+  avg_output_len: 16
+
+generator:
+  num_buckets: 1
+  vocab_size: 32000
+  seed: 42
+
+trace:
+  path: ../tests/fixtures/interactive_conversation.jsonl
+  max_requests: 6
+  prefix_mode: session_history
+
+scheduler:
+  name: bidaw
+  params:
+    enable_answer_eviction: true
+    answer_eviction_profile_path: ../tests/fixtures/interactive_eviction_profile.json

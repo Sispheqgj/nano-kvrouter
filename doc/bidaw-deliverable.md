@@ -1,14 +1,14 @@
-# P5-Bidaw M1 交付总结（中文）
+# P5-Bidaw M1/M2 交付总结（中文）
 
 > **范围**：Bidaw (FAST'26) 论文的 I/O-aware request scheduling 层
-> 在 nano-kvrouter 上的 metadata-level event-driven 模拟实现。
+> + previous-answer-based eviction 的 metadata-level 模拟实现。
 > **不**包含真实 storage engine、CUDA stream、tensor caching、
-> previous-answer eviction 等论文其他模块。
+> storage-efficient tensor caching 等论文底层模块。
 >
 > **分支**：`feat/bidaw-io-aware-scheduling`
-> **Commit**：`6d1cf50 feat(scheduler): Bidaw I/O-aware dual-queue scheduling (P5-Bidaw M1)`
+> **Commit**：M1 为 `6d1cf50`；M2 当前在本工作树实现，待提交。
 > **基线**：`origin/main = 3767be9`（P4-B 后）
-> **测试**：488 passed（460 baseline + 28 新增 - 2 dead-metric 清理 = 26 net）
+> **测试**：497 passed。
 >
 > 完整设计：DESIGN §13。本文档面向用户的 ship 判定 + 论文-实现 mapping。
 
@@ -23,18 +23,23 @@
 | KV load 作为关键路径事件 | 新增 `EventType.KV_LOAD_START` / `KV_LOAD_COMPLETE`；preparing 请求必须等 `KV_LOAD_COMPLETE` 才能 `PREFILL_START` | `src/nano_kvrouter/simulator/event.py:94-95` + cli wiring |
 | Per-node 单 load slot | `_in_flight_load: dict[str, str \| None]`；`mark_load_started` busy 时 raise；同节点 disk loads 串行，跨节点并行 | `bidaw_controller.py:142-152` |
 | Request-local promote to ready | `KV_LOAD_COMPLETE` 触发 `mark_load_completed` → 控制器把请求从 preparing 取出 → cli 调度 `PREFILL_START` | `bidaw_controller.py:154-180` + cli wiring |
+| Metadata disk→CPU promotion | `KV_LOAD_COMPLETE` 后调用 `CacheManager.promote_matched_disk_blocks_to_cpu()`，把匹配前缀中的 disk blocks 尝试移动到 CPU tier | `src/nano_kvrouter/kv_cache/cache_manager.py` + cli wiring |
+| Previous-answer-based eviction（M2） | request 携带 `session_id/previous_answer_len`；CacheManager 给 blocks 打 hit-potential 元数据；CPU 满时优先 demote 低潜力 block | `src/nano_kvrouter/kv_cache/answer_eviction.py` + `cache_manager.py` |
+| Interactive workload converter（M2） | 把 `User_id, Timestamp(seconds), Query_length, Response_length, Round_index` 转成 session-history JSONL，并生成 answer profile JSON | `scripts/convert_interactive_workload.py` |
+| Session-history trace replay（M2） | `trace.prefix_mode: session_history` 根据同一 session 的历史 query+answer 合成 prompt prefix | `src/nano_kvrouter/simulator/trace_generator.py` |
 | Double-charging guard | `BidawPolicy.schedule` 把 disk 部分从 `transfer_cost_ms` 减掉再传 `compute_est_ttft`，避免估算 + 真实路径双计费 | `bidaw.py:141-160` |
 | 选择性 scheduler 启用 | `cli.py` `SCHEDULER_NAMES` 加 `"bidaw"`；`_wire_simulator(bidaw_mode=False)` 默认值保护其他 13 个 hidden caller；只有 `scheduler.name=="bidaw"` 时构造 controller + 接 KV_LOAD handlers | `src/nano_kvrouter/cli.py:62/124/816 area` |
-| 4 个新 metrics | `bidaw_preparing_wait_avg_ms` / `_p99_ms` / `bidaw_disk_load_service_avg_ms` / `bidaw_preparing_promotions` | `src/nano_kvrouter/metrics/collector.py` |
+| Bidaw metrics | preparing wait / disk-load service / preparing promotions / physical promoted+skipped blocks / answer eviction counters | `src/nano_kvrouter/metrics/collector.py` + `CacheManager.answer_eviction_summary()` |
 
 ## 2. 哪些是 simulator 近似
 
 | 项 | 近似形式 | 与论文差距 |
 |---|---|---|
-| KV block tier 状态 | **Request-local gating only**：`KV_LOAD_COMPLETE` 仅让该请求进 `PREFILL_START`，不动 `BlockPool.tier_of(bid)`。同 prefix 后续请求仍看到 disk hit | 论文里 load 完成后 block 应该物理上在 performance layer。本项目把这点降级为 metadata-level 标记，避免动 CacheManager 不变量 |
+| KV block tier 状态 | `KV_LOAD_COMPLETE` 后会尝试 metadata-only disk→CPU promotion；CPU 无容量或 block pinned 时会 skip | 论文里是真实 tensor residency；本项目只移动 block metadata，不复制 tensor |
 | Load 并发度 | **每 decode node 一个 in-flight slot**，跨节点并行 | 论文 figure 7 可能允许多 stream 并发；本项目用 single slot 是 P4-A `TransferModel` 模式的简化复用 |
 | Storage 带宽 | 沿用 `bandwidth.cpu_to_disk` 算 service_time = `disk_blocks * block_bytes / cpu_to_disk * 1000` | 论文真实 NVMe / SSD 异步 I/O；本项目是静态带宽公式 |
 | Performance layer 映射 | gpu + cpu tier 都视为 "ready"，disk tier 视为 "preparing" | 论文严格按 GPU HBM = performance；本项目把 CPU DRAM 也算 performance（避免 CPU hit 也走 KV_LOAD，与 P4-A/B 的 cache_load_ms 估算冲突） |
+| Previous-answer eviction | 用 previous answer length bucket 估计 hit potential，CPU promotion 需要腾空间时按 potential 选 victim | 论文有 ghost cache / weighted reuse distance 分析；本项目只保留 profile 结果和控制面选择，不实现真实 tensor eviction |
 | Bidaw 路由策略 | decode_node 选 `min(current_load)`，prefill_node round-robin | 论文 Bidaw 论文重点不在 routing 是 I/O gating；本项目沿用 least_loaded 风格保持简单 |
 | Scheduler 估算与真实事件的关系 | `BidawPolicy.schedule` 把 disk 部分清零；保留 cpu 部分；CPU reload 仍由 `compute_est_ttft` 估算 | 论文里 estimate 与 runtime 应一致；本项目保持 5 老 scheduler 估算路径不变 + Bidaw 单独走真实事件 |
 
@@ -44,12 +49,11 @@
 |---|---|
 | **Storage-efficient tensor caching** | 需要真实 tensor format conversion + memory layout，超出 metadata 模拟器尺度 |
 | **CUDA stream overlap** | 项目 AGENTS.md 明确"no real GPU execution; all time is simulated"，stream 模型与事件循环架构不匹配 |
-| **Previous-answer-based eviction** | 论文可选机制，需要 RadixTree 加 "answer block" 标记 + LRU 交互重写，是独立 ½ 周工作量 |
-| **Ghost cache / answer-length hit potential** | 论文优化项，本次只做 I/O scheduling 主线 |
+| **真实 previous-answer tensor eviction** | 已实现控制面元数据近似，但不保存/移动/压缩真实 KV tensor |
+| **Ghost cache 在线模拟** | 当前只读离线 profile 的 bucket potential，不维护真实 ghost cache residency |
 | **Cross-node KV migration** | Llumnix 领域，不是 Bidaw 论文核心 |
 | **真实 disk async I/O / SSD model** | 同上 metadata 边界 |
-| **物理 disk→cpu/gpu promotion**（M1.5） | 主线已 ship；promotion 是独立增强，需要 cpu_blocks > 0 的新 yaml，单独 commit |
-| **HRRN under real contention demo** | bidaw.yaml load 0.37ms ≪ 67ms 到达间隔，preparing 队列从不积压。HRRN 单元测试覆盖正确性，但 demo 上是 dead code。需要 `bidaw-stress.yaml`（更慢 disk 或更高 rate）单独工作 |
+| **真实 disk→cpu/gpu tensor promotion** | 已实现 metadata-only disk→CPU tier move，但不复制真实 tensor |
 
 ## 4. 对比表：round_robin / conductor / bidaw on `configs/bidaw.yaml`
 
@@ -77,29 +81,37 @@
 
 ## 5. 测试覆盖
 
-**新增 28 个测试（26 net new + 2 fix-round-added）**：
+**新增/扩展的测试覆盖**：
 
 - `tests/test_bidaw_scheduler.py` (~8 tests)：HRRN 数学正确性、BidawPolicy 双计费 guard 在 CPU+Disk mixed hit 下正确（Codex M1.fix 抓到的 important #1）、no-disk fallback、决策签名兼容
 - `tests/test_bidaw_controller.py` (~5 tests)：ready/preparing classification、HRRN pick、single slot serialization、`mark_load_started` busy 时 raise（M1.fix nit #4）、promotion on complete
-- `tests/test_bidaw_cli.py` (~12 tests)：事件路径序列化（`KV_LOAD_COMPLETE ≤ PREFILL_START`）、head-of-line absence（真实 timestamp 断言，M1.fix important #3 重写）、no-disk workload 退化、6 scheduler sweep table、metrics 填充、stale-guard 防 unknown KV_LOAD_COMPLETE 污染
+- `tests/test_bidaw_cli.py`：事件路径序列化（`KV_LOAD_COMPLETE ≤ PREFILL_START`）、head-of-line absence、physical promotion、stress yaml preparing wait、no-disk workload 退化、6 scheduler sweep table、metrics 填充、stale-guard 防 unknown KV_LOAD_COMPLETE 污染
+- `tests/test_cache_manager.py`：`promote_matched_disk_blocks_to_cpu()` 成功 promotion 与 CPU 容量不足 skip；answer-aware eviction 优先逐出 low-potential CPU block
+- `tests/test_trace_generator.py`：`session_history` 模式保留同 session 历史 prompt
+- `tests/test_convert_interactive_workload.py`：Interactive-conversation-workload CSV 转 JSONL/profile
+- `tests/test_metrics_collector.py`：Bidaw physical promoted/skipped block 计数；answer eviction 默认字段
 
-**回归保护**：5 老 scheduler 在 6 老 yaml（default / heavy / hicache / pd_split / trace_mooncake / trace_burstgpt）上 byte-identical；sensitivity 13/13 PASS；prefix-sensitivity 表不变；`configs/transfer_contention.yaml` 不变。Hard guards：
+**回归保护**：5 老 scheduler 仍不进入 Bidaw controller；老 yaml 不需要新增字段；`CacheManager` 只新增 opt-in promotion API，现有 lookup/admit/release 行为由全量测试覆盖。
 
-- `git diff src/nano_kvrouter/kv_cache/ scheduler/{base,round_robin,least_loaded,prefix_greedy,e2_policy,conductor}.py simulator/transfer_model.py` = 0 lines
-- `git diff configs/{default,heavy,hicache,pd_split,sensitivity,trace_mooncake,trace_burstgpt,transfer_contention}.yaml` = 0 lines
-- `rg "pool\.move|promote_matched" src/nano_kvrouter/scheduler/bidaw.py src/nano_kvrouter/simulator/bidaw_controller.py` = 0 hits（M1 不动 BlockPool）
+Hard checks:
+
+- `uv run pytest -q` -> 497 passed
+- `uv run python -m nano_kvrouter.cli run --config configs/bidaw.yaml --scheduler bidaw`
+- `uv run python -m nano_kvrouter.cli run --config configs/bidaw-stress.yaml --scheduler bidaw`
+- `uv run python -m nano_kvrouter.cli run --config configs/bidaw-interactive.yaml --scheduler bidaw`
 
 ## 6. Ship 判定
 
 ### Critical (block ship)
 
-**无**。M1 + M1.fix 后 Codex YES，全部 488 测试通过，5 老 scheduler 行为不变。
+**无**。M1/M2 后全部 497 测试通过，5 老 scheduler 行为不变。
 
-### Important（建议在 M1.5 / 后续解决，不阻塞 M1 ship）
+### Important（当前机制边界 / 后续注意）
 
-1. **`bidaw_preparing_wait` 在 demo 上恒为 0**。HRRN 单元测试覆盖了算法，但 `bidaw.yaml` 这个 workload 没把 preparing queue 压出来。**建议**：M1.5 加 `configs/bidaw-stress.yaml`（slower `cpu_to_disk` 或更高 `request_rate`）让 demo 上 HRRN 真的活起来。
-2. **物理 disk→cpu promotion 缺失**。M1 是 request-local gating；同 prefix 后续请求仍看到 disk hit，与论文真实行为有差距。**建议**：M1.5 加 `CacheManager.promote_matched_disk_blocks_to_cpu()` + 修改 `bidaw.yaml` 让 `cpu_blocks > 0`。
+1. **`bidaw.yaml` 仍是低压 demo**。该配置 `cpu_blocks=0`，所以物理 promotion 会全部 skipped，且 preparing wait 仍为 0。看 HRRN 积压应使用 `configs/bidaw-stress.yaml`。
+2. **物理 promotion 仍是 metadata-only**。它移动 `BlockPool` tier，不复制真实 tensor，也不建 CUDA/storage stream。
 3. **bidaw vs conductor 不是同语义对比**。conductor 的 cache_hit 看起来更好但不付真实 disk load；要真对比需要让 5 老 scheduler 也走 `KV_LOAD_*` 路径。**建议**：P6 候选项，需要单独 plan。
+4. **previous-answer eviction 是控制面近似**。它依赖 trace/profile 提供 previous answer length 与 bucket potential；没有真实 tensor cache layout，也没有在线 ghost cache。
 
 ### Nit
 
@@ -108,9 +120,9 @@
 
 ### 综合判定
 
-**✅ Can ship M1 as-is**。论文 I/O-aware scheduling 核心机制（dual queue + disk-HRRN + 真实 KV_LOAD events + single slot per decode node + request-local gating）全部实现且测试覆盖到位；5 老 scheduler 行为零漂移；4 个新 metrics 提供 observability。两个"价值不够直观"的 caveat（preparing_wait=0、cache_hit 看似输 conductor）都是 demo workload 选择 + 同语义对比缺失导致的展示问题，**不是实现缺陷**。
+**✅ Can ship M1/M2 simulator implementation**。论文 I/O-aware scheduling 核心机制（dual queue + disk-HRRN + 真实 KV_LOAD events + single slot per decode node + metadata disk→CPU promotion）已实现；previous-answer-based eviction 作为 metadata/control-plane 近似已实现；5 老 scheduler 行为不变。
 
-后续工作明确分阶段（M1.5 promotion + bidaw-stress、P6 全 scheduler 共享 KV_LOAD 路径），不影响 M1 的"独立可 ship"判定。
+后续仍应单独做 P6 全 scheduler 共享 KV_LOAD 路径，避免 bidaw/conductor 对比语义不一致。
 
 ## 7. 验证命令
 
@@ -120,7 +132,7 @@ git checkout feat/bidaw-io-aware-scheduling
 
 # 全套测试
 uv run pytest -q
-# → 488 passed
+# → 497 passed
 
 # Bidaw 单独测试
 uv run pytest tests/test_bidaw_scheduler.py tests/test_bidaw_controller.py tests/test_bidaw_cli.py -v
@@ -134,6 +146,10 @@ uv run python -m nano_kvrouter.cli sweep --config configs/bidaw.yaml \
 uv run python -m nano_kvrouter.cli run --config configs/bidaw.yaml \
     --scheduler bidaw
 
+# 单跑 interactive fixture（验证 session_history + answer eviction profile wiring）
+uv run python -m nano_kvrouter.cli run --config configs/bidaw-interactive.yaml \
+    --scheduler bidaw
+
 # 5 老 scheduler byte-identical 回归
 uv run python -m nano_kvrouter.cli sweep --config configs/default.yaml
 uv run python -m nano_kvrouter.cli sweep --config configs/hicache.yaml
@@ -142,35 +158,36 @@ uv run python -m nano_kvrouter.cli sensitivity --config configs/sensitivity.yaml
 
 ## 8. 文件清单
 
-**新增** (6)：
-- `src/nano_kvrouter/scheduler/bidaw.py` (179 LOC)
-- `src/nano_kvrouter/simulator/bidaw_controller.py` (218 LOC)
-- `configs/bidaw.yaml` (56 lines)
-- `tests/test_bidaw_scheduler.py` (~340 LOC, 8 tests)
-- `tests/test_bidaw_controller.py` (~170 LOC, 6 tests)
-- `tests/test_bidaw_cli.py` (~385 LOC, 14 tests)
+**新增/主要文件**：
+- `src/nano_kvrouter/scheduler/bidaw.py`
+- `src/nano_kvrouter/simulator/bidaw_controller.py`
+- `src/nano_kvrouter/kv_cache/answer_eviction.py`
+- `scripts/convert_interactive_workload.py`
+- `src/nano_kvrouter/kv_cache/cache_manager.py`
+- `src/nano_kvrouter/cli.py`
+- `src/nano_kvrouter/metrics/collector.py`
+- `src/nano_kvrouter/simulator/trace_generator.py`
+- `src/nano_kvrouter/request.py`
+- `src/nano_kvrouter/config.py`
+- `configs/bidaw.yaml`
+- `configs/bidaw-stress.yaml`
+- `configs/bidaw-interactive.yaml`
+- `tests/fixtures/interactive_conversation.jsonl`
+- `tests/fixtures/interactive_eviction_profile.json`
+- `tests/test_bidaw_scheduler.py`
+- `tests/test_bidaw_controller.py`
+- `tests/test_bidaw_cli.py`
+- `tests/test_cache_manager.py`
+- `tests/test_metrics_collector.py`
 
-**修改** (5)：
-- `src/nano_kvrouter/cli.py` (+229)：`"bidaw"` in `SCHEDULER_NAMES` + factory branch + `_wire_simulator(bidaw_mode=False)` + 3 hardcoded "5-scheduler" literals 替换
-- `src/nano_kvrouter/metrics/collector.py` (+56)：4 新 metric 字段 + 2 新 event handler + stale guard
-- `src/nano_kvrouter/simulator/event.py` (+21)：`KV_LOAD_START` / `KV_LOAD_COMPLETE` enum + lifecycle docstring
-- `tests/test_event.py` (+4)：expected enum-name set 加 2 个
-- `tests/test_metrics_collector.py` (+2)：handler attach 测试
-
-**未改**（regression hard guard）：
-- `src/nano_kvrouter/kv_cache/` 整个目录
-- `src/nano_kvrouter/scheduler/{base,round_robin,least_loaded,prefix_greedy,e2_policy,conductor}.py`
-- `src/nano_kvrouter/simulator/transfer_model.py`
-- `src/nano_kvrouter/simulator/{generator,trace_generator,prefix_synthesis}.py`
-- `src/nano_kvrouter/engine/mock_node.py`
-- `src/nano_kvrouter/config.py` / `request.py`
-- `configs/{default,heavy,hicache,pd_split,sensitivity,trace_mooncake,trace_burstgpt,transfer_contention}.yaml`
+**回归 hard guard**：
+5 个老 scheduler 不进入 Bidaw controller；老 configs 不需要 `scheduler.params`
+新增字段；answer eviction 默认关闭，只有 `scheduler="bidaw"` 且
+`enable_answer_eviction: true` 时才注入 `AnswerEvictionPolicy`。
 
 ## 9. 后续 milestones
 
-- **M1.5**：物理 disk→cpu promotion via `CacheManager.promote_matched_disk_blocks_to_cpu()` + `configs/bidaw-cpu.yaml`（cpu_blocks > 0）
-- **bidaw-stress.yaml**：让 preparing wait > 0、HRRN 在 demo 真的活
 - **P6 候选**：让 5 老 scheduler 也共享 `KV_LOAD_*` 真实路径（同语义对比）；PagedAttention Tier 2；Llumnix migration；speculative decoding
-- **Bidaw 论文其他模块**（如果用户要做）：previous-answer eviction（½ 周）、storage-efficient tensor caching（需要真实 tensor format 支持，超出 metadata 模拟器范围）
+- **Bidaw 论文其他模块**（如果用户要做）：storage-efficient tensor caching（需要真实 tensor format 支持，超出 metadata 模拟器范围）
 
 详见 DESIGN §14 路线表。

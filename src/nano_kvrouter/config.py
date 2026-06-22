@@ -237,11 +237,12 @@ class TraceConfig(BaseModel):
         ge=1,
         description="Stop after replaying this many requests. None = full trace.",
     )
-    prefix_mode: Literal["none", "hash_ids", "synthesis"] = Field(
+    prefix_mode: Literal["none", "hash_ids", "synthesis", "session_history"] = Field(
         default="hash_ids",
         description=(
             "How to derive token_ids: none=random, hash_ids=expand "
-            "from trace.hash_ids (Mooncake), synthesis=M2 only."
+            "from trace.hash_ids (Mooncake), synthesis=M2 only, "
+            "session_history=interactive conversation trace."
         ),
     )
     prefix_synthesis: PrefixSynthesisConfig | None = Field(

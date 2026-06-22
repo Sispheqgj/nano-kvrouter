@@ -38,8 +38,13 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 
 from nano_kvrouter.config import BandwidthConfig, ModelConfig, NodeConfig
+from nano_kvrouter.kv_cache.answer_eviction import (
+    AnswerEvictionPolicy,
+    AnswerEvictionStats,
+)
 from nano_kvrouter.kv_cache.block_table import RequestBlockTable
 from nano_kvrouter.kv_cache.block_pool import BlockPool
 from nano_kvrouter.kv_cache.radix_tree import RadixTree
@@ -51,7 +56,52 @@ logger = logging.getLogger(__name__)
 __all__ = ["CacheManager", "RequestBlockTable"]
 
 
-def _demote_block(pool: BlockPool, tree: RadixTree, bid: str) -> None:
+@dataclass(slots=True)
+class _BlockEvictionMeta:
+    session_id: str
+    previous_answer_len: int | None
+    round_index: int | None
+    hit_potential: float
+
+
+def _select_answer_eviction_cpu_bid(
+    pool: BlockPool,
+    tree: RadixTree,
+    protected_block_ids: set[str],
+    block_meta: dict[str, _BlockEvictionMeta],
+    policy: AnswerEvictionPolicy,
+) -> tuple[str, float] | None:
+    candidates: list[tuple[float, float, str]] = []
+    for node in tree._nodes.values():
+        if node.children or node.ref_count > 0:
+            continue
+        for bid in node.block_ids:
+            if bid in protected_block_ids:
+                continue
+            if pool.tier_of(bid) != "cpu" or pool.pin_count(bid) > 0:
+                continue
+            meta = block_meta.get(bid)
+            potential = (
+                meta.hit_potential
+                if meta is not None
+                else policy.default_potential
+            )
+            candidates.append((potential, node.last_access_time, bid))
+    if not candidates:
+        return None
+    potential, _last_access, bid = min(candidates)
+    return bid, potential
+
+
+def _demote_block(
+    pool: BlockPool,
+    tree: RadixTree,
+    bid: str,
+    *,
+    answer_eviction_policy: AnswerEvictionPolicy | None = None,
+    block_meta: dict[str, _BlockEvictionMeta] | None = None,
+    stats: AnswerEvictionStats | None = None,
+) -> None:
     """Cascade one block down the tier hierarchy until it finds a free slot.
 
     GPU → CPU → Disk → free (no-op if block already freed / None).
@@ -74,22 +124,84 @@ def _demote_block(pool: BlockPool, tree: RadixTree, bid: str) -> None:
         raise MemoryError(f"block {bid!r} is pinned and cannot be demoted")
     s = pool.stats()
     if current == "gpu":
-        if s["cpu"]["free"] > 0:
+        if s["cpu"]["free"] > 0 or _make_cpu_room(
+            pool,
+            tree,
+            {bid},
+            answer_eviction_policy=answer_eviction_policy,
+            block_meta=block_meta,
+            stats=stats,
+        ):
             pool.move(bid, "gpu", "cpu")
         elif s["disk"]["free"] > 0:
             pool.move(bid, "gpu", "disk")
         else:
             pool.free([bid])
+            if block_meta is not None:
+                block_meta.pop(bid, None)
             tree.purge_block_ids([bid], pool.tier_of)
     elif current == "cpu":
         if pool.stats()["disk"]["free"] > 0:
             pool.move(bid, "cpu", "disk")
         else:
             pool.free([bid])
+            if block_meta is not None:
+                block_meta.pop(bid, None)
             tree.purge_block_ids([bid], pool.tier_of)
     elif current == "disk":
         pool.free([bid])
+        if block_meta is not None:
+            block_meta.pop(bid, None)
         tree.purge_block_ids([bid], pool.tier_of)
+
+
+def _make_cpu_room(
+    pool: BlockPool,
+    tree: RadixTree,
+    protected_block_ids: set[str],
+    *,
+    answer_eviction_policy: AnswerEvictionPolicy | None = None,
+    block_meta: dict[str, _BlockEvictionMeta] | None = None,
+    stats: AnswerEvictionStats | None = None,
+) -> bool:
+    """Free one CPU-tier slot by demoting an unpinned LRU CPU block.
+
+    Bidaw disk-load completion promotes matched disk blocks into the
+    performance layer (CPU in this metadata simulator). When CPU is full,
+    reuse the existing tree-preserving demotion chain for an unpinned CPU
+    block, but never demote blocks from the request currently being loaded.
+    """
+    if pool.stats()["cpu"]["free"] > 0:
+        return True
+
+    if answer_eviction_policy is not None and block_meta is not None:
+        picked = _select_answer_eviction_cpu_bid(
+            pool, tree, protected_block_ids, block_meta, answer_eviction_policy
+        )
+        if picked is not None:
+            bid, potential = picked
+            _demote_block(pool, tree, bid, block_meta=block_meta)
+            if stats is not None:
+                stats.eviction_count += 1
+                stats.evicted_blocks += 1
+                stats.cpu_saved_blocks += 1
+                stats.evicted_potential_sum += potential
+            return pool.stats()["cpu"]["free"] > 0
+
+    candidates = sorted(tree._nodes.values(), key=lambda n: n.last_access_time)
+    for node in candidates:
+        if node.children or node.ref_count > 0:
+            continue
+        for bid in node.block_ids:
+            if bid in protected_block_ids:
+                continue
+            if pool.tier_of(bid) != "cpu":
+                continue
+            if pool.pin_count(bid) > 0:
+                continue
+            _demote_block(pool, tree, bid, block_meta=block_meta)
+            return pool.stats()["cpu"]["free"] > 0
+    return False
 
 
 class CacheManager:
@@ -104,6 +216,8 @@ class CacheManager:
     * :meth:`lookup` / :meth:`lookup_all` — read-only; called by schedulers.
     * :meth:`free_blocks` — read-only; called by schedulers.
     * :meth:`admit` — write; called by the simulation engine after prefill.
+    * :meth:`promote_matched_disk_blocks_to_cpu` — Bidaw M1.5 physical
+      disk→CPU promotion after a KV_LOAD completes.
     """
 
     def __init__(
@@ -114,6 +228,7 @@ class CacheManager:
         bandwidth_config: BandwidthConfig,
         *,
         clock: Callable[[], float] | None = None,
+        answer_eviction_policy: AnswerEvictionPolicy | None = None,
     ) -> None:
         """Initialise per-node trees, pools and capacity limits.
 
@@ -128,6 +243,9 @@ class CacheManager:
                 for transfer-cost calculation (M6 live).
             clock: Optional simulated-time callable forwarded to each node's
                 :class:`RadixTree`. Defaults to ``time.time`` when ``None``.
+            answer_eviction_policy: Optional Bidaw previous-answer-based CPU
+                eviction policy. When ``None``, the existing LRU demotion
+                behavior is preserved.
         """
         self._block_size: int = model_config.block_size
         self._model_cfg = model_config
@@ -155,6 +273,9 @@ class CacheManager:
             )
         self._bw_cfg = bandwidth_config
         self._block_tables: dict[tuple[str, str], RequestBlockTable] = {}
+        self._answer_eviction_policy = answer_eviction_policy
+        self._answer_eviction_stats = AnswerEvictionStats()
+        self._block_eviction_meta: dict[str, _BlockEvictionMeta] = {}
 
     # ------------------------------------------------------------------
     # CacheQuery Protocol — read-only
@@ -246,6 +367,11 @@ class CacheManager:
             if disk_n > 0 else 0.0
         )
         transfer_cost_ms = cpu_load_ms + disk_load_ms
+        if self._answer_eviction_policy is not None and request.session_id is not None:
+            cpu_disk_blocks = cpu_n + disk_n
+            if cpu_disk_blocks > 0:
+                self._answer_eviction_stats.cpu_hit_blocks += cpu_n
+                self._answer_eviction_stats.cpu_lookup_blocks += cpu_disk_blocks
 
         return CacheLookup(
             matched_tokens=matched_tokens,
@@ -288,6 +414,77 @@ class CacheManager:
             raise KeyError(tier)
         return pool._tiers[tier].free
 
+    def promote_matched_disk_blocks_to_cpu(
+        self,
+        request: Request,
+        node_id: str,
+    ) -> tuple[int, int]:
+        """Promote matched disk-tier prefix blocks to CPU for Bidaw.
+
+        This is still metadata-only: block IDs move from ``disk`` to ``cpu``
+        in :class:`BlockPool`; no tensor copy exists. The method intentionally
+        promotes only blocks on the matched prefix path for ``request`` and
+        never moves pinned blocks. If CPU is full, it first tries to demote an
+        unpinned LRU CPU block to disk/free using the existing demotion chain.
+
+        Args:
+            request: Request whose matched disk prefix was just loaded.
+            node_id: Decode node whose cache owns the matched blocks.
+
+        Returns:
+            ``(promoted_count, skipped_count)``. Skipped means a block was
+            still on disk but could not be moved because CPU capacity could not
+            be made available, or because the block was pinned.
+
+        Raises:
+            KeyError: If *node_id* is unknown.
+        """
+        if node_id not in self._trees:
+            raise KeyError(node_id)
+
+        tree = self._trees[node_id]
+        pool = self._pools[node_id]
+        matched_raw, path_block_ids = tree.match_prefix_path(request.token_ids)
+        matched_blocks = matched_raw // self._block_size
+        if matched_blocks == 0:
+            return 0, 0
+
+        relevant_bids = path_block_ids[:matched_blocks]
+        protected = set(relevant_bids)
+        disk_bids = [bid for bid in relevant_bids if pool.tier_of(bid) == "disk"]
+        if not disk_bids:
+            return 0, 0
+
+        if self._capacity[node_id]["cpu"] <= 0:
+            return 0, len(disk_bids)
+
+        promoted = 0
+        skipped = 0
+        for bid in disk_bids:
+            if pool.tier_of(bid) != "disk":
+                continue
+            if pool.pin_count(bid) > 0:
+                skipped += 1
+                continue
+            if pool.stats()["cpu"]["free"] <= 0 and not _make_cpu_room(
+                pool,
+                tree,
+                protected,
+                answer_eviction_policy=self._answer_eviction_policy,
+                block_meta=self._block_eviction_meta,
+                stats=self._answer_eviction_stats,
+            ):
+                skipped += 1
+                continue
+            try:
+                pool.move(bid, "disk", "cpu")
+            except (KeyError, MemoryError, RuntimeError):
+                skipped += 1
+            else:
+                promoted += 1
+
+        return promoted, skipped
+
     # ------------------------------------------------------------------
     # Active request BlockTables
     # ------------------------------------------------------------------
@@ -329,11 +526,43 @@ class CacheManager:
         pool = self._pools[node_id]
         pool.unpin(block_ids)
 
+    def _tag_request_blocks(
+        self,
+        request: Request | None,
+        block_ids: list[str],
+    ) -> None:
+        if (
+            self._answer_eviction_policy is None
+            or request is None
+            or request.session_id is None
+            or not block_ids
+        ):
+            return
+        potential = self._answer_eviction_policy.potential(request.previous_answer_len)
+        meta = _BlockEvictionMeta(
+            session_id=request.session_id,
+            previous_answer_len=request.previous_answer_len,
+            round_index=request.round_index,
+            hit_potential=potential,
+        )
+        for bid in block_ids:
+            self._block_eviction_meta[bid] = meta
+
+    def answer_eviction_summary(self) -> dict[str, float | int]:
+        """Return Bidaw previous-answer eviction counters.
+
+        The dict is always populated with zero defaults so callers can merge
+        it into run summaries without checking whether the policy was enabled.
+        """
+        return self._answer_eviction_stats.summary()
+
     def materialize_request(
         self,
         request_id: str,
         token_ids: list[int],
         node_id: str,
+        *,
+        request: Request | None = None,
     ) -> RequestBlockTable:
         """Create and pin the logical KV block table for an active request.
 
@@ -371,7 +600,7 @@ class CacheManager:
             retained.extend(prefix_bids)
 
             if len(prefix_bids) < total_blocks:
-                self.admit(aligned_tokens, node_id)
+                self.admit(aligned_tokens, node_id, request=request)
 
             matched_after, path_block_ids = self._trees[node_id].match_prefix_path(aligned_tokens)
             if matched_after // self._block_size < total_blocks:
@@ -400,6 +629,7 @@ class CacheManager:
                 matched_blocks=len(prefix_bids),
                 new_blocks=total_blocks - len(prefix_bids),
             )
+            self._tag_request_blocks(request, block_ids)
             self._block_tables[key] = table
             return table
         except Exception:
@@ -422,7 +652,13 @@ class CacheManager:
     # Write path — called by SimulationEngine after PREFILL_COMPLETE
     # ------------------------------------------------------------------
 
-    def admit(self, token_ids: list[int], node_id: str) -> None:
+    def admit(
+        self,
+        token_ids: list[int],
+        node_id: str,
+        *,
+        request: Request | None = None,
+    ) -> None:
         """Materialise the KV cache for *token_ids* on *node_id*.
 
         M6 eviction policy (demotion chain):
@@ -436,6 +672,8 @@ class CacheManager:
         Args:
             token_ids: Full prompt token sequence.
             node_id: Node where the KV cache should be stored.
+            request: Optional request metadata used by Bidaw's
+                previous-answer-based eviction. Existing callers can omit it.
 
         Raises:
             KeyError: If *node_id* is unknown.
@@ -473,16 +711,22 @@ class CacheManager:
                     "admit: node %s already has %d/%d blocks cached (all live), no-op",
                     node_id, already_blocks, total_blocks,
                 )
+                self._tag_request_blocks(request, relevant_bids)
                 return
             # Partial or full zombie detected: purge the stale path so that
             # tree.insert re-creates it with fresh GPU blocks. Also frees any
             # alive CPU/Disk blocks to reclaim their tier capacity (avoids leak).
             # purge_block_ids intentionally skips mixed-state nodes; use
             # purge_path_with_any_dead which handles them correctly.
+            def _free_and_drop_meta(bids: list[str]) -> None:
+                pool.free(bids)
+                for freed_bid in bids:
+                    self._block_eviction_meta.pop(freed_bid, None)
+
             purged = tree.purge_path_with_any_dead(
                 aligned_tokens,
                 tier_of=pool.tier_of,
-                free_blocks=lambda bids: pool.free(bids),
+                free_blocks=_free_and_drop_meta,
             )
             logger.debug(
                 "admit: node %s partial/full zombie on path; purged %d nodes",
@@ -514,11 +758,21 @@ class CacheManager:
                 )
             for bid_list in demoted:
                 for bid in bid_list:
-                    _demote_block(pool, tree, bid)
+                    _demote_block(
+                        pool,
+                        tree,
+                        bid,
+                        answer_eviction_policy=self._answer_eviction_policy,
+                        block_meta=self._block_eviction_meta,
+                        stats=self._answer_eviction_stats,
+                    )
 
         pre = pool.used("gpu")
         tree.insert(aligned_tokens)
         post = pool.used("gpu")
+        matched_after, path_block_ids = tree.match_prefix_path(aligned_tokens)
+        if matched_after // bs >= total_blocks:
+            self._tag_request_blocks(request, path_block_ids[:total_blocks])
 
         logger.debug(
             "admit: node %s pool blocks %d->%d (total_blocks=%d)",

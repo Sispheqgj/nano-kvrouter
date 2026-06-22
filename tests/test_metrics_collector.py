@@ -101,6 +101,13 @@ def test_initial_summary_is_empty(collector):
     assert s["avg_chunked_prefill_steps_per_request"] is None
     assert s["dual_phase_tick_count"] == 0
     assert s["kv_transfer_time_avg_ms"] is None
+    assert s["bidaw_physical_promoted_blocks"] == 0
+    assert s["bidaw_physical_skipped_blocks"] == 0
+    assert s["bidaw_answer_eviction_count"] == 0
+    assert s["bidaw_answer_evicted_blocks"] == 0
+    assert s["bidaw_answer_eviction_cpu_saved_blocks"] == 0
+    assert s["bidaw_answer_eviction_hit_potential_avg"] == 0.0
+    assert s["bidaw_answer_eviction_cpu_hit_rate"] == 0.0
 
 
 # ------------------------------------------------------------------
@@ -269,6 +276,37 @@ def test_attach_registers_all_handlers(engine, collector):
     assert set(engine._handlers.keys()) == expected
     for et in expected:
         assert len(engine._handlers[et]) == 1
+
+
+def test_kv_load_complete_accumulates_physical_promotion_counts(engine, collector):
+    collector.attach(engine)
+    engine.schedule(Event(
+        time=1.0,
+        type=EventType.KV_LOAD_START,
+        payload={
+            "request_id": "r0",
+            "decode_node_id": "d0",
+            "disk_blocks": 5,
+            "load_service_ms": 3.0,
+            "preparing_wait_ms": 2.0,
+        },
+    ))
+    engine.schedule(Event(
+        time=4.0,
+        type=EventType.KV_LOAD_COMPLETE,
+        payload={
+            "request_id": "r0",
+            "decode_node_id": "d0",
+            "promoted_count": 3,
+            "skipped_count": 2,
+        },
+    ))
+    engine.run()
+
+    summary = collector.summary()
+    assert summary["bidaw_preparing_promotions"] == 1
+    assert summary["bidaw_physical_promoted_blocks"] == 3
+    assert summary["bidaw_physical_skipped_blocks"] == 2
 
 
 # ------------------------------------------------------------------

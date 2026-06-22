@@ -128,6 +128,8 @@ class MetricsCollector:
         self._bidaw_preparing_wait_samples: list[float] = []
         self._bidaw_load_service_samples: list[float] = []
         self._bidaw_promotions_count: int = 0
+        self._bidaw_physical_promoted_blocks: int = 0
+        self._bidaw_physical_skipped_blocks: int = 0
         # Stale-guard: mirrors _seen_transfer_ids for KV_LOAD events.
         self._seen_load_req_ids: set[str] = set()
 
@@ -217,6 +219,13 @@ class MetricsCollector:
                 if self._bidaw_load_service_samples else 0.0
             ),
             "bidaw_preparing_promotions": self._bidaw_promotions_count,
+            "bidaw_physical_promoted_blocks": self._bidaw_physical_promoted_blocks,
+            "bidaw_physical_skipped_blocks": self._bidaw_physical_skipped_blocks,
+            "bidaw_answer_eviction_count": 0,
+            "bidaw_answer_evicted_blocks": 0,
+            "bidaw_answer_eviction_cpu_saved_blocks": 0,
+            "bidaw_answer_eviction_hit_potential_avg": 0.0,
+            "bidaw_answer_eviction_cpu_hit_rate": 0.0,
         }
 
     # ------------------------------------------------------------------
@@ -415,6 +424,8 @@ class MetricsCollector:
             return  # stale / unknown — silently drop
         self._seen_load_req_ids.discard(req_id)
         self._bidaw_promotions_count += 1
+        self._bidaw_physical_promoted_blocks += int(event.payload.get("promoted_count", 0))
+        self._bidaw_physical_skipped_blocks += int(event.payload.get("skipped_count", 0))
 
     def _on_decode_complete(self, event: Event, engine: SimulationEngine) -> None:
         request_id = event.payload.get("request_id")

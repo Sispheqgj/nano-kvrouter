@@ -5,7 +5,7 @@ REQUEST_ARRIVE events in arrival-time order.  The generator is streaming —
 it reads one record at a time and schedules the next ARRIVE inside the handler
 for the current one, so the full trace never needs to be loaded into memory.
 
-Supports three prefix_mode values:
+Supports four prefix_mode values:
 
 - ``"hash_ids"``: requires ``hash_ids`` field per record (Mooncake FAST'25
   trace format, block_size=512).  Token IDs are derived from hash IDs to
@@ -13,6 +13,9 @@ Supports three prefix_mode values:
 - ``"synthesis"``: requires no prefix field; pairs with PrefixSynthesisModel
   to synthesize prefix sharing on top of (arrival_ms, input_length).  Used
   for BurstGPT / Azure-style length-only traces.
+- ``"session_history"``: requires session_id/query_length/output_length and
+  synthesizes growing per-session conversation history for Bidaw's
+  interactive workload.
 - ``"none"``: pure random tokens, no prefix sharing (conservative baseline).
 
 Internal JSONL schema per line::
@@ -23,10 +26,14 @@ Internal JSONL schema per line::
       "output_length": int,      # decode token count
       "hash_ids": list[int],     # optional; required when prefix_mode="hash_ids"
       "session_id": str | null,  # optional; preserved for future P3-D use
+      "round_index": int | null, # optional; used by session_history
+      "query_length": int | null,
+      "previous_answer_length": int | null,
     }
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import random
@@ -141,6 +148,7 @@ class TraceGenerator:
         self._idx = 0
         self._file: IO[str] | None = None
         self._attached: bool = False
+        self._session_histories: dict[str, list[int]] = {}
 
     def attach(self, engine: SimulationEngine) -> None:
         """Open the trace file, schedule first ARRIVE, register chain handler."""
@@ -194,6 +202,15 @@ class TraceGenerator:
                 arrival_time=arrival_ms,
                 config=self._config,
                 expected_output_len=record["output_length"],
+                session_id=(
+                    str(record["session_id"])
+                    if record.get("session_id") is not None else None
+                ),
+                round_index=_optional_int(record.get("round_index")),
+                query_len=_optional_int(record.get("query_length")),
+                previous_answer_len=_optional_int(
+                    record.get("previous_answer_length")
+                ),
             )
         except Exception:
             self._close()
@@ -243,5 +260,55 @@ class TraceGenerator:
             tokens = prefix + suffix
             assert len(tokens) == input_length
             return tokens
+        elif mode == "session_history":
+            return self._build_session_history_tokens(record)
         else:
             raise ValueError(f"Unknown prefix_mode: {mode!r}")
+
+    def _build_session_history_tokens(self, record: dict) -> list[int]:
+        """Build prompt tokens from prior turns in the same session."""
+        session_id = record.get("session_id")
+        if session_id is None or str(session_id) == "":
+            raise ValueError("prefix_mode='session_history' requires session_id")
+        session = str(session_id)
+        input_length = int(record["input_length"])
+        query_length = int(record.get("query_length", input_length))
+        output_length = int(record["output_length"])
+        round_index = _optional_int(record.get("round_index")) or 0
+
+        history = self._session_histories.get(session, [])
+        query_tokens = _stable_tokens(session, round_index, "query", query_length)
+        tokens = history + query_tokens
+
+        if len(tokens) < input_length:
+            pad_len = input_length - len(tokens)
+            tokens = tokens + _stable_tokens(session, round_index, "pad", pad_len)
+        elif len(tokens) > input_length:
+            raise ValueError(
+                "session_history input_length shorter than accumulated "
+                f"history+query for session={session!r}: "
+                f"input_length={input_length}, built={len(tokens)}"
+            )
+
+        answer_tokens = _stable_tokens(session, round_index, "answer", output_length)
+        self._session_histories[session] = tokens + answer_tokens
+        return tokens
+
+
+def _optional_int(value: object) -> int | None:
+    if value is None:
+        return None
+    return int(value)
+
+
+def _stable_tokens(
+    session_id: str,
+    round_index: int,
+    kind: str,
+    n_tokens: int,
+) -> list[int]:
+    digest = hashlib.sha256(f"{session_id}:{round_index}:{kind}".encode()).digest()
+    max_token_id = 2**32
+    span = max(1, max_token_id - max(n_tokens, 1))
+    base = int.from_bytes(digest[:8], "big") % span
+    return [base + i for i in range(n_tokens)]

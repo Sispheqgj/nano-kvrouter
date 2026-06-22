@@ -6,12 +6,11 @@ event scheduling. The cli wiring (_wire_bidaw_branch in cli.py) calls into
 this controller and schedules KV_LOAD_START / KV_LOAD_COMPLETE events
 based on the controller's decisions.
 
-M1 limitation:
-KV_LOAD_COMPLETE only marks the request "ready" in the controller; it
-does NOT mutate BlockPool tier state (no physical disk→CPU promotion).
-Subsequent cache lookups for the same prefix still see disk hits. This is
-a known fidelity gap documented in plan v2. Physical promotion is deferred
-to M1.5 (separate commit after M1 ships).
+Metadata boundary:
+KV_LOAD_COMPLETE marks the request "ready" in the controller. The cli wiring
+then attempts physical metadata promotion (disk→CPU) through CacheManager.
+This controller remains a pure state machine and never mutates BlockPool
+directly.
 
 Single load slot invariant:
 At most one in-flight KV_LOAD per decode node at a time. This serializes

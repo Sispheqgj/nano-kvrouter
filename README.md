@@ -30,16 +30,17 @@ It also models the KV cache as a first-class cluster resource:
 P2-Infra M1-M6 is implemented and verified. P3-C M1+M2 (real-world trace
 replay + synthetic prefix sharing on length-only traces), P4-A (per-node
 KV transfer lane contention, opt-in), P4-B (schedulers see transfer-lane
-backlog + `kv_transfer_queued_avg_ms` metric), and P5-Bidaw M1 (FAST'26
-I/O-aware dual-queue scheduling, `bidaw` as the 6th scheduler) are all
-live.
+backlog + `kv_transfer_queued_avg_ms` metric), and P5-Bidaw M1/M2 (FAST'26
+I/O-aware dual-queue scheduling plus metadata-only previous-answer-based
+eviction, `bidaw` as the 6th scheduler) are all live.
 
-- `uv run pytest -q` -> `488 passed`
+- `uv run pytest -q` -> `497 passed`
 - `uv run python -m nano_kvrouter.cli sensitivity --config configs/sensitivity.yaml` -> `13/13 fields PASS`
 - `uv run python -m nano_kvrouter.cli sweep --config configs/trace_mooncake.yaml` -> 6 schedulers on Mooncake FAST'25 real trace, cache-aware ~2× cache_hit vs cache-blind
 - `uv run python -m nano_kvrouter.cli prefix-sensitivity --config configs/trace_burstgpt.yaml` -> 4-axis sweep over prefix-synthesis params on BurstGPT replay, with Mooncake real-trace `cache_hit` shown as informational anchor
 - `uv run python -m nano_kvrouter.cli sweep --config configs/transfer_contention.yaml` -> per-node KV transfer lane queueing exposes ~30× `kv_transfer_time_avg_ms` inflation vs constant-cost baseline on the same 2p/2d cluster
 - `uv run python -m nano_kvrouter.cli sweep --config configs/bidaw.yaml` -> 6-row table with Bidaw `KV_LOAD_*` event path on disk-hit requests; `bidaw_preparing_promotions ≈ disk-hit request count`
+- `uv run python -m nano_kvrouter.cli run --config configs/bidaw-interactive.yaml --scheduler bidaw` -> session-history replay + opt-in previous-answer eviction profile plumbing
 - repo-outside absolute `--config` sensitivity execution is supported
 
 The repository currently exposes four public CLI workflows:
@@ -265,7 +266,7 @@ Default `bandwidth.contention_model: "none"` still keeps every old
 config and regression number byte-identical — `NoopTransferModel.peek_backlog`
 returns zeros, `max(0, 0 - now) = 0`, and `kv_transfer` is unchanged.
 
-### Bidaw I/O-aware dual-queue scheduling (P5-Bidaw M1, 2026-06-21)
+### Bidaw I/O-aware scheduling + answer eviction (P5-Bidaw M1/M2, 2026-06-21)
 
 P5 adds a sixth scheduler `bidaw` that simulates the **I/O-aware
 request scheduling layer** of Bidaw (FAST'26). Until P5, requests
@@ -287,15 +288,27 @@ Inside each decode node's preparing queue, ordering uses **disk-HRRN**:
 to bound starvation. A **single in-flight load slot per decode node**
 serializes the disk loads on that node; cross-node loads run in
 parallel. When `KV_LOAD_COMPLETE` fires, the controller marks the
-request "ready" and it can proceed to `PREFILL_START` —
-**request-local gating only**, the underlying BlockPool tier state
-is NOT mutated (physical disk→cpu promotion is deferred to M1.5).
+request "ready", `CacheManager` attempts metadata-only disk→CPU promotion
+for the matched prefix blocks, and the request can proceed to
+`PREFILL_START`. This is still a simulator approximation: no real tensor
+copy exists, and CPU/GPU tiers are both treated as Bidaw's ready layer.
 
 The Bidaw branch lives in two new modules
 (`scheduler/bidaw.py` + `simulator/bidaw_controller.py`) plus a cli
 wiring branch. The five existing schedulers, all eight existing
-yamls, `CacheManager`, `BlockPool`, and `TransferModel` are
-**byte-identical** — Bidaw is purely additive.
+configs and `TransferModel` are unchanged for non-Bidaw schedulers. Bidaw's
+only cache-layer write is the opt-in disk→CPU promotion path on
+`KV_LOAD_COMPLETE`.
+
+P5-Bidaw M2 adds an opt-in **previous-answer-based eviction** approximation.
+It does not store tensors. Instead, interactive trace records carry
+`session_id`, `query_length`, `round_index`, and `previous_answer_length`;
+`TraceGenerator(prefix_mode="session_history")` reconstructs growing
+conversation prompts; and `CacheManager` tags cached blocks with an
+answer-length-derived hit potential. When Bidaw disk→CPU promotion needs CPU
+space, low-potential CPU blocks are demoted before high-potential ones. The
+profile can be generated from the public Interactive-conversation-workload CSV
+with `scripts/convert_interactive_workload.py`.
 
 Run the demo:
 
@@ -303,9 +316,13 @@ Run the demo:
 uv run python -m nano_kvrouter.cli run --config configs/bidaw.yaml \
     --scheduler bidaw
 uv run python -m nano_kvrouter.cli sweep --config configs/bidaw.yaml
+uv run python -m nano_kvrouter.cli run --config configs/bidaw-stress.yaml \
+    --scheduler bidaw
+uv run python -m nano_kvrouter.cli run --config configs/bidaw-interactive.yaml \
+    --scheduler bidaw
 ```
 
-Five new metrics surface in the summary (all default to `0.0`/`0`
+Bidaw metrics surface in the summary (all default to `0.0`/`0`
 on non-bidaw runs):
 
 - `bidaw_preparing_wait_avg_ms` / `_p99_ms` — wait between arriving
@@ -314,19 +331,25 @@ on non-bidaw runs):
   time (the `KV_LOAD_*` interval).
 - `bidaw_preparing_promotions` — count of requests that traversed
   the preparing path (≈ disk-hit request count).
+- `bidaw_physical_promoted_blocks` / `_skipped_blocks` — block-level
+  metadata promotion result after `KV_LOAD_COMPLETE`.
+- `bidaw_answer_eviction_count` / `_evicted_blocks` /
+  `_cpu_saved_blocks` — answer-aware CPU demotions.
+- `bidaw_answer_eviction_hit_potential_avg` — average hit potential of
+  answer-aware evicted blocks.
+- `bidaw_answer_eviction_cpu_hit_rate` — CPU hits over CPU+Disk session hits.
 
 See `doc/bidaw-deliverable.md` for the full Chinese deliverable
 summary (mechanism mapping, simulator approximations, what is NOT
 implemented, comparison table, ship verdict) and DESIGN §13 for
 the design write-up.
 
-**Known M1 caveats** (documented in DESIGN §13):
+**Known caveats** (documented in DESIGN §13):
 1. `configs/bidaw.yaml` is a minimal-stress demo — disk load (~0.37 ms)
    is much faster than the request arrival interval (~67 ms), so the
    preparing queue never backs up and `bidaw_preparing_wait_avg_ms = 0`.
-   HRRN ordering is exercised by unit tests, not by the demo run. A
-   `bidaw-stress.yaml` variant for HRRN under real contention is
-   future work.
+   HRRN ordering is covered by unit tests and exercised by
+   `configs/bidaw-stress.yaml`.
 2. Bidaw's routing mirrors `least_loaded` for decode-node choice.
    On `bidaw.yaml` this produces lower `cache_hit_ratio` than
    `conductor` (0.69 vs 0.82), but **`bidaw` ends up with lower
@@ -405,6 +428,8 @@ uv run pytest -q
 | [`configs/trace_burstgpt.yaml`](configs/trace_burstgpt.yaml) | BurstGPT trace replay with synthetic prefix sharing (`PrefixSynthesisModel`) |
 | [`configs/transfer_contention.yaml`](configs/transfer_contention.yaml) | 2p/2d cluster with `bandwidth.contention_model: per_node_lane` to exercise the P4-A `TransferModel` lane queueing |
 | [`configs/bidaw.yaml`](configs/bidaw.yaml) | 2p/4d cluster with `cpu_blocks=0` + `disk_blocks=4000` so disk-tier hits are visible; exercises the P5-Bidaw `KV_LOAD_*` event path on the new `bidaw` scheduler |
+| [`configs/bidaw-stress.yaml`](configs/bidaw-stress.yaml) | Single-node Bidaw stress case with slow disk and CPU tier enabled, useful for preparing-queue contention and physical promotion checks |
+| [`configs/bidaw-interactive.yaml`](configs/bidaw-interactive.yaml) | Tiny session-history fixture that wires Bidaw's previous-answer eviction profile path; real traces should be produced with `scripts/convert_interactive_workload.py` |
 
 ## LIVE config matrix
 
@@ -575,7 +600,7 @@ the following systems:
 - **Mooncake** — *Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving*, FAST'25 Best Paper.
 - **Preble** — *Preble: Efficient Distributed Prompt Scheduling for LLM Serving*, ICLR'25.
 - **SGLang** — *Efficiently Programming Large Language Models using SGLang* (RadixAttention), NeurIPS'24.
-- **Bidaw** — *Bidaw: Interactive LLM Serving with Two-Tier KV Storage*, FAST'26 (I/O-aware dual-queue request scheduling; storage engine + previous-answer eviction + tensor caching are explicitly NOT in scope, see `doc/bidaw-deliverable.md`).
+- **Bidaw** — *Bidaw: Interactive LLM Serving with Two-Tier KV Storage*, FAST'26 (I/O-aware dual-queue request scheduling plus metadata-only previous-answer eviction; storage engine + tensor caching remain out of scope, see `doc/bidaw-deliverable.md`).
 - **Llumnix** — *Llumnix: Dynamic Scheduling for Large Language Model Serving*, OSDI'24 (migration logic — roadmap).
 - **vLLM** — *Efficient Memory Management for Large Language Model Serving with PagedAttention*, SOSP'23.
 

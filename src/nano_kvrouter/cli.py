@@ -34,6 +34,7 @@ from nano_kvrouter.config import (
     load_sensitivity_config,
 )
 from nano_kvrouter.engine.mock_node import MockEngineNode
+from nano_kvrouter.kv_cache.answer_eviction import AnswerEvictionPolicy
 from nano_kvrouter.kv_cache.cache_manager import CacheManager
 from nano_kvrouter.metrics.collector import MetricsCollector
 from nano_kvrouter.scheduler.base import SchedulingPolicy, TransferBacklogView
@@ -59,7 +60,14 @@ from nano_kvrouter.simulator.trace_generator import TraceGenerator
 logger = logging.getLogger(__name__)
 console = Console()
 
-SCHEDULER_NAMES = ["round_robin", "least_loaded", "prefix_greedy", "e2_policy", "conductor", "bidaw"]
+SCHEDULER_NAMES = [
+    "round_robin",
+    "least_loaded",
+    "prefix_greedy",
+    "e2_policy",
+    "conductor",
+    "bidaw",
+]
 
 
 # ----------------- scheduler factory -----------------
@@ -92,9 +100,17 @@ def _build_scheduler(
     """
     bw = bandwidth_cfg if bandwidth_cfg is not None else BandwidthConfig()
     if name == "round_robin":
-        return RoundRobinPolicy(model_config=model_cfg, bandwidth_config=bw, backlog_view=backlog_view)
+        return RoundRobinPolicy(
+            model_config=model_cfg,
+            bandwidth_config=bw,
+            backlog_view=backlog_view,
+        )
     if name == "least_loaded":
-        return LeastLoadedPolicy(model_config=model_cfg, bandwidth_config=bw, backlog_view=backlog_view)
+        return LeastLoadedPolicy(
+            model_config=model_cfg,
+            bandwidth_config=bw,
+            backlog_view=backlog_view,
+        )
     if name == "prefix_greedy":
         min_hit_ratio = float(params.get("min_hit_ratio", 0.25))
         return PrefixGreedyPolicy(
@@ -124,6 +140,21 @@ def _build_scheduler(
     if name == "bidaw":
         return BidawPolicy(model_config=model_cfg, bandwidth_config=bw, backlog_view=backlog_view)
     raise ValueError(f"Unknown scheduler {name!r}; valid: {SCHEDULER_NAMES}")
+
+
+def _build_answer_eviction_policy(
+    scheduler_name: str,
+    params: dict[str, Any],
+) -> AnswerEvictionPolicy | None:
+    """Build Bidaw previous-answer eviction policy from scheduler params."""
+    if scheduler_name != "bidaw":
+        return None
+    if not bool(params.get("enable_answer_eviction", False)):
+        return None
+    profile_path = params.get("answer_eviction_profile_path")
+    if profile_path:
+        return AnswerEvictionPolicy.from_profile_path(str(profile_path))
+    return AnswerEvictionPolicy.default()
 
 
 # ----------------- event wiring -----------------
@@ -431,7 +462,12 @@ def _wire_simulator(
 
         # Admit KV into decode_node cache and pin the active request BlockTable.
         try:
-            cm.materialize_request(request_id, req.token_ids, decision.decode_node)
+            cm.materialize_request(
+                request_id,
+                req.token_ids,
+                decision.decode_node,
+                request=req,
+            )
         except MemoryError:
             logger_.debug(
                 "cm.materialize_request MemoryError for %s on %s; KV not cached",
@@ -518,7 +554,11 @@ def _wire_simulator(
         try:
             cm.release_request(request_id, node_id)
         except KeyError:
-            logger_.debug("release_request skipped for %s on %s; no block table", request_id, node_id)
+            logger_.debug(
+                "release_request skipped for %s on %s; no block table",
+                request_id,
+                node_id,
+            )
 
         _decisions.pop(request_id, None)
         _requests.pop(request_id, None)
@@ -622,14 +662,20 @@ def _wire_bidaw_branch(
             payload={
                 "request_id": req.request_id,
                 "decode_node_id": decode_node_id,
-                "promoted_count": 0,   # M1 is logical gating only
+                "promoted_count": 0,
                 "skipped_count": 0,
             },
         ))
 
     def on_arrive_bidaw(event: Event, engine: SimulationEngine) -> None:
         req = event.payload["request"]
-        decision = sched.schedule(req, prefill_nodes, list(decode_nodes_by_id.values()), cm, now=engine.now())
+        decision = sched.schedule(
+            req,
+            prefill_nodes,
+            list(decode_nodes_by_id.values()),
+            cm,
+            now=engine.now(),
+        )
         if decision.is_rejected:
             engine.schedule(Event(
                 time=engine.now(),
@@ -710,6 +756,20 @@ def _wire_bidaw_branch(
             _try_schedule_kv_load(decode_node_id, engine)
             return
 
+        try:
+            promoted_count, skipped_count = cm.promote_matched_disk_blocks_to_cpu(
+                req, decode_node_id
+            )
+        except KeyError:
+            logger_.warning(
+                "on_kv_load_complete: cannot promote disk blocks for %s on unknown node %s",
+                req_id,
+                decode_node_id,
+            )
+            promoted_count, skipped_count = 0, 0
+        event.payload["promoted_count"] = promoted_count
+        event.payload["skipped_count"] = skipped_count
+
         decision = _decisions.get(req_id)
         if decision is None:
             logger_.warning("on_kv_load_complete: no decision for %s", req_id)
@@ -775,19 +835,30 @@ def _run_one(cfg: NanoKVConfig, scheduler_name: str) -> dict:
         MockEngineNode(f"d{i}", cfg.model, cfg.node)
         for i in range(cfg.cluster.decode_nodes)
     ]
+    answer_eviction_policy = _build_answer_eviction_policy(
+        scheduler_name,
+        cfg.scheduler.params,
+    )
     cm = CacheManager(
         node_ids=[n.node_id for n in decode_nodes],
         model_config=cfg.model,
         node_config=cfg.node,
         bandwidth_config=cfg.bandwidth,
         clock=eng.now,
+        answer_eviction_policy=answer_eviction_policy,
     )
     transfer_model: TransferModel = (
         PerNodeLaneTransferModel()
         if cfg.bandwidth.contention_model == "per_node_lane"
         else NoopTransferModel()
     )
-    sched = _build_scheduler(scheduler_name, cfg.scheduler.params, cfg.model, cfg.bandwidth, backlog_view=transfer_model)
+    sched = _build_scheduler(
+        scheduler_name,
+        cfg.scheduler.params,
+        cfg.model,
+        cfg.bandwidth,
+        backlog_view=transfer_model,
+    )
     metrics = MetricsCollector()
     if cfg.trace is not None:
         synthesis_model = None
@@ -820,7 +891,9 @@ def _run_one(cfg: NanoKVConfig, scheduler_name: str) -> dict:
     gen.attach(eng)
     eng.run()
 
-    return metrics.summary()
+    summary = metrics.summary()
+    summary.update(cm.answer_eviction_summary())
+    return summary
 
 
 # ----------------- output rendering -----------------
@@ -851,6 +924,13 @@ _TABLE_KEYS = [
     "bidaw_preparing_wait_p99_ms",
     "bidaw_disk_load_service_avg_ms",
     "bidaw_preparing_promotions",
+    "bidaw_physical_promoted_blocks",
+    "bidaw_physical_skipped_blocks",
+    "bidaw_answer_eviction_count",
+    "bidaw_answer_evicted_blocks",
+    "bidaw_answer_eviction_cpu_saved_blocks",
+    "bidaw_answer_eviction_hit_potential_avg",
+    "bidaw_answer_eviction_cpu_hit_rate",
 ]
 
 _SWEEP_KEYS = [
@@ -863,6 +943,8 @@ _SWEEP_KEYS = [
     "avg_batch_size",
     "decode_throughput_tokens_per_s",
     "kv_transfer_time_avg_ms",
+    "bidaw_answer_eviction_count",
+    "bidaw_answer_eviction_cpu_hit_rate",
 ]
 
 
@@ -890,6 +972,15 @@ def _resolve_related_config_path(config_path: str, related_path: str) -> Path:
         return cwd_candidate
 
     return config_parent_candidate
+
+
+def _resolve_bidaw_answer_profile_path(config_path: str, cfg: NanoKVConfig) -> None:
+    profile_path = cfg.scheduler.params.get("answer_eviction_profile_path")
+    if not profile_path:
+        return
+    cfg.scheduler.params["answer_eviction_profile_path"] = str(
+        _resolve_related_config_path(config_path, str(profile_path))
+    )
 
 
 def _get_nested_attr(cfg: NanoKVConfig, field_path: str) -> Any:
@@ -974,7 +1065,11 @@ def _metric_threshold_met(metric_name: str, baseline: Any, candidate: Any) -> bo
         return delta_abs >= 0.5 or (delta_pct is not None and delta_pct >= 0.01)
     if "throughput" in root_metric or "rejection" in root_metric:
         return delta_abs >= 0.005 or (delta_pct is not None and delta_pct >= 0.01)
-    if root_metric.endswith("_count") or "steps_per_request" in root_metric or "batch_size" in root_metric:
+    if (
+        root_metric.endswith("_count")
+        or "steps_per_request" in root_metric
+        or "batch_size" in root_metric
+    ):
         return delta_abs >= 0.5 or (delta_pct is not None and delta_pct >= 0.01)
     return delta_abs > 1e-9
 
@@ -1211,6 +1306,7 @@ def cmd_run(args: argparse.Namespace) -> None:
     if cfg.trace is not None:
         abs_path = _resolve_related_config_path(args.config, cfg.trace.path)
         cfg.trace.path = str(abs_path)
+    _resolve_bidaw_answer_profile_path(args.config, cfg)
     sched_name = args.scheduler or cfg.scheduler.name
     if sched_name not in SCHEDULER_NAMES:
         raise SystemExit(
@@ -1240,6 +1336,7 @@ def cmd_sweep(args: argparse.Namespace) -> None:
     if cfg.trace is not None:
         abs_path = _resolve_related_config_path(args.config, cfg.trace.path)
         cfg.trace.path = str(abs_path)
+    _resolve_bidaw_answer_profile_path(args.config, cfg)
     results: dict[str, dict] = {}
     for name in SCHEDULER_NAMES:
         console.print(f"[dim]running {name}...[/dim]")

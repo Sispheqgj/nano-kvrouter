@@ -6,7 +6,14 @@ from pathlib import Path
 
 import pytest
 
-from nano_kvrouter.cli import SCHEDULER_NAMES, _build_scheduler, _run_one, _wire_simulator
+from nano_kvrouter.cli import (
+    SCHEDULER_NAMES,
+    _build_scheduler,
+    _resolve_bidaw_answer_profile_path,
+    _resolve_related_config_path,
+    _run_one,
+    _wire_simulator,
+)
 from nano_kvrouter.config import (
     BandwidthConfig,
     ClusterConfig,
@@ -29,6 +36,10 @@ from nano_kvrouter.simulator.generator import RequestGenerator
 from nano_kvrouter.simulator.transfer_model import NoopTransferModel
 
 _BIDAW_YAML = str(Path(__file__).parent.parent / "configs" / "bidaw.yaml")
+_BIDAW_STRESS_YAML = str(Path(__file__).parent.parent / "configs" / "bidaw-stress.yaml")
+_BIDAW_INTERACTIVE_YAML = str(
+    Path(__file__).parent.parent / "configs" / "bidaw-interactive.yaml"
+)
 _DEFAULT_YAML = str(Path(__file__).parent.parent / "configs" / "default.yaml")
 
 _LOG = logging.getLogger("test_bidaw_cli")
@@ -84,6 +95,20 @@ def _build_sim(cfg: NanoKVConfig):
     )
     gen = RequestGenerator(cfg)
     return eng, prefill_nodes, decode_nodes, cm, gen
+
+
+def test_bidaw_interactive_config_runs_with_answer_eviction_metrics() -> None:
+    """Interactive fixture config should replay session history and export M2 metrics."""
+    cfg = load_config(_BIDAW_INTERACTIVE_YAML)
+    assert cfg.trace is not None
+    cfg.trace.path = str(_resolve_related_config_path(_BIDAW_INTERACTIVE_YAML, cfg.trace.path))
+    _resolve_bidaw_answer_profile_path(_BIDAW_INTERACTIVE_YAML, cfg)
+
+    summary = _run_one(cfg, "bidaw")
+
+    assert summary["total_arrived"] == 6
+    assert "bidaw_answer_eviction_count" in summary
+    assert "bidaw_answer_eviction_cpu_hit_rate" in summary
 
 
 # ---------------------------------------------------------------------------
@@ -293,6 +318,79 @@ def test_bidaw_metrics_populated_on_bidaw_yaml() -> None:
     assert summary["total_arrived"] > 0
     assert summary["completed"] > 0
     assert summary["ttft_p50_ms"] is not None
+
+
+def test_bidaw_kv_load_complete_physically_promotes_disk_blocks_to_cpu() -> None:
+    """KV_LOAD_COMPLETE should mutate matched disk blocks into CPU-tier blocks."""
+    model_cfg = ModelConfig(block_size=16, kv_bytes_per_token=4096,
+                            prefill_cost_per_token_ms=0.04, decode_base_ms=5.0,
+                            marginal_decode_ms=0.5, prefill_chunk_size=512)
+    bw_cfg = BandwidthConfig(gpu_to_gpu=3.0e11, gpu_to_cpu=3.2e10,
+                             cpu_to_disk=1e9)
+    node_cfg = NodeConfig(gpu_blocks=32, cpu_blocks=16, disk_blocks=4000, capacity=16)
+
+    eng = SimulationEngine()
+    prefill_nodes = [MockEngineNode("p0", model_cfg, node_cfg)]
+    decode_nodes = [MockEngineNode("d0", model_cfg, node_cfg)]
+    cm = CacheManager(["d0"], model_cfg, node_cfg, bw_cfg, clock=eng.now)
+
+    tokens = list(range(64))  # 4 blocks
+    cm.materialize_request("_seed", tokens, "d0")
+    cm.release_request("_seed", "d0")
+    pool = cm._pools["d0"]
+    _, seed_bids = cm._trees["d0"].match_prefix_path(tokens)
+    for bid in seed_bids:
+        if pool.tier_of(bid) == "gpu":
+            pool.move(bid, "gpu", "disk")
+
+    req = Request(
+        request_id="disk-req",
+        token_ids=tokens,
+        prefix_hash="disk0000",
+        expected_output_len=2,
+        arrival_time=0.0,
+        slo_ttft=9999.0,
+        slo_tbt=9999.0,
+    )
+    assert cm.lookup(req, "d0").matched_blocks_by_tier == {"disk": 4}
+
+    transfer_model = NoopTransferModel()
+    sched = _build_scheduler("bidaw", {}, model_cfg, bw_cfg, backlog_view=transfer_model)
+    _wire_simulator(
+        eng, sched, cm, prefill_nodes, decode_nodes,
+        logger_=_LOG, model_cfg=model_cfg, bandwidth_cfg=bw_cfg,
+        transfer_model=transfer_model, bidaw_mode=True,
+    )
+
+    complete_payloads: list[dict] = []
+
+    def record_kv_load_complete(ev: Event, engine: SimulationEngine) -> None:
+        if ev.payload.get("request_id") == "disk-req":
+            complete_payloads.append(dict(ev.payload))
+
+    eng.on(EventType.KV_LOAD_COMPLETE, record_kv_load_complete)
+    metrics = MetricsCollector()
+    metrics.attach(eng, nodes={n.node_id: n for n in [*prefill_nodes, *decode_nodes]})
+    eng.schedule(Event(time=0.0, type=EventType.REQUEST_ARRIVE, payload={"request": req}))
+    eng.run()
+
+    assert complete_payloads
+    assert complete_payloads[0]["promoted_count"] == 4
+    assert complete_payloads[0]["skipped_count"] == 0
+    assert cm.lookup(req, "d0").matched_blocks_by_tier == {"cpu": 4}
+    summary = metrics.summary()
+    assert summary["bidaw_physical_promoted_blocks"] == 4
+    assert summary["bidaw_physical_skipped_blocks"] == 0
+
+
+def test_bidaw_stress_yaml_exercises_preparing_queue_wait() -> None:
+    """The stress config should make disk-HRRN observable beyond unit tests."""
+    cfg = load_config(_BIDAW_STRESS_YAML)
+    summary = _run_one(cfg, "bidaw")
+
+    assert summary["bidaw_preparing_promotions"] > 0
+    assert summary["bidaw_disk_load_service_avg_ms"] > 0.0
+    assert summary["bidaw_preparing_wait_avg_ms"] > 0.0
 
 
 # ---------------------------------------------------------------------------

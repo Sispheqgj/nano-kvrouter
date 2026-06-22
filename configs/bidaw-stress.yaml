@@ -1,0 +1,49 @@
+# nano-kvrouter — Bidaw dual-queue stress demo
+#
+# Purpose: make preparing-queue wait observable. Compared with bidaw.yaml,
+# this uses a slower disk bandwidth and higher request rate, so multiple
+# disk-hit requests can queue behind one decode node's single KV_LOAD slot.
+
+cluster:
+  prefill_nodes: 1
+  decode_nodes: 1
+
+node:
+  capacity: 16
+  gpu_blocks: 40
+  cpu_blocks: 16
+  disk_blocks: 4000
+
+model:
+  block_size: 16
+  kv_bytes_per_token: 4096
+  prefill_cost_per_token_ms: 0.04
+  decode_base_ms: 5.0
+  marginal_decode_ms: 0.5
+  prefill_chunk_size: 512
+
+bandwidth:
+  gpu_to_gpu: 3.0e11
+  gpu_to_cpu: 3.2e10
+  cpu_to_disk: 1.0e7
+  contention_model: none
+
+slo:
+  ttft_target_ms: 5000.0
+  tbt_target_ms: 100.0
+
+workload:
+  request_rate: 100.0
+  duration_s: 1.0
+  prefix_sharing_ratio: 0.95
+  avg_prompt_len: 512
+  avg_output_len: 16
+
+generator:
+  num_buckets: 2
+  vocab_size: 32000
+  seed: 42
+
+scheduler:
+  name: bidaw
+  params: {}

@@ -4,6 +4,7 @@ from __future__ import annotations
 import pytest
 
 from nano_kvrouter.config import BandwidthConfig, ModelConfig, NodeConfig
+from nano_kvrouter.kv_cache.answer_eviction import AnswerEvictionPolicy
 from nano_kvrouter.kv_cache.cache_manager import CacheManager
 from nano_kvrouter.request import Request
 from nano_kvrouter.scheduler.base import CacheQuery
@@ -621,6 +622,62 @@ def test_lookup_returns_tier_distribution() -> None:
     assert lookup.matched_blocks_by_tier.get("gpu", 0) == 0
 
 
+def test_promote_matched_disk_blocks_to_cpu_moves_prefix_blocks() -> None:
+    """Bidaw physical promotion: matched disk blocks become CPU-tier hits."""
+    model_cfg = ModelConfig(block_size=BLOCK_SIZE, kv_bytes_per_token=512)
+    node_cfg = NodeConfig(gpu_blocks=4, cpu_blocks=4, disk_blocks=8)
+    cm = CacheManager(
+        node_ids=["n0"],
+        model_config=model_cfg,
+        node_config=node_cfg,
+        bandwidth_config=BandwidthConfig(),
+    )
+    tokens = _tokens(BLOCK_SIZE * 2, start=0)
+    cm.admit(tokens, "n0")
+
+    pool = cm._pools["n0"]
+    _, bids = cm._trees["n0"].match_prefix_path(tokens)
+    for bid in bids:
+        pool.move(bid, "gpu", "disk")
+
+    req = _req(tokens)
+    before = cm.lookup(req, "n0")
+    assert before.matched_blocks_by_tier == {"disk": 2}
+
+    promoted, skipped = cm.promote_matched_disk_blocks_to_cpu(req, "n0")
+
+    assert promoted == 2
+    assert skipped == 0
+    after = cm.lookup(req, "n0")
+    assert after.matched_blocks_by_tier == {"cpu": 2}
+
+
+def test_promote_matched_disk_blocks_to_cpu_skips_when_no_cpu_room() -> None:
+    """Promotion must not demote protected blocks from the same request."""
+    model_cfg = ModelConfig(block_size=BLOCK_SIZE, kv_bytes_per_token=512)
+    node_cfg = NodeConfig(gpu_blocks=4, cpu_blocks=1, disk_blocks=8)
+    cm = CacheManager(
+        node_ids=["n0"],
+        model_config=model_cfg,
+        node_config=node_cfg,
+        bandwidth_config=BandwidthConfig(),
+    )
+    tokens = _tokens(BLOCK_SIZE * 2, start=0)
+    cm.admit(tokens, "n0")
+
+    pool = cm._pools["n0"]
+    _, bids = cm._trees["n0"].match_prefix_path(tokens)
+    for bid in bids:
+        pool.move(bid, "gpu", "disk")
+
+    promoted, skipped = cm.promote_matched_disk_blocks_to_cpu(_req(tokens), "n0")
+
+    assert promoted == 1
+    assert skipped == 1
+    after = cm.lookup(_req(tokens), "n0")
+    assert after.matched_blocks_by_tier == {"cpu": 1, "disk": 1}
+
+
 def test_transfer_cost_uses_bandwidth_config() -> None:
     """transfer_cost_ms is correctly computed from bandwidth config for CPU blocks."""
     block_size = 16
@@ -844,3 +901,74 @@ def test_materialize_release_preserves_cache_manager_lookup_contract() -> None:
 
     assert all(cm._pools["d0"].pin_count(bid) == 0 for bid in table.block_ids)
     assert cm.lookup(_req(toks), "d0").matched_tokens == len(toks)
+
+
+def test_answer_eviction_prefers_low_potential_cpu_block_for_promotion() -> None:
+    """Bidaw answer-aware eviction should protect short-answer CPU blocks."""
+    policy = AnswerEvictionPolicy(
+        short_answer_max=64,
+        medium_answer_max=256,
+        potential_short=1.0,
+        potential_medium=0.5,
+        potential_long=0.0,
+        default_potential=0.5,
+    )
+    cm = CacheManager(
+        node_ids=["d0"],
+        model_config=ModelConfig(block_size=BLOCK_SIZE, kv_bytes_per_token=512),
+        node_config=NodeConfig(gpu_blocks=4, cpu_blocks=2, disk_blocks=8),
+        bandwidth_config=BandwidthConfig(),
+        answer_eviction_policy=policy,
+    )
+    pool = cm._pools["d0"]
+    tree = cm._trees["d0"]
+
+    def req(request_id: str, tokens: list[int], prev_answer: int) -> Request:
+        return Request(
+            request_id=request_id,
+            token_ids=tokens,
+            prefix_hash=request_id,
+            expected_output_len=4,
+            arrival_time=0.0,
+            slo_ttft=9999.0,
+            slo_tbt=9999.0,
+            session_id=request_id,
+            previous_answer_len=prev_answer,
+        )
+
+    def single_bid(tokens: list[int]) -> str:
+        _matched, bids = tree.match_prefix_path(tokens)
+        return bids[0]
+
+    short_tokens = _tokens(BLOCK_SIZE, start=1000)
+    long_tokens = _tokens(BLOCK_SIZE, start=2000)
+    incoming_tokens = _tokens(BLOCK_SIZE, start=3000)
+    short_req = req("short", short_tokens, 16)
+    long_req = req("long", long_tokens, 640)
+    incoming_req = req("incoming", incoming_tokens, 16)
+
+    cm.materialize_request("short-active", short_tokens, "d0", request=short_req)
+    cm.release_request("short-active", "d0")
+    pool.move(single_bid(short_tokens), "gpu", "cpu")
+
+    cm.materialize_request("long-active", long_tokens, "d0", request=long_req)
+    cm.release_request("long-active", "d0")
+    pool.move(single_bid(long_tokens), "gpu", "cpu")
+
+    cm.materialize_request("incoming-active", incoming_tokens, "d0", request=incoming_req)
+    cm.release_request("incoming-active", "d0")
+    pool.move(single_bid(incoming_tokens), "gpu", "disk")
+
+    assert cm.lookup(short_req, "d0").matched_blocks_by_tier == {"cpu": 1}
+    assert cm.lookup(long_req, "d0").matched_blocks_by_tier == {"cpu": 1}
+    assert cm.lookup(incoming_req, "d0").matched_blocks_by_tier == {"disk": 1}
+
+    promoted, skipped = cm.promote_matched_disk_blocks_to_cpu(incoming_req, "d0")
+
+    assert (promoted, skipped) == (1, 0)
+    assert cm.lookup(short_req, "d0").matched_blocks_by_tier == {"cpu": 1}
+    assert cm.lookup(long_req, "d0").matched_blocks_by_tier == {"disk": 1}
+    assert cm.lookup(incoming_req, "d0").matched_blocks_by_tier == {"cpu": 1}
+    summary = cm.answer_eviction_summary()
+    assert summary["bidaw_answer_eviction_count"] == 1
+    assert summary["bidaw_answer_eviction_hit_potential_avg"] == 0.0

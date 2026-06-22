@@ -53,6 +53,10 @@ class Request:
     slo_ttft: float
     slo_tbt: float
     priority: int = field(default=0)
+    session_id: str | None = None
+    round_index: int | None = None
+    query_len: int | None = None
+    previous_answer_len: int | None = None
 
 
 def make_request(
@@ -62,6 +66,10 @@ def make_request(
     *,
     priority: int = 0,
     expected_output_len: int | None = None,
+    session_id: str | None = None,
+    round_index: int | None = None,
+    query_len: int | None = None,
+    previous_answer_len: int | None = None,
 ) -> Request:
     """Construct a `Request` with SLO and output-length fields filled from config.
 
@@ -78,6 +86,11 @@ def make_request(
             request. When None (default), falls back to
             config.workload.avg_output_len so existing Poisson callers
             require no change.
+        session_id: Optional conversation/user identifier for interactive traces.
+        round_index: Optional turn index inside a conversation.
+        query_len: Optional current user query length, excluding history.
+        previous_answer_len: Optional previous model answer length for the same
+            session. Used by Bidaw answer-aware eviction.
 
     Returns:
         A freshly-initialized `Request` with a new UUID `request_id` and
@@ -95,4 +108,8 @@ def make_request(
         slo_ttft=config.slo.ttft_target_ms,
         slo_tbt=config.slo.tbt_target_ms,
         priority=priority,
+        session_id=session_id,
+        round_index=round_index,
+        query_len=query_len,
+        previous_answer_len=previous_answer_len,
     )

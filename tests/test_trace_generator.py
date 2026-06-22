@@ -214,6 +214,55 @@ def test_max_requests_cap(tmp_path: Path):
     assert len(arrived) == 3, f"Expected 3 arrivals, got {len(arrived)}"
 
 
+def test_session_history_mode_builds_conversation_prompt_and_metadata(
+    tmp_path: Path,
+) -> None:
+    """session_history mode grows prompts with prior query+answer turns."""
+    from nano_kvrouter.simulator.engine import SimulationEngine
+    from nano_kvrouter.simulator.event import EventType
+
+    records = [
+        {
+            "arrival_ms": 0.0,
+            "input_length": 16,
+            "output_length": 4,
+            "session_id": "u1",
+            "round_index": 0,
+            "query_length": 16,
+            "previous_answer_length": 0,
+        },
+        {
+            "arrival_ms": 1.0,
+            "input_length": 28,
+            "output_length": 5,
+            "session_id": "u1",
+            "round_index": 1,
+            "query_length": 8,
+            "previous_answer_length": 4,
+        },
+    ]
+    trace_path = _write_trace(tmp_path, records)
+    cfg = _make_config(block_size=16)
+    tc = TraceConfig(path=str(trace_path), max_requests=2, prefix_mode="session_history")
+    arrived = []
+
+    eng = SimulationEngine()
+    gen = TraceGenerator(cfg, tc, trace_path)
+    gen.attach(eng)
+    eng.on(EventType.REQUEST_ARRIVE, lambda e, _engine: arrived.append(e.payload["request"]))
+    eng.run()
+
+    assert len(arrived) == 2
+    first, second = arrived
+    assert len(first.token_ids) == 16
+    assert len(second.token_ids) == 28
+    assert second.token_ids[:16] == first.token_ids
+    assert second.session_id == "u1"
+    assert second.round_index == 1
+    assert second.query_len == 8
+    assert second.previous_answer_len == 4
+
+
 # ---------------------------------------------------------------------------
 # P3-M1.fix new tests
 # ---------------------------------------------------------------------------

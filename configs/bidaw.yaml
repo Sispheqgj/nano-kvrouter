@@ -1,9 +1,8 @@
 # nano-kvrouter — Bidaw I/O-aware scheduling demo (P5-Bidaw M1)
 #
-# Candidate J (M0 §3): cpu_blocks=0 makes disk hits visible without
-# physical disk->cpu promotion (M1.5 only). gpu_blocks=80 keeps a mix of
-# GPU and disk hits. prefix_sharing_ratio=0.88 + num_buckets=4 provide
-# enough prefix reuse to exercise both cache-aware and cache-blind policies.
+# Candidate J (M0 §3): cpu_blocks=0 keeps disk hits visible in the low-pressure
+# demo, so physical disk->cpu promotions are skipped here by design. Use
+# configs/bidaw-stress.yaml for preparing-queue contention.
 #
 # scheduler.name is conductor (default sweep). Use --scheduler bidaw to
 # exercise Bidaw's dual-queue path.

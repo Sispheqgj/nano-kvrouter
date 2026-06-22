@@ -1,0 +1,6 @@
+{"request_id":"interactive-0","arrival_ms":0.0,"input_length":32,"output_length":16,"session_id":"u-short","round_index":0,"query_length":32,"previous_answer_length":0}
+{"request_id":"interactive-1","arrival_ms":1000.0,"input_length":32,"output_length":96,"session_id":"u-long","round_index":0,"query_length":32,"previous_answer_length":0}
+{"request_id":"interactive-2","arrival_ms":2000.0,"input_length":64,"output_length":16,"session_id":"u-short","round_index":1,"query_length":16,"previous_answer_length":16}
+{"request_id":"interactive-3","arrival_ms":3000.0,"input_length":144,"output_length":16,"session_id":"u-long","round_index":1,"query_length":16,"previous_answer_length":96}
+{"request_id":"interactive-4","arrival_ms":4000.0,"input_length":32,"output_length":48,"session_id":"u-medium","round_index":0,"query_length":32,"previous_answer_length":0}
+{"request_id":"interactive-5","arrival_ms":5000.0,"input_length":96,"output_length":16,"session_id":"u-short","round_index":2,"query_length":16,"previous_answer_length":16}

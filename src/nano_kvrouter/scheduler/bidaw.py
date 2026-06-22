@@ -17,10 +17,10 @@ not CPU-to-GPU reloads. Formula mirrors cache_manager.py:241-247 exactly:
 max(0.0, ...) guards against floating-point underflow. The 5 existing
 schedulers are unaffected.
 
-M1 limitation:
-KV_LOAD_COMPLETE only gates this request's PREFILL_START; it does NOT
-promote disk blocks to CPU tier in BlockPool. Physical disk→CPU promotion
-is M1.5 (separate commit after M1 ships).
+Metadata boundary:
+KV_LOAD_COMPLETE gates this request's PREFILL_START and the cli wiring
+attempts metadata-only disk→CPU promotion via CacheManager. No real tensor
+copy exists; CPU/GPU are both treated as Bidaw's ready/performance layer.
 """
 from __future__ import annotations
 
