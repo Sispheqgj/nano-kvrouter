@@ -63,7 +63,7 @@ def test_controller_single_slot_serializes() -> None:
     # Pick and start first load.
     req_first = ctrl.pick_next_to_load("d0", now_ms=5.0)
     assert req_first is not None
-    ctrl.mark_load_started("d0", req_first.request_id, now_ms=5.0)
+    ctrl.mark_load_started("d0", req_first.request_id, now_ms=5.0, service_ms=10.0)
 
     # Slot is now busy — pick must return None.
     assert ctrl.pick_next_to_load("d0", now_ms=5.0) is None
@@ -111,7 +111,7 @@ def test_controller_promote_to_ready_on_load_complete() -> None:
     ctrl.on_arrive(req0, "d0", matched_disk_blocks=3, now_ms=5.0)
     picked = ctrl.pick_next_to_load("d0", now_ms=10.0)
     assert picked is not None
-    ctrl.mark_load_started("d0", picked.request_id, now_ms=10.0)
+    ctrl.mark_load_started("d0", picked.request_id, now_ms=10.0, service_ms=10.0)
 
     # Slot is busy.
     assert not ctrl.has_idle_load_slot("d0")
@@ -136,11 +136,11 @@ def test_controller_double_load_start_raises() -> None:
 
     r0 = ctrl.pick_next_to_load("d0", now_ms=5.0)
     assert r0 is not None
-    ctrl.mark_load_started("d0", r0.request_id, now_ms=5.0)
+    ctrl.mark_load_started("d0", r0.request_id, now_ms=5.0, service_ms=10.0)
 
     # Slot is busy — second call must raise.
     with pytest.raises(RuntimeError, match="already has in-flight"):
-        ctrl.mark_load_started("d0", "r1", now_ms=5.0)
+        ctrl.mark_load_started("d0", "r1", now_ms=5.0, service_ms=10.0)
 
 
 def test_controller_get_waiting_ms() -> None:
@@ -158,7 +158,7 @@ def test_controller_per_node_isolation() -> None:
     ctrl.on_arrive(_req("r1"), "d1", matched_disk_blocks=2, now_ms=0.0)
 
     r0 = ctrl.pick_next_to_load("d0", now_ms=5.0)
-    ctrl.mark_load_started("d0", r0.request_id, now_ms=5.0)
+    ctrl.mark_load_started("d0", r0.request_id, now_ms=5.0, service_ms=10.0)
 
     # d0 slot busy, but d1 slot is still idle.
     assert not ctrl.has_idle_load_slot("d0")

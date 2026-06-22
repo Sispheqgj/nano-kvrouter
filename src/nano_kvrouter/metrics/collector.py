@@ -41,11 +41,14 @@ class MetricsCollector:
       the M3 ``prefill_decode_interleave_step_count`` (which was per-tick
       same-node and went to 0 under always-split P/D).
 
-    Event payload contract:
+        Event payload contract:
         REQUEST_ARRIVE:    {"request": Request}
         SCHEDULED:         {"request_id": str, "decision": SchedulingDecision,
                             "matched_tokens": int}
+                            Bidaw M3 metrics sample decision.routing_score
+                            and decision.affinity_hit when present.
         REQUEST_REJECTED:  {"request_id": str, "reason": str}
+                            ttft_slo_rejections samples reason only.
         PREFILL_START:     {"request_id": str, "n_chunks": int}
         PREFILL_COMPLETE:  {"request_id": str}
         KV_TRANSFER_START: {"transfer_id": str, "service_cost_ms": float,
@@ -132,6 +135,10 @@ class MetricsCollector:
         self._bidaw_physical_skipped_blocks: int = 0
         # Stale-guard: mirrors _seen_transfer_ids for KV_LOAD events.
         self._seen_load_req_ids: set[str] = set()
+        # P5-Bidaw M3 metrics.
+        self._bidaw_routing_score_samples: list[float] = []
+        self._bidaw_session_affinity_hits: int = 0
+        self._ttft_slo_rejections: int = 0
 
     # ------------------------------------------------------------------
     # Public API
@@ -226,6 +233,12 @@ class MetricsCollector:
             "bidaw_answer_eviction_cpu_saved_blocks": 0,
             "bidaw_answer_eviction_hit_potential_avg": 0.0,
             "bidaw_answer_eviction_cpu_hit_rate": 0.0,
+            "bidaw_routing_score_avg": (
+                statistics.mean(self._bidaw_routing_score_samples)
+                if self._bidaw_routing_score_samples else 0.0
+            ),
+            "bidaw_session_affinity_hits": self._bidaw_session_affinity_hits,
+            "ttft_slo_rejections": self._ttft_slo_rejections,
         }
 
     # ------------------------------------------------------------------
@@ -266,6 +279,11 @@ class MetricsCollector:
         if decision is not None:
             rec["prefill_node"] = getattr(decision, "prefill_node", None)
             rec["decode_node"] = getattr(decision, "decode_node", None)
+            routing_score = getattr(decision, "routing_score", None)
+            if routing_score is not None:
+                self._bidaw_routing_score_samples.append(float(routing_score))
+            if getattr(decision, "affinity_hit", False) is True:
+                self._bidaw_session_affinity_hits += 1
         # M6: accumulate per-tier hit block counts.
         by_tier = event.payload.get("matched_blocks_by_tier") or {}
         for tier, n in by_tier.items():
@@ -278,6 +296,8 @@ class MetricsCollector:
             logger.warning("REQUEST_REJECTED payload missing 'request_id', skipping")
             return
         self._rejected_count += 1
+        if event.payload.get("reason") == "ttft_slo_exceeded":
+            self._ttft_slo_rejections += 1
         # Clean up lifecycle state set by PREFILL_START (B2 mid-prefill reject
         # path). No-ops for B1 rejects that fire before PREFILL_START.
         self._request_n_chunks.pop(request_id, None)

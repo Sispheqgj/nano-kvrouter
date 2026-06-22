@@ -23,6 +23,7 @@ import logging
 from dataclasses import dataclass
 from typing import Literal, Sequence
 
+from nano_kvrouter.config import BandwidthConfig, ModelConfig
 from nano_kvrouter.request import Request
 from nano_kvrouter.scheduler.bidaw import hrrn_priority
 
@@ -65,7 +66,17 @@ class BidawAdmissionController:
         get_waiting_ms — helper for KV_LOAD_START payload construction.
     """
 
-    def __init__(self, decode_node_ids: Sequence[str]) -> None:
+    def __init__(
+        self,
+        decode_node_ids: Sequence[str],
+        *,
+        model_config: ModelConfig | None = None,
+        bandwidth_config: BandwidthConfig | None = None,
+        affinity_enabled: bool = False,
+    ) -> None:
+        self._model_cfg = model_config
+        self._bw_cfg = bandwidth_config
+        self.affinity_enabled = affinity_enabled
         # Per-node preparing queue.
         self._preparing: dict[str, list[PreparingEntry]] = {
             nid: [] for nid in decode_node_ids
@@ -74,8 +85,15 @@ class BidawAdmissionController:
         self._in_flight_load: dict[str, str | None] = {
             nid: None for nid in decode_node_ids
         }
+        # Per-node in-flight load finish time, used for deterministic A2
+        # projected-wait estimates. None means the load slot is idle.
+        self._in_flight_finish_ms: dict[str, float | None] = {
+            nid: None for nid in decode_node_ids
+        }
         # Arrival time registry for HRRN waiting_ms calculation.
         self._arrival_ms_by_req: dict[str, float] = {}
+        # Session affinity is bounded by the distinct session IDs in the workload.
+        self._session_to_decode: dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -139,14 +157,19 @@ class BidawAdmissionController:
         return best.request
 
     def mark_load_started(
-        self, decode_node_id: str, req_id: str, now_ms: float
+        self,
+        decode_node_id: str,
+        req_id: str,
+        now_ms: float,
+        service_ms: float,
     ) -> None:
         """Claim the in-flight load slot for req_id on decode_node_id.
 
         Args:
             decode_node_id: Decode node whose slot to claim.
             req_id: Request starting the load.
-            now_ms: Current simulated time (reserved for future tracking).
+            now_ms: Current simulated time.
+            service_ms: Load service time in milliseconds.
 
         Raises:
             RuntimeError: If the slot is already occupied (single-slot invariant
@@ -160,6 +183,7 @@ class BidawAdmissionController:
                 f"cannot start load for {req_id!r}"
             )
         self._in_flight_load[decode_node_id] = req_id
+        self._in_flight_finish_ms[decode_node_id] = now_ms + service_ms
 
     def mark_load_completed(
         self, decode_node_id: str, req_id: str, now_ms: float
@@ -185,6 +209,7 @@ class BidawAdmissionController:
         entry = next(e for e in entries if e.request_id == req_id)
         entries.remove(entry)
         self._in_flight_load[decode_node_id] = None
+        self._in_flight_finish_ms[decode_node_id] = None
         preparing_wait_ms = now_ms - entry.arrival_ms
         self._arrival_ms_by_req.pop(req_id, None)
         return entry.request, preparing_wait_ms
@@ -215,3 +240,59 @@ class BidawAdmissionController:
         """
         arrival = self._arrival_ms_by_req.get(req_id, now_ms)
         return now_ms - arrival
+
+    def peek_preparing_disk_blocks(self, decode_node_id: str) -> int:
+        """Return queued preparing disk blocks, excluding the active load."""
+        in_flight_req = self._in_flight_load.get(decode_node_id)
+        return sum(
+            entry.disk_blocks
+            for entry in self._preparing.get(decode_node_id, [])
+            if entry.request_id != in_flight_req
+        )
+
+    def peek_in_flight_disk_blocks(self, decode_node_id: str) -> int:
+        """Return disk block count for the request currently loading."""
+        req_id = self._in_flight_load.get(decode_node_id)
+        if req_id is None:
+            return 0
+        for entry in self._preparing.get(decode_node_id, []):
+            if entry.request_id == req_id:
+                return entry.disk_blocks
+        return 0
+
+    def peek_projected_preparing_wait_ms(
+        self,
+        decode_node_id: str,
+        my_disk_blocks: int,
+        now_ms: float,
+    ) -> float:
+        """Estimate single-slot wait plus own load service for a disk-hit request.
+
+        The formula intentionally mirrors the actual cli.py KV_LOAD service
+        path: ``disk_blocks * block_bytes / cpu_to_disk * 1000``. It does not
+        use CacheManager's two-hop disk transfer estimate.
+        """
+        if my_disk_blocks == 0:
+            return 0.0
+        if self._model_cfg is None or self._bw_cfg is None:
+            raise ValueError(
+                "BidawAdmissionController needs model_config and bandwidth_config "
+                "to project preparing wait"
+            )
+
+        finish_ms = self._in_flight_finish_ms.get(decode_node_id)
+        residual_ms = 0.0 if finish_ms is None else max(0.0, finish_ms - now_ms)
+        queued_disk_blocks = self.peek_preparing_disk_blocks(decode_node_id)
+        block_bytes = self._model_cfg.block_size * self._model_cfg.kv_bytes_per_token
+        service_ms_per_block = block_bytes / self._bw_cfg.cpu_to_disk * 1000.0
+        return residual_ms + (queued_disk_blocks + my_disk_blocks) * service_ms_per_block
+
+    def peek_session_affinity(self, session_id: str) -> str | None:
+        """Return pinned decode node for *session_id*, if any."""
+        return self._session_to_decode.get(session_id)
+
+    def commit_session_affinity(self, session_id: str, decode_node_id: str) -> None:
+        """Pin *session_id* to *decode_node_id* for later routing decisions."""
+        if not self.affinity_enabled:
+            return
+        self._session_to_decode[session_id] = decode_node_id

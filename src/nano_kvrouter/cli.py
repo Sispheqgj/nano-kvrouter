@@ -39,6 +39,7 @@ from nano_kvrouter.kv_cache.cache_manager import CacheManager
 from nano_kvrouter.metrics.collector import MetricsCollector
 from nano_kvrouter.scheduler.base import SchedulingPolicy, TransferBacklogView
 from nano_kvrouter.scheduler.bidaw import BidawPolicy
+from nano_kvrouter.scheduler.bidaw_view import BidawControllerView
 from nano_kvrouter.scheduler.conductor import MooncakeConductor
 from nano_kvrouter.scheduler.e2_policy import E2Policy
 from nano_kvrouter.scheduler.least_loaded import LeastLoadedPolicy
@@ -79,6 +80,7 @@ def _build_scheduler(
     bandwidth_cfg: BandwidthConfig | None = None,
     *,
     backlog_view: TransferBacklogView,
+    bidaw_controller: BidawControllerView | None = None,
 ) -> SchedulingPolicy:
     """Construct a scheduler by name.
 
@@ -138,7 +140,25 @@ def _build_scheduler(
             backlog_view=backlog_view,
         )
     if name == "bidaw":
-        return BidawPolicy(model_config=model_cfg, bandwidth_config=bw, backlog_view=backlog_view)
+        return BidawPolicy(
+            model_config=model_cfg,
+            bandwidth_config=bw,
+            backlog_view=backlog_view,
+            controller_view=bidaw_controller,
+            enable_routing_aware=bool(params.get("enable_routing_aware", False)),
+            enable_ttft_slo_gate=bool(params.get("enable_ttft_slo_gate", False)),
+            enable_session_affinity=bool(params.get("enable_session_affinity", False)),
+            routing_weight_matched_blocks=float(
+                params.get("routing_weight_matched_blocks", 1.0)
+            ),
+            routing_weight_load=float(params.get("routing_weight_load", 1.0)),
+            routing_weight_preparing=float(params.get("routing_weight_preparing", 1.0)),
+            routing_weight_in_flight=float(params.get("routing_weight_in_flight", 2.0)),
+            affinity_overload_factor=float(params.get("affinity_overload_factor", 1.5)),
+            affinity_overload_abs_floor=float(
+                params.get("affinity_overload_abs_floor", 2.0)
+            ),
+        )
     raise ValueError(f"Unknown scheduler {name!r}; valid: {SCHEDULER_NAMES}")
 
 
@@ -171,6 +191,7 @@ def _wire_simulator(
     bandwidth_cfg: BandwidthConfig,
     transfer_model: TransferModel,
     bidaw_mode: bool = False,
+    bidaw_controller: BidawAdmissionController | None = None,
 ) -> None:
     """Register simulation event handlers on *eng* (M5a split P/D).
 
@@ -208,6 +229,8 @@ def _wire_simulator(
     prefill_nodes_by_id: dict[str, MockEngineNode] = {n.node_id: n for n in prefill_nodes}
     decode_nodes_by_id: dict[str, MockEngineNode] = {n.node_id: n for n in decode_nodes}
     all_nodes_by_id: dict[str, MockEngineNode] = {**prefill_nodes_by_id, **decode_nodes_by_id}
+    if bidaw_mode and bidaw_controller is None:
+        bidaw_controller = BidawAdmissionController([n.node_id for n in decode_nodes])
 
     # Per-request bookkeeping (single source of truth across handlers).
     _decisions: dict[str, Any] = {}   # request_id → SchedulingDecision
@@ -462,6 +485,7 @@ def _wire_simulator(
 
         # Admit KV into decode_node cache and pin the active request BlockTable.
         try:
+            materialized_ok = True
             cm.materialize_request(
                 request_id,
                 req.token_ids,
@@ -469,6 +493,7 @@ def _wire_simulator(
                 request=req,
             )
         except MemoryError:
+            materialized_ok = False
             logger_.debug(
                 "cm.materialize_request MemoryError for %s on %s; KV not cached",
                 request_id, decision.decode_node,
@@ -483,6 +508,14 @@ def _wire_simulator(
         )
         decode_node.start_decode(request_id)
         _wake_batch_step(decode_node, decode_node.node_id, engine)
+
+        if (
+            bidaw_controller is not None
+            and bidaw_controller.affinity_enabled
+            and req.session_id is not None
+            and materialized_ok
+        ):
+            bidaw_controller.commit_session_affinity(req.session_id, decision.decode_node)
 
     def on_decode_batch_step(event: Event, engine: SimulationEngine) -> None:
         node_id = event.payload["node_id"]
@@ -574,10 +607,11 @@ def _wire_simulator(
         _wake_batch_step(node, node_id, engine)
 
     if bidaw_mode:
+        assert bidaw_controller is not None
         _wire_bidaw_branch(
             eng, sched, cm, prefill_nodes_by_id, decode_nodes_by_id,
             _decisions, _requests, _compute_n_chunks, _wake_batch_step,
-            controller=BidawAdmissionController([n.node_id for n in decode_nodes]),
+            controller=bidaw_controller,
             logger_=logger_,
             model_cfg=model_cfg,
             bandwidth_cfg=bandwidth_cfg,
@@ -642,7 +676,12 @@ def _wire_bidaw_branch(
         preparing_wait_ms = controller.get_waiting_ms(req.request_id, engine.now())
 
         # Claim the slot before scheduling events to prevent double-scheduling.
-        controller.mark_load_started(decode_node_id, req.request_id, engine.now())
+        controller.mark_load_started(
+            decode_node_id,
+            req.request_id,
+            engine.now(),
+            load_service_ms,
+        )
 
         now = engine.now()
         engine.schedule(Event(
@@ -852,12 +891,21 @@ def _run_one(cfg: NanoKVConfig, scheduler_name: str) -> dict:
         if cfg.bandwidth.contention_model == "per_node_lane"
         else NoopTransferModel()
     )
+    bidaw_controller: BidawAdmissionController | None = None
+    if scheduler_name == "bidaw":
+        bidaw_controller = BidawAdmissionController(
+            [n.node_id for n in decode_nodes],
+            model_config=cfg.model,
+            bandwidth_config=cfg.bandwidth,
+            affinity_enabled=bool(cfg.scheduler.params.get("enable_session_affinity", False)),
+        )
     sched = _build_scheduler(
         scheduler_name,
         cfg.scheduler.params,
         cfg.model,
         cfg.bandwidth,
         backlog_view=transfer_model,
+        bidaw_controller=bidaw_controller,
     )
     metrics = MetricsCollector()
     if cfg.trace is not None:
@@ -885,6 +933,7 @@ def _run_one(cfg: NanoKVConfig, scheduler_name: str) -> dict:
         logger_=logger, model_cfg=cfg.model, bandwidth_cfg=cfg.bandwidth,
         transfer_model=transfer_model,
         bidaw_mode=(scheduler_name == "bidaw"),
+        bidaw_controller=bidaw_controller,
     )
     all_nodes = {n.node_id: n for n in [*prefill_nodes, *decode_nodes]}
     metrics.attach(eng, nodes=all_nodes)
@@ -931,6 +980,9 @@ _TABLE_KEYS = [
     "bidaw_answer_eviction_cpu_saved_blocks",
     "bidaw_answer_eviction_hit_potential_avg",
     "bidaw_answer_eviction_cpu_hit_rate",
+    "bidaw_routing_score_avg",
+    "bidaw_session_affinity_hits",
+    "ttft_slo_rejections",
 ]
 
 _SWEEP_KEYS = [
@@ -945,6 +997,9 @@ _SWEEP_KEYS = [
     "kv_transfer_time_avg_ms",
     "bidaw_answer_eviction_count",
     "bidaw_answer_eviction_cpu_hit_rate",
+    "bidaw_routing_score_avg",
+    "bidaw_session_affinity_hits",
+    "ttft_slo_rejections",
 ]
 
 

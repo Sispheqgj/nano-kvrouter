@@ -30,6 +30,7 @@ from nano_kvrouter.engine.mock_node import MockEngineNode
 from nano_kvrouter.kv_cache.cache_manager import CacheManager
 from nano_kvrouter.metrics.collector import MetricsCollector
 from nano_kvrouter.request import Request
+from nano_kvrouter.simulator.bidaw_controller import BidawAdmissionController
 from nano_kvrouter.simulator.engine import SimulationEngine
 from nano_kvrouter.simulator.event import Event, EventType
 from nano_kvrouter.simulator.generator import RequestGenerator
@@ -37,6 +38,9 @@ from nano_kvrouter.simulator.transfer_model import NoopTransferModel
 
 _BIDAW_YAML = str(Path(__file__).parent.parent / "configs" / "bidaw.yaml")
 _BIDAW_STRESS_YAML = str(Path(__file__).parent.parent / "configs" / "bidaw-stress.yaml")
+_BIDAW_M3_STRESS_YAML = str(
+    Path(__file__).parent.parent / "configs" / "bidaw-m3-stress.yaml"
+)
 _BIDAW_INTERACTIVE_YAML = str(
     Path(__file__).parent.parent / "configs" / "bidaw-interactive.yaml"
 )
@@ -481,3 +485,78 @@ def test_bidaw_kv_load_stale_guard_drops_unknown_complete() -> None:
 
     # Stale event must be silently dropped — promotions count stays at 0.
     assert collector.summary()["bidaw_preparing_promotions"] == 0
+
+
+def test_bidaw_m3_all_flags_stress_config_runs() -> None:
+    """All three M3 flags on should run deterministically without crashing."""
+    cfg = load_config(_BIDAW_M3_STRESS_YAML)
+    summary = _run_one(cfg, "bidaw")
+
+    assert summary["total_arrived"] > 0
+    assert "bidaw_routing_score_avg" in summary
+    assert "bidaw_session_affinity_hits" in summary
+    assert "ttft_slo_rejections" in summary
+
+
+def test_bidaw_capacity_reject_does_not_commit_affinity_in_cli_wiring() -> None:
+    """Decode capacity rejection must happen before A3 affinity commit."""
+    cfg = NanoKVConfig(
+        cluster=ClusterConfig(prefill_nodes=1, decode_nodes=1),
+        node=NodeConfig(capacity=1, gpu_blocks=100, cpu_blocks=10, disk_blocks=100),
+        model=ModelConfig(block_size=16, kv_bytes_per_token=4096, prefill_chunk_size=512),
+        bandwidth=BandwidthConfig(),
+        slo=SLOConfig(ttft_target_ms=10_000.0, tbt_target_ms=10_000.0),
+        workload=WorkloadConfig(
+            request_rate=1.0,
+            duration_s=1.0,
+            avg_prompt_len=32,
+            avg_output_len=2,
+        ),
+        scheduler=SchedulerConfig(name="bidaw", params={"enable_session_affinity": True}),
+        generator=GeneratorConfig(seed=42),
+    )
+    eng, prefill_nodes, decode_nodes, cm, _gen = _build_sim(cfg)
+    controller = BidawAdmissionController(
+        [n.node_id for n in decode_nodes],
+        model_config=cfg.model,
+        bandwidth_config=cfg.bandwidth,
+        affinity_enabled=True,
+    )
+    transfer_model = NoopTransferModel()
+    sched = _build_scheduler(
+        "bidaw",
+        cfg.scheduler.params,
+        cfg.model,
+        cfg.bandwidth,
+        backlog_view=transfer_model,
+        bidaw_controller=controller,
+    )
+    _wire_simulator(
+        eng,
+        sched,
+        cm,
+        prefill_nodes,
+        decode_nodes,
+        logger_=_LOG,
+        model_cfg=cfg.model,
+        bandwidth_cfg=cfg.bandwidth,
+        transfer_model=transfer_model,
+        bidaw_mode=True,
+        bidaw_controller=controller,
+    )
+    decode_nodes[0].admit("blocker", expected_output_len=4, prompt_len=32, uncached_tokens=0)
+    req = Request(
+        request_id="capacity-reject",
+        token_ids=list(range(32)),
+        prefix_hash="cap",
+        expected_output_len=2,
+        arrival_time=0.0,
+        slo_ttft=10_000.0,
+        slo_tbt=10_000.0,
+        session_id="s-capacity",
+    )
+
+    eng.schedule(Event(time=0.0, type=EventType.REQUEST_ARRIVE, payload={"request": req}))
+    eng.run()
+
+    assert controller.peek_session_affinity("s-capacity") is None

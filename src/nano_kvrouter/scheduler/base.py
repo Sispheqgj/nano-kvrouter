@@ -196,6 +196,10 @@ class SchedulingDecision:
         reject_reason: Free-text reason for rejection. ``None`` iff the
             request was accepted; set to a human-readable string when
             rejected (e.g. ``"ttft_slo_exceeded"``).
+        routing_score: Optional Bidaw routing score. ``None`` for schedulers
+            that do not expose a routing-aware score.
+        affinity_hit: True when Bidaw session affinity pinned the request to
+            the returned decode node.
     """
 
     prefill_node: str | None
@@ -203,6 +207,8 @@ class SchedulingDecision:
     estimated_ttft_ms: float
     estimated_tbt_ms: float
     reject_reason: str | None = None
+    routing_score: float | None = None
+    affinity_hit: bool = False
 
     @property
     def is_rejected(self) -> bool:
