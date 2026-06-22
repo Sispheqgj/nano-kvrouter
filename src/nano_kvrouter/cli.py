@@ -46,6 +46,11 @@ from nano_kvrouter.scheduler.least_loaded import LeastLoadedPolicy
 from nano_kvrouter.scheduler.prefix_greedy import PrefixGreedyPolicy
 from nano_kvrouter.scheduler.round_robin import RoundRobinPolicy
 from nano_kvrouter.simulator.bidaw_controller import BidawAdmissionController
+from nano_kvrouter.simulator.bidaw_load_model import (
+    BidawLoadModel,
+    MultiStreamLoadModel,
+    SingleSlotLoadModel,
+)
 from nano_kvrouter.simulator.engine import SimulationEngine
 from nano_kvrouter.simulator.transfer_model import (
     NoopTransferModel,
@@ -177,6 +182,27 @@ def _build_answer_eviction_policy(
     return AnswerEvictionPolicy.default()
 
 
+def _build_bidaw_load_model(
+    params: dict[str, Any],
+    decode_node_ids: list[str],
+) -> BidawLoadModel:
+    """Build Bidaw KV-load slot model from scheduler params."""
+    kind = params.get("load_model", "single")
+    num_streams = int(params.get("num_streams", 1))
+    if kind == "single":
+        if num_streams != 1:
+            raise ValueError(
+                f"load_model='single' is incompatible with num_streams={num_streams}. "
+                f"Use load_model='multi' for K>1 or remove num_streams."
+            )
+        return SingleSlotLoadModel(decode_node_ids)
+    if kind == "multi":
+        if num_streams < 1:
+            raise ValueError(f"num_streams must be >= 1, got {num_streams}")
+        return MultiStreamLoadModel(decode_node_ids, num_streams=num_streams)
+    raise ValueError(f"unknown load_model: {kind!r}")
+
+
 # ----------------- event wiring -----------------
 
 def _wire_simulator(
@@ -230,7 +256,11 @@ def _wire_simulator(
     decode_nodes_by_id: dict[str, MockEngineNode] = {n.node_id: n for n in decode_nodes}
     all_nodes_by_id: dict[str, MockEngineNode] = {**prefill_nodes_by_id, **decode_nodes_by_id}
     if bidaw_mode and bidaw_controller is None:
-        bidaw_controller = BidawAdmissionController([n.node_id for n in decode_nodes])
+        decode_node_ids = [n.node_id for n in decode_nodes]
+        bidaw_controller = BidawAdmissionController(
+            decode_node_ids,
+            load_model=SingleSlotLoadModel(decode_node_ids),
+        )
 
     # Per-request bookkeeping (single source of truth across handlers).
     _decisions: dict[str, Any] = {}   # request_id → SchedulingDecision
@@ -658,62 +688,65 @@ def _wire_bidaw_branch(
     """
     prefill_nodes = list(prefill_nodes_by_id.values())
 
-    def _try_schedule_kv_load(decode_node_id: str, engine: SimulationEngine) -> None:
-        """Pick next HRRN candidate from preparing queue and schedule KV_LOAD events."""
-        req = controller.pick_next_to_load(decode_node_id, engine.now())
-        if req is None:
-            return
-        decision = _decisions.get(req.request_id)
-        if decision is None:
-            return
-        try:
-            decode_lookup = cm.lookup(req, decode_node_id)
-        except KeyError:
-            return
-        disk_blocks = decode_lookup.matched_blocks_by_tier.get("disk", 0)
-        block_bytes = model_cfg.block_size * model_cfg.kv_bytes_per_token
-        # Disk-hit pays both serial hops: Disk→CPU (1/cpu_to_disk) + CPU→GPU
-        # (1/gpu_to_cpu). Matches cache_manager.py's transfer_cost_ms estimate
-        # (see cache_manager.py:25, 365) so the bidaw double-charging guard at
-        # scheduler/bidaw.py:281 stays balanced.
-        load_service_ms = (
-            disk_blocks
-            * block_bytes
-            * (1.0 / bandwidth_cfg.cpu_to_disk + 1.0 / bandwidth_cfg.gpu_to_cpu)
-            * 1000.0
-        )
-        preparing_wait_ms = controller.get_waiting_ms(req.request_id, engine.now())
+    def _drain_idle_slots(
+        decode_node_id: str,
+        now_ms: float,
+        engine: SimulationEngine,
+    ) -> None:
+        """Fill every currently idle KV-load slot from the preparing queue."""
+        while True:
+            req = controller.pick_next_to_load(decode_node_id, now_ms)
+            if req is None:
+                return
+            decision = _decisions.get(req.request_id)
+            if decision is None:
+                return
+            try:
+                decode_lookup = cm.lookup(req, decode_node_id)
+            except KeyError:
+                return
+            disk_blocks = decode_lookup.matched_blocks_by_tier.get("disk", 0)
+            block_bytes = model_cfg.block_size * model_cfg.kv_bytes_per_token
+            # Disk-hit pays both serial hops: Disk→CPU (1/cpu_to_disk) + CPU→GPU
+            # (1/gpu_to_cpu). Matches cache_manager.py's transfer_cost_ms estimate.
+            load_service_ms = (
+                disk_blocks
+                * block_bytes
+                * (1.0 / bandwidth_cfg.cpu_to_disk + 1.0 / bandwidth_cfg.gpu_to_cpu)
+                * 1000.0
+            )
+            preparing_wait_ms = controller.get_waiting_ms(req.request_id, now_ms)
 
-        # Claim the slot before scheduling events to prevent double-scheduling.
-        controller.mark_load_started(
-            decode_node_id,
-            req.request_id,
-            engine.now(),
-            load_service_ms,
-        )
+            # Claim before scheduling events so the next loop iteration sees
+            # this request as in-flight and cannot re-pick it.
+            controller.mark_load_started(
+                decode_node_id,
+                req.request_id,
+                now_ms,
+                load_service_ms,
+            )
 
-        now = engine.now()
-        engine.schedule(Event(
-            time=now,
-            type=EventType.KV_LOAD_START,
-            payload={
-                "request_id": req.request_id,
-                "decode_node_id": decode_node_id,
-                "disk_blocks": disk_blocks,
-                "load_service_ms": load_service_ms,
-                "preparing_wait_ms": preparing_wait_ms,
-            },
-        ))
-        engine.schedule(Event(
-            time=now + load_service_ms,
-            type=EventType.KV_LOAD_COMPLETE,
-            payload={
-                "request_id": req.request_id,
-                "decode_node_id": decode_node_id,
-                "promoted_count": 0,
-                "skipped_count": 0,
-            },
-        ))
+            engine.schedule(Event(
+                time=now_ms,
+                type=EventType.KV_LOAD_START,
+                payload={
+                    "request_id": req.request_id,
+                    "decode_node_id": decode_node_id,
+                    "disk_blocks": disk_blocks,
+                    "load_service_ms": load_service_ms,
+                    "preparing_wait_ms": preparing_wait_ms,
+                },
+            ))
+            engine.schedule(Event(
+                time=now_ms + load_service_ms,
+                type=EventType.KV_LOAD_COMPLETE,
+                payload={
+                    "request_id": req.request_id,
+                    "decode_node_id": decode_node_id,
+                    "promoted_count": 0,
+                    "skipped_count": 0,
+                },
+            ))
 
     def on_arrive_bidaw(event: Event, engine: SimulationEngine) -> None:
         req = event.payload["request"]
@@ -774,11 +807,11 @@ def _wire_bidaw_branch(
                 ))
         else:
             # "preparing": disk hit — defer prefill until KV_LOAD_COMPLETE.
-            # Try to kick off a disk load if the node's slot is idle.
-            _try_schedule_kv_load(decision.decode_node, engine)
+            # Fill every currently idle load slot on the decode node.
+            _drain_idle_slots(decision.decode_node, engine.now(), engine)
 
     def on_kv_load_start(event: Event, engine: SimulationEngine) -> None:
-        """Metrics hook only — controller state already updated by _try_schedule_kv_load."""
+        """Metrics hook only — controller state already updated by _drain_idle_slots."""
         logger_.debug(
             "KV_LOAD_START: request_id=%s decode_node=%s disk_blocks=%d service_ms=%.3f",
             event.payload.get("request_id"),
@@ -801,7 +834,7 @@ def _wire_bidaw_branch(
             logger_.warning(
                 "on_kv_load_complete: no preparing entry for %s on %s", req_id, decode_node_id
             )
-            _try_schedule_kv_load(decode_node_id, engine)
+            _drain_idle_slots(decode_node_id, engine.now(), engine)
             return
 
         try:
@@ -821,7 +854,7 @@ def _wire_bidaw_branch(
         decision = _decisions.get(req_id)
         if decision is None:
             logger_.warning("on_kv_load_complete: no decision for %s", req_id)
-            _try_schedule_kv_load(decode_node_id, engine)
+            _drain_idle_slots(decode_node_id, engine.now(), engine)
             return
 
         # Admit request to prefill now that its disk load is done.
@@ -852,7 +885,7 @@ def _wire_bidaw_branch(
             ))
 
         # Free slot done; pick next preparing request on this node.
-        _try_schedule_kv_load(decode_node_id, engine)
+        _drain_idle_slots(decode_node_id, engine.now(), engine)
 
     eng.on(EventType.REQUEST_ARRIVE, on_arrive_bidaw)
     eng.on(EventType.KV_LOAD_START, on_kv_load_start)
@@ -902,11 +935,14 @@ def _run_one(cfg: NanoKVConfig, scheduler_name: str) -> dict:
     )
     bidaw_controller: BidawAdmissionController | None = None
     if scheduler_name == "bidaw":
+        decode_node_ids = [n.node_id for n in decode_nodes]
+        bidaw_load_model = _build_bidaw_load_model(cfg.scheduler.params, decode_node_ids)
         bidaw_controller = BidawAdmissionController(
-            [n.node_id for n in decode_nodes],
+            decode_node_ids,
             model_config=cfg.model,
             bandwidth_config=cfg.bandwidth,
             affinity_enabled=bool(cfg.scheduler.params.get("enable_session_affinity", False)),
+            load_model=bidaw_load_model,
         )
     sched = _build_scheduler(
         scheduler_name,

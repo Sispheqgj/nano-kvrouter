@@ -5,6 +5,7 @@ import pytest
 
 from nano_kvrouter.request import Request
 from nano_kvrouter.simulator.bidaw_controller import BidawAdmissionController, PreparingEntry
+from nano_kvrouter.simulator.bidaw_load_model import MultiStreamLoadModel
 
 
 # ---------------------------------------------------------------------------
@@ -167,3 +168,42 @@ def test_controller_per_node_isolation() -> None:
     r1 = ctrl.pick_next_to_load("d1", now_ms=5.0)
     assert r1 is not None
     assert r1.request_id == "r1"
+
+
+def test_controller_k2_pick_next_filters_in_flight_entries() -> None:
+    """K>1 keeps in-flight entries in _preparing but never re-picks them."""
+    ctrl = BidawAdmissionController(
+        ["d0"],
+        load_model=MultiStreamLoadModel(["d0"], num_streams=2),
+    )
+    ctrl.on_arrive(_req("r0"), "d0", matched_disk_blocks=1, now_ms=0.0)
+    ctrl.on_arrive(_req("r1"), "d0", matched_disk_blocks=2, now_ms=0.0)
+
+    first = ctrl.pick_next_to_load("d0", now_ms=100.0)
+    assert first is not None
+    ctrl.mark_load_started("d0", first.request_id, now_ms=100.0, service_ms=10.0)
+
+    second = ctrl.pick_next_to_load("d0", now_ms=100.0)
+    assert second is not None
+    assert second.request_id != first.request_id
+
+
+def test_controller_k4_peek_preparing_filters_all_in_flight_entries() -> None:
+    """peek_preparing_disk_blocks excludes every in-flight request, not just one."""
+    ctrl = BidawAdmissionController(
+        ["d0"],
+        load_model=MultiStreamLoadModel(["d0"], num_streams=4),
+    )
+    for req_id, disk_blocks in [
+        ("a", 2),
+        ("b", 3),
+        ("c", 5),
+        ("queued0", 7),
+        ("queued1", 11),
+    ]:
+        ctrl.on_arrive(_req(req_id), "d0", matched_disk_blocks=disk_blocks, now_ms=0.0)
+    for req_id in ["a", "b", "c"]:
+        ctrl.mark_load_started("d0", req_id, now_ms=0.0, service_ms=100.0)
+
+    assert ctrl.peek_preparing_disk_blocks("d0") == 18
+    assert ctrl.peek_in_flight_disk_blocks("d0") == 10

@@ -11,6 +11,7 @@ from nano_kvrouter.request import Request
 from nano_kvrouter.scheduler.base import CacheLookup
 from nano_kvrouter.scheduler.bidaw import BidawPolicy
 from nano_kvrouter.simulator.bidaw_controller import BidawAdmissionController
+from nano_kvrouter.simulator.bidaw_load_model import MultiStreamLoadModel
 from nano_kvrouter.simulator.transfer_model import NoopTransferModel
 
 
@@ -132,6 +133,54 @@ def test_projected_wait_includes_in_flight_residual_and_queued_blocks() -> None:
 
     assert ctrl.peek_projected_preparing_wait_ms("d0", 2, now_ms=5.0) == pytest.approx(
         expected
+    )
+
+
+def test_projected_wait_k2_filters_in_flight_and_uses_earliest_slot() -> None:
+    model = ModelConfig(block_size=1, kv_bytes_per_token=1)
+    bandwidth = BandwidthConfig(cpu_to_disk=100.0, gpu_to_cpu=1.0e12)
+    ctrl = BidawAdmissionController(
+        ["d0"],
+        model_config=model,
+        bandwidth_config=bandwidth,
+        load_model=MultiStreamLoadModel(["d0"], num_streams=2),
+    )
+    req_a = Request(
+        request_id="A",
+        token_ids=[1],
+        prefix_hash="a",
+        expected_output_len=1,
+        arrival_time=0.0,
+        slo_ttft=10_000.0,
+        slo_tbt=10_000.0,
+    )
+    req_c = Request(
+        request_id="C",
+        token_ids=[2],
+        prefix_hash="c",
+        expected_output_len=1,
+        arrival_time=0.0,
+        slo_ttft=10_000.0,
+        slo_tbt=10_000.0,
+    )
+    req_b = Request(
+        request_id="B",
+        token_ids=[3],
+        prefix_hash="b",
+        expected_output_len=1,
+        arrival_time=0.0,
+        slo_ttft=10_000.0,
+        slo_tbt=10_000.0,
+    )
+    ctrl.on_arrive(req_a, "d0", matched_disk_blocks=3, now_ms=0.0)
+    ctrl.on_arrive(req_c, "d0", matched_disk_blocks=2, now_ms=0.0)
+    ctrl.on_arrive(req_b, "d0", matched_disk_blocks=3, now_ms=0.0)
+    ctrl.mark_load_started("d0", "A", now_ms=0.0, service_ms=5.0)
+    ctrl.mark_load_started("d0", "C", now_ms=0.0, service_ms=15.0)
+
+    assert ctrl.peek_projected_preparing_wait_ms("d0", 2, now_ms=0.0) == pytest.approx(
+        35.0,
+        rel=1e-6,
     )
 
 
