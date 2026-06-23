@@ -2,7 +2,9 @@
 
 > No-code preflight for plan v1 (in-place patched after Codex YES
 > with revisions) of P5-Bidaw M5 (GPU-only performance mode).
-> HEAD=`0640c8e`. Working tree clean. 531 tests pass.
+> Baselines locked at `0640c8e` (M4 docs sync); current HEAD
+> `42206ce` after M0 docs commits. Working tree clean. 531 tests
+> pass.
 >
 > Plan: `.claude/plans/p5-bidaw-m5-gpu-only-plan-v1.md` (Codex YES
 > with 4 Important + 2 Nit revisions, all applied in-place).
@@ -90,11 +92,14 @@ cpu_blocks plumbing happens inside the controller body.
 Same conclusion as M3/M4 M0: M5 ship-gate sweeps use a named yaml
 file (`configs/bidaw-m5-gpu-only.yaml`). No CLI override needed.
 
-## 4. Locked baselines (HEAD=`0640c8e`)
+## 4. Locked baselines (baselines at `0640c8e`; HEAD now `42206ce` post doc-only commits)
 
-13 sweep configs (8 non-bidaw + 5 bidaw-family + bidaw-m4-multistream =
-**14 yamls actually run via sweep**) + 1 sensitivity workflow. JSONs
-at `$CLAUDE_JOB_DIR/m5-baselines/`.
+**13 sweep configs** (7 non-bidaw: `default / heavy / hicache /
+pd_split / trace_burstgpt / trace_mooncake / transfer_contention`
++ 6 bidaw-family: `bidaw / bidaw-interactive / bidaw-stress /
+bidaw-affinity / bidaw-m3-stress / bidaw-m4-multistream`)
+**+ 1 sensitivity workflow** (`cli sensitivity --config configs/sensitivity.yaml`).
+14 JSON artifacts total. JSONs at `$CLAUDE_JOB_DIR/m5-baselines/`.
 
 ### Bidaw-family key metrics (HEAD=0640c8e, post-M4)
 
