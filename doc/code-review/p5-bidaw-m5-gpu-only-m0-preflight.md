@@ -230,7 +230,7 @@ Expected: 531 tests pass; 14 JSONs match this doc's tables.
   BidawPolicy (11) (§1)
 - [x] `mark_load_started` signature simplification documented (§2)
 - [x] CLI `-p` audit (§3)
-- [x] 14 baselines locked at f4b714d... no wait, 0640c8e (§4)
+- [x] 13 sweep + 1 sensitivity baselines locked at HEAD `0640c8e` (§4)
 - [x] Numerical feasibility analyzed: CPU is 3200× faster than
   disk per block, so ship gate language refined to promotion-count
   focus (§5)
