@@ -509,3 +509,27 @@ A more detailed paper-to-module mapping lives in
 - [DESIGN.md](DESIGN.md): current architecture and milestone fidelity
 - [doc/code-review/README.md](doc/code-review/README.md): per-file review index
 - [doc/review-notes.md](doc/review-notes.md): backlog and cross-file notes
+
+## Experimental branches (not merged into main)
+
+- **`feat/bidaw-io-aware-scheduling`** — full Bidaw (FAST'26)
+  simulator approximation, preserved as a paper-replica fork
+  (M0–M4 + two-hop fix):
+  - **M1** dual ready/preparing queue + disk-HRRN + real `KV_LOAD_*`
+    event path
+  - **M2** previous-answer-based CPU eviction +
+    `session_history` trace mode + interactive workload converter
+  - **M3** routing-aware decode selection (A1) + TTFT SLO gate (A2)
+    + session affinity (A3); block-weighted routing + min-anchored
+    affinity threshold variants ratified
+  - **M4** multi-stream KV load model (B1) — `BidawLoadModel`
+    Protocol + `SingleSlotLoadModel` (default) +
+    `MultiStreamLoadModel(K)`; demonstrates −68% preparing wait,
+    −72% ttft_p50, −32% e2e_avg at K=4 vs K=1 on
+    `bidaw-stress.yaml`
+  - Closed [PR #1](https://github.com/Sispheqgj/nano-kvrouter/pull/1)
+    contains 11 commits + full Codex review history. Tag
+    `v0.1-bidaw-m4` snapshots the M4 state. Branch is intentionally
+    not merged: `main` keeps the clean 5-scheduler baseline; this
+    branch holds the full Bidaw stack and is the base for future
+    M5/M6 work.
